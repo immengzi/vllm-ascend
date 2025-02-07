@@ -53,7 +53,7 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.utils import (DeviceMemoryProfiler, PyObjectCache, flatten_2d_lists,
-                        is_pin_memory_available, make_tensor_with_pad)
+                        is_pin_memory_available)
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase, ModelRunnerInputBuilderBase,
     _add_attn_metadata_broadcastable_dict,
@@ -511,50 +511,21 @@ class ModelInputForNPUBuilder(ModelRunnerInputBuilderBase[ModelInputForNPU]):
             for data in self.inter_data_list
         }
 
-        batch_size = len(input_tokens)
-
-        if self.inter_data_list[0].is_prompt:
-            input_tokens_tensor = make_tensor_with_pad(
-                input_tokens, 0, dtype=torch.int, device=self.runner.device)
-            input_tokens_tensor = torch.flatten(input_tokens_tensor)
-            if mrope_input_positions is not None:
-                mrope_input_positions_tensor = make_tensor_with_pad(
-                    mrope_input_positions,
-                    0,
-                    dtype=torch.int,
-                    device=self.runner.device)
-                input_positions_tensor = torch.tensor(
-                    mrope_input_positions_tensor,
-                    dtype=torch.long,
-                    device=self.runner.device)
-            else:
-                input_positions_tensor = make_tensor_with_pad(
-                    input_positions,
-                    0,
-                    dtype=torch.int,
-                    device=self.runner.device)
-                input_positions_tensor = torch.flatten(input_positions_tensor)
-
-            max_seq_len = max(seq_lens)
-            seq_lens = len(seq_lens) * [max_seq_len]
+        input_tokens_tensor = torch.tensor(flatten_2d_lists(input_tokens),
+                                           dtype=torch.long,
+                                           device=self.runner.device)
+        if mrope_input_positions is not None:
+            input_positions_tensor = torch.tensor(mrope_input_positions,
+                                                  dtype=torch.long,
+                                                  device=self.runner.device)
         else:
-            input_tokens_tensor = torch.tensor(flatten_2d_lists(input_tokens),
-                                               dtype=torch.long,
-                                               device=self.runner.device)
-            if mrope_input_positions is not None:
-                input_positions_tensor = torch.tensor(
-                    mrope_input_positions,
-                    dtype=torch.long,
-                    device=self.runner.device)
-            else:
-                input_positions_tensor = torch.tensor(
-                    flatten_2d_lists(input_positions),
-                    dtype=torch.long,
-                    device=self.runner.device)
+            input_positions_tensor = torch.tensor(
+                flatten_2d_lists(input_positions),
+                dtype=torch.long,
+                device=self.runner.device)
 
         # Attention metadata.
-        attn_metadata = self.attn_metadata_builder.build(
-            seq_lens, query_lens, -1, batch_size)
+        attn_metadata = self.attn_metadata_builder.build(seq_lens, query_lens)
 
         # Multi-modal data.
         multi_modal_kwargs_list = [
