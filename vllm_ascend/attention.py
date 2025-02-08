@@ -1,8 +1,25 @@
-from collections import defaultdict
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is a part of the vllm-ascend project.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
+import numpy as np
 
 try:
     import torch_npu  # noqa: F401
@@ -453,6 +470,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.hidden_size = self.num_heads * self.head_size
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
         if alibi_slopes is not None:
@@ -493,7 +511,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Returns:
             shape = [batch_size, seq_len * num_heads * head_size]
         """
-        assert layer._k_scale == 1.0 and layer._v_scale == 1.0
+        assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         attn_type = self.attn_type
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("Encoder self-attention and "
@@ -502,12 +520,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                       "PallasAttentionBackendImpl")
         # View q k v to BSH.
         num_tokens = query.shape[0]
-        hidden_size = self.num_heads * self.head_size
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
 
-        if kv_cache is not None and len(kv_cache) >= 2:
+        if kv_cache.numel() > 0:
             key_cache, value_cache = kv_cache[0], kv_cache[1]
             num_blocks, block_size, _ = key_cache.shape
             key_cache = key_cache.view(num_blocks, block_size, self.num_kv_heads,
@@ -529,7 +546,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     or attn_metadata.block_tables.numel() == 0):
                 assert attn_metadata.attn_mask is not None
                 mask = attn_metadata.attn_mask
-                self.seq_lens_tensor_cpu = torch.tensor(attn_metadata.prefill_metadata.seq_lens, dtype=torch.int32)
+                self.seq_lens_tensor_cpu = torch.from_numpy(np.array(attn_metadata.prefill_metadata.seq_lens).astype(np.int32))
                 torch_npu.npu_selfattention(query, key, value, mask,
                                             self.seq_lens_tensor_cpu, self.scale,
                                             self.num_heads, self.num_kv_heads,
@@ -541,11 +558,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
         elif attn_metadata.decode_metadata:
             assert kv_cache is not None
-            self.seq_lens_tensor_cpu = torch.tensor(attn_metadata.decode_metadata.seq_lens, dtype=torch.int32)
+            self.seq_lens_tensor_cpu = torch.from_numpy(np.array(attn_metadata.decode_metadata.seq_lens).astype(np.int32))
             block_tables = attn_metadata.decode_metadata.block_tables
             torch_npu.npu_pagedattention(query, key_cache, value_cache,
                                          self.num_kv_heads, self.num_heads,
                                          self.scale, block_tables,
                                          self.seq_lens_tensor_cpu, output)
 
-        return output.view(num_tokens, hidden_size)
+        return output.view(num_tokens, self.hidden_size)
