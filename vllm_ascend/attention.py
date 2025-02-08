@@ -407,7 +407,6 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
         max_query_len = max(query_lens)
         max_prefill_seq_len = max(self.prefill_seq_lens, default=0)
         max_decode_seq_len = max(self.curr_seq_lens, default=0)
-        num_decode_tokens = self.num_decode_tokens
 
         if self.num_prefills > 0:
             self.attn_mask = AscendMetadataBuilder._attn_mask_builder.get_attn_mask(  # type: ignore
@@ -441,7 +440,7 @@ class AscendMetadataBuilder(CommonMetadataBuilder[AscendMetadata]):
             multi_modal_placeholder_index_maps=placeholder_index_maps,
             enable_kv_scales_calculation=False,
             num_prefill_tokens=self.num_prefill_tokens,
-            num_decode_tokens=num_decode_tokens,
+            num_decode_tokens=self.num_decode_tokens,
             seq_lens=seq_lens,
             max_query_len=max_query_len,
             max_prefill_seq_len=max_prefill_seq_len,
