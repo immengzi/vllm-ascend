@@ -16,7 +16,7 @@
 #
 
 import os
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -27,6 +27,10 @@ except ImportError:
 
 from vllm.config import VllmConfig
 from vllm.platforms import Platform, PlatformEnum
+if TYPE_CHECKING:
+    from vllm.utils import FlexibleArgumentParser
+else:
+    FlexibleArgumentParser = None
 
 os.environ["RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES"] = "1"
 
@@ -52,6 +56,10 @@ class NPUPlatform(Platform):
     simple_compile_backend: str = "npu"
     ray_device_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+
+    supported_quantization: list[str] = [
+        "ascend"
+    ]
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0):
