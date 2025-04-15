@@ -144,6 +144,25 @@ class NPUPlatform(Platform):
             )
             cache_config.enable_prefix_caching = False
 
+        if envs.VLLM_USE_V1:
+            # Activate custom ops for v1.
+            vllm_config.compilation_config.custom_ops = ["all"]
+            additional_config = vllm_config.additional_config
+            if additional_config and additional_config.get(
+                    "ascend_scheduler_config", None) is not None:
+                additional_scheduler_config = additional_config.get(
+                    "ascend_scheduler_config")
+                from vllm_ascend.core.schedule_config import \
+                    AscendSchedulerConfig
+                ascend_scheduler_config = AscendSchedulerConfig.initialize_from_config(
+                    vllm_config.scheduler_config, additional_scheduler_config)
+                vllm_config.scheduler_config = ascend_scheduler_config
+                from vllm.v1.engine.core import EngineCore
+
+                from vllm_ascend.core.v1_engine_core_init import \
+                    engine_core_init_with_ascend_scheduler
+                EngineCore.__init__ = engine_core_init_with_ascend_scheduler
+
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, head_size, dtype,
                              kv_cache_dtype, block_size, use_v1, use_mla):

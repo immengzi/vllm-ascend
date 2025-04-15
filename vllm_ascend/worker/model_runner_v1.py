@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
-from vllm.attention import AttentionType
+from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_pp_group
@@ -49,13 +49,12 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-from vllm_ascend.attention.attention_v1 import (AscendAttentionBackend,
+from vllm_ascend.attention.attention import AttentionMaskBuilder
+from vllm_ascend.attention.attention_v1 import (AscendAttentionState,
                                                 AscendMetadata)
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler_output import SchedulerOutput
-
-NPU_PAGED_ATTENTION_MASK_VALUE = -10000
 
 logger = init_logger(__name__)
 
@@ -106,6 +105,24 @@ class NPUModelRunner:
         self.num_kv_heads = model_config.get_num_kv_heads(parallel_config)
         self.head_size = model_config.get_head_size()
         self.hidden_size = model_config.get_hidden_size()
+
+        self.attn_backend = get_attn_backend(
+            self.head_size,
+            self.dtype,
+            self.kv_cache_dtype,
+            self.block_size,
+            self.model_config.is_attention_free,
+            use_mla=self.model_config.use_mla,
+        )
+        if self.attn_backend is None:
+            error_msg = (
+                f"Error with get_att_backend: {self.head_size=}, "
+                f"{self.dtype=}, {self.kv_cache_dtype=}, {self.block_size=}, "
+                f"{self.model_config.is_attention_free=}, "
+                f"{self.model_config.use_mla=}")
+            logger.error(error_msg)
+            raise NotImplementedError(
+                "Non-Attention backend is not supported by V1 NPUModelRunner.")
 
         # Multi-modal data support
         self.input_registry = INPUT_REGISTRY
@@ -240,13 +257,8 @@ class NPUModelRunner:
         # the size of the pre-constructed mask matrix based on requirements.
         mask_len = os.getenv("PAGED_ATTENTION_MASK_LEN", 10000)
         self.attn_mask_len = min(self.max_model_len, int(mask_len))
-        self.attn_mask_npu = torch.full(
-            (self.attn_mask_len, self.attn_mask_len),
-            NPU_PAGED_ATTENTION_MASK_VALUE,
-            device=self.device,
-            dtype=self.vllm_config.model_config.dtype)
-        self.attn_mask_npu.masked_fill_(
-            self.attn_mask_npu.tril() == NPU_PAGED_ATTENTION_MASK_VALUE, 0)
+        self.attn_mask_builder = AttentionMaskBuilder.initialize_from_len(
+            self.attn_mask_len, self.dtype)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -403,35 +415,20 @@ class NPUModelRunner:
     def get_model(self) -> nn.Module:
         return self.model
 
-    def make_attention_mask(self, seq_lens, query_lens,
-                            position) -> torch.Tensor:
-        max_seq_len = max(seq_lens, default=0)
-        if max_seq_len <= self.attn_mask_len:
-            return torch.index_select(self.attn_mask_npu,
-                                      dim=0,
-                                      index=position)[:, :max_seq_len]
-
-        total_q_len = sum(query_lens)
-        attn_mask = torch.zeros((total_q_len, max_seq_len),
-                                dtype=self.vllm_config.model_config.dtype,
-                                device="cpu")
-
-        current_row = 0
-        for i in range(len(query_lens)):
-            seq_len = seq_lens[i]
-            q_len = query_lens[i]
-            context_len = seq_len - q_len
-
-            assert context_len >= 0
-            attn_mask[current_row:current_row + q_len,
-                      context_len:] = NPU_PAGED_ATTENTION_MASK_VALUE
-            right_tensor = attn_mask[current_row:current_row + q_len,
-                                     context_len:seq_len]
-            right_tensor.mask_fill_(
-                right_tensor.tril() == NPU_PAGED_ATTENTION_MASK_VALUE, 0)
-            current_row += q_len
-
-        return attn_mask.to(self.device, non_blocking=True)
+    def make_attention_mask(self, seq_lens, query_lens, position,
+                            attn_state) -> torch.Tensor:
+        # Chunk Prefill situation.
+        if attn_state == AscendAttentionState.ChunkedPrefill:
+            return self.attn_mask_builder.get_splitfuse_attn_mask(
+                seq_lens, query_lens, position, self.dtype, self.device)
+        # Prefill-only situation.
+        elif attn_state == AscendAttentionState.PrefillOnly:
+            max_seq_len = max(seq_lens, default=0)
+            return self.attn_mask_builder.get_attn_mask(
+                max_seq_len, self.dtype, self.device)
+        # Decode-only situation.
+        else:
+            return None
 
     def _process_reqs(
         self,
@@ -465,6 +462,9 @@ class NPUModelRunner:
         cu_num_tokens = np.cumsum(num_scheduled_tokens)
         cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
                                     num_scheduled_tokens)
+        sample_indices = cu_num_tokens - 1
+        sample_indices = torch.from_numpy(sample_indices).to(self.device,
+                                                             non_blocking=True)
         arange = self.arange_np[:total_num_scheduled_tokens] - cumsums_offsets
 
         positions_np = self.positions_np[:total_num_scheduled_tokens]
@@ -494,9 +494,18 @@ class NPUModelRunner:
         slot_mapping = self.slot_mapping_cpu[:total_num_scheduled_tokens].to(
             self.device, non_blocking=True)
 
+        attn_state = AscendAttentionState.ChunkedPrefill
+        if np.array_equal(self.seq_lens_np[:num_reqs], num_scheduled_tokens):
+            attn_state = AscendAttentionState.PrefillOnly
+        elif np.all(num_scheduled_tokens == 1):
+            attn_state = AscendAttentionState.DecodeOnly
+        else:
+            attn_state = AscendAttentionState.ChunkedPrefill
+
         attn_mask = self.make_attention_mask(seq_lens=seq_lens,
                                              query_lens=num_scheduled_tokens,
-                                             position=positions)
+                                             position=positions,
+                                             attn_state=attn_state)
 
         attn_metadata = AscendMetadata(
             seq_lens=query_lens,
@@ -505,6 +514,7 @@ class NPUModelRunner:
             block_tables=(
                 self.input_batch.block_table.get_device_tensor()[:num_reqs]),
             attn_mask=attn_mask,
+            attn_state=attn_state,
         )
 
         # Prepare input_ids
@@ -531,7 +541,7 @@ class NPUModelRunner:
                 attn_metadata=attn_metadata,
             )
 
-        return hidden_states[cu_num_tokens - 1]
+        return hidden_states[sample_indices]
 
     @torch.inference_mode()
     def execute_model(
@@ -809,6 +819,7 @@ class NPUModelRunner:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        import torch_npu
         if len(kv_cache_config.groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
@@ -821,13 +832,14 @@ class NPUModelRunner:
             assert tensor_config.size % layer_spec.page_size_bytes == 0
             num_blocks = tensor_config.size // layer_spec.page_size_bytes
             if isinstance(layer_spec, FullAttentionSpec):
-                kv_cache_shape = AscendAttentionBackend.get_kv_cache_shape(
+                kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                     num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,
                     layer_spec.head_size)
                 dtype = layer_spec.dtype
                 kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                     dtype=dtype,
                                                     device=self.device)
+                torch_npu.npu_format_cast(kv_caches[layer_name], 2)
             else:
                 raise NotImplementedError
 
