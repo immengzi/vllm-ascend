@@ -138,6 +138,28 @@ class NPUPlatform(Platform):
                 parallel_config.world_size_across_dp //
                 parallel_config.expert_tensor_parallel_size)
 
+            # Check and configure lmhead_tp
+            if model_config is not None and "deepseek" not in model_config.hf_config.model_type:
+                if ascend_config.lmhead_tp_size > 0:
+                    logger.warning(
+                        "LMHead TP only supports deepseek now. For other models, parallelism of lmhead"
+                        " is designed by tensor_parallel_size.")
+                parallel_config.lmhead_tp_size = -1
+            elif ascend_config.lmhead_tp_size <= 0:
+                # For deepseek series, although we don't need lmhead_tp in default cases, we still
+                # need to initialize the communication group.
+                parallel_config.lmhead_tp_size = parallel_config.tensor_parallel_size
+            elif parallel_config.tensor_parallel_size > 1:
+                logger.warning(
+                    "LMHead tp_size is separately set while tensor_parallel_size is larger than 1."
+                    "For better performance, we recommend to set LMHead tp_size only when "
+                    "tensor_parallel_size equals 1. LMHead tp_size will be automatically changed "
+                    "to tensor_parallel_size when tensor_parallel_size is larger than 1."
+                )
+                parallel_config.lmhead_tp_size = parallel_config.tensor_parallel_size
+            else:
+                parallel_config.lmhead_tp_size = ascend_config.lmhead_tp_size
+
         if model_config is None:
             logger.warning("Model config is missing. This may indicate "
                            "that we are running a test case")
