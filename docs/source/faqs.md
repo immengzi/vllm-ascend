@@ -183,4 +183,33 @@ This has been solved in `ray>=2.47.1`, thus we could solve this as following:
 
 ```
 python3 -m pip install modelscope 'ray>=2.47.1' 'protobuf>3.20.0'
-``` 
+```
+
+### 21. Failed with inferencing Qwen3 MoE due to `Alloc sq cq fail` issue?
+
+When running Qwen3 MoE with tp/dp/ep, etc., you may encounter an error shown in [#2629](https://github.com/vllm-project/vllm-ascend/issues/2629).
+
+This is more likely to happen when you're using A3. Please refer to the empirical formula below to estimate a suitable value for this argument:
+
+```python
+# pg_num: the number of process groups for communication
+pg_num = sum(size > 1 for size in [
+    parallel_config.data_parallel_size,
+    parallel_config.tensor_parallel_size,
+])
+# num_hidden_layer: number of hidden layers of the model
+
+# for A2:
+num_capture_sizes = (1920) / (num_hidden_layer + 1) / (1 + pg_num * 1)
+# for A3:
+num_capture_sizes = (1920 - pg_num * 40) / (num_hidden_layer + 1) / (1 + pg_num * 2)
+```
+
+Find more details about how to calculate this value at [#2629](https://github.com/vllm-project/vllm-ascend/issues/2629).
+
+Try to adjust the arg `cuda-capture-sizes` to address this:
+
+```bash
+vllm serve ... \
+--cuda-capture-sizes=num_capture_sizes
+```
