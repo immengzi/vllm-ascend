@@ -28,3 +28,4 @@ import vllm_ascend.patch.worker.patch_weight_loader  # noqa
 import vllm_ascend.patch.worker.patch_multimodal_merge  # noqa
 import vllm_ascend.patch.worker.patch_minicpm  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
+import vllm_ascend.patch.worker.patch_attention_layer  # noqa
