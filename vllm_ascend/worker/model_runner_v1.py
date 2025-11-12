@@ -2258,7 +2258,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             attn_metadata = {}
 
-            seq_lens = self.model_config.max_model_len
+            seq_lens = max_query_len
             self.seq_lens_np[:num_reqs] = seq_lens
             self.seq_lens_np[num_reqs:] = 0
 
