@@ -54,6 +54,8 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
+from vllm_ascend.device_allocator.shmem_allocator import (
+    ShmemAllocator, shmem_available)
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.utils import (AscendDeviceType, check_ascend_device_type,
@@ -351,7 +353,17 @@ class NPUWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
-        if self.vllm_config.model_config.enable_sleep_mode:
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            # Use the SHMEM dynamic pool for weight allocation.
+            # SHMEM does not support CPU offloading, so sleep mode must be
+            # disabled when ENABLE_SHMEM is active.
+            if self.vllm_config.model_config.enable_sleep_mode:
+                raise RuntimeError(
+                    "ENABLE_SHMEM and sleep mode are mutually exclusive: "
+                    "the SHMEM allocator does not support CPU offloading.")
+            allocator = ShmemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="weights")
+        elif self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, (
                 "Sleep mode can only be "

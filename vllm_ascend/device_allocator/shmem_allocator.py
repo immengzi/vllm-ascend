@@ -138,16 +138,16 @@ class ShmemAllocator:
         return ShmemAllocator.instance
 
     def __init__(self) -> None:
+        # Set _initialized first so __del__ → finalize() never raises
+        # AttributeError even if __init__ raises before completing.
+        self._initialized: bool = False
+        self.current_tag: str = ShmemAllocator.default_tag
+        self._pools: Dict[str, Any] = {}
         if not shmem_available:
             raise RuntimeError(
                 "SHMEM allocator is not available. "
                 "Rebuild vllm-ascend with ENABLE_SHMEM=ON."
             )
-        self._initialized: bool = False
-        self.current_tag: str = ShmemAllocator.default_tag
-        # Hard references prevent GC from collecting MemPool / allocator
-        # objects while a context manager is active (mirrors camem.py).
-        self._pools: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
