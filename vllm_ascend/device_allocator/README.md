@@ -16,14 +16,14 @@ PyTorch-NPU's default caching allocator with a custom memory pool.
 ### Background
 
 [SHMEM](https://gitee.com/ascend/shmem) (Ascend Symmetric Heterogeneous Memory)
-is a multi-device memory communication library for Ascend NPUs.  Its memory
+is a multi-device memory communication library for Ascend NPUs. Its memory
 heap exposes the standard `aclshmem_malloc` / `aclshmem_free` interface
 compatible with any NPU device pointer.
 
 The library was extended with a **dynamic expansion** capability
 (`shmem_dynamic_mm.cpp`): when the initial pool is exhausted, additional CANN
 device memory blocks are allocated transparently — up to 4 GiB per expansion,
-with a 1.5× growth factor.  This eliminates the need to pre-size the pool for
+with a 1.5× growth factor. This eliminates the need to pre-size the pool for
 the entire model and allows vllm to grow its KV-cache on demand.
 
 ### Architecture
@@ -31,13 +31,16 @@ the entire model and allows vllm to grow its KV-cache on demand.
 ```
 Python layer (vllm-ascend)
 │
-│  ShmemAllocator.use_memory_pool()
+│  worker.py: load_model()            → weights in SHMEM pool
+│  worker.py: initialize_from_config() → KV cache in SHMEM pool
+│      ↓
+│  ShmemAllocator.use_memory_pool(tag)
 │      ↓
 │  torch.npu.memory.NPUPluggableAllocator(lib_path, 'my_malloc', 'my_free')
 │      ↓
 │  torch.npu.memory.MemPool  +  torch.npu.memory.use_mem_pool(pool)
 │      │
-│      │  every  torch.empty() / tensor creation inside the context
+│      │  every torch.empty() / tensor creation inside the context
 │      ↓
 C++ layer (shmem_allocator.cpython-*.so)
 │
@@ -62,7 +65,7 @@ SHMEM library (libshmem.so)
 **Key design decisions**
 
 * **Separate `.so` module** — `camem_allocator.cpp` (compiled into
-  `vllm_ascend_C.so`) already defines `my_malloc`/`my_free`.  A second
+  `vllm_ascend_C.so`) already defines `my_malloc`/`my_free`. A second
   definition in the same shared object would cause a linker duplicate-symbol
   error, so `shmem_allocator` is built as its own `pybind11_add_module`.
 
@@ -72,13 +75,27 @@ SHMEM library (libshmem.so)
      to resolve `my_malloc`/`my_free` from the already-loaded shared object.
 
 * **Pointer tracking** — `aclshmem_ptr_valid` does not exist in the public
-  SHMEM API.  The allocator maintains an `std::unordered_set<void*>` of every
+  SHMEM API. The allocator maintains an `std::unordered_set<void*>` of every
   pointer returned by `aclshmem_malloc` so that `my_free` can route each
   deallocation to the correct backend.
 
 * **No ACL lifecycle management** — `aclInit`, `aclrtSetDevice`, `aclFinalize`
-  are called by vllm-ascend before any allocator is used.  The SHMEM allocator
+  are called by vllm-ascend before any allocator is used. The SHMEM allocator
   must not duplicate or interfere with these calls.
+
+* **SHMEM vs sleep mode are mutually exclusive** — `CaMemAllocator` (sleep
+  mode) supports CPU offloading; `ShmemAllocator` does not. Enabling both
+  simultaneously raises a `RuntimeError`.
+
+### Allocation scope in vllm-ascend
+
+When `ENABLE_SHMEM=1`, both major NPU allocation phases are routed through
+the SHMEM dynamic pool:
+
+| Phase | Function | Pool tag |
+|-------|----------|----------|
+| Model weight loading | `worker.load_model()` | `"weights"` |
+| KV cache initialisation | `worker.initialize_from_config()` | `"kv_cache"` |
 
 ---
 
@@ -87,20 +104,19 @@ SHMEM library (libshmem.so)
 #### 1. Build and install SHMEM (source)
 
 ```bash
-# Clone and build
 git clone <shmem-repo-url>
 cd shmem
 bash scripts/build.sh
 
-# Configure environment (exports SHMEM_HOME_PATH)
+# Exports SHMEM_HOME_PATH, e.g. /root/shmem/install
 source install/set_env.sh
-echo $SHMEM_HOME_PATH   # e.g. /root/shmem/install
+echo $SHMEM_HOME_PATH
 ```
 
 #### 2. Build vllm-ascend with SHMEM support
 
 ```bash
-# SHMEM_HOME_PATH must be set (from step 1 above)
+# SHMEM_HOME_PATH must be set (from step 1)
 ENABLE_SHMEM=1 pip install -e .
 ```
 
@@ -118,34 +134,31 @@ existing `vllm_ascend_C.cpython-*.so`.
 
 ### Usage
 
+#### Option A — automatic (recommended)
+
+Set `ENABLE_SHMEM=1` at runtime. The worker picks it up automatically for
+both weight loading and KV-cache initialisation.
+
+```bash
+ENABLE_SHMEM=1 python your_vllm_script.py
+```
+
+#### Option B — manual via Python API
+
 ```python
 from vllm_ascend.device_allocator.shmem_allocator import ShmemAllocator
 
 allocator = ShmemAllocator.get_instance()
 
-# All NPU tensor allocations inside this block use the SHMEM pool.
 with allocator.use_memory_pool(tag="kv_cache"):
     kv_cache = torch.empty(shape, dtype=torch.float16, device="npu")
     ...
 
-# Inspect pool usage
 stats = allocator.get_memory_stats()
 if stats:
     total, used, avail = stats
     print(f"SHMEM pool: {used/1e9:.2f} / {total/1e9:.2f} GiB used")
 ```
-
-#### Singleton pattern
-
-`ShmemAllocator.get_instance()` always returns the same object.  SHMEM
-initialization is lazy: it happens on the first `use_memory_pool()` call (or
-explicit `allocator.initialize()`).
-
-#### Integration with vllm scheduler
-
-The allocator implements the same `sleep()` / `wake_up()` interface as
-`CaMemAllocator`.  For SHMEM these are no-ops because device memory is always
-resident (no CPU offloading support in this release).
 
 ---
 
@@ -153,16 +166,18 @@ resident (no CPU offloading support in this release).
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `ENABLE_SHMEM` | Enable SHMEM allocator at runtime | `0` |
 | `SHMEM_HOME_PATH` | Path set by `source install/set_env.sh` | — |
 | `SHMEM_INITIAL_POOL_SIZE` | Initial pool size in bytes | `2147483648` (2 GiB) |
 
-`SHMEM_INITIAL_POOL_SIZE` is read by the C++ layer at init time.  The pool
-grows automatically beyond this size via dynamic expansion — setting it large
-enough to cover the typical working set reduces expansion overhead.
+`SHMEM_INITIAL_POOL_SIZE` is read by the C++ layer at first allocation.
+The pool grows automatically beyond this size via dynamic expansion —
+setting it large enough reduces expansion overhead.
 
-Example: reserve 8 GiB upfront for a large model:
 ```bash
+# Reserve 8 GiB upfront
 export SHMEM_INITIAL_POOL_SIZE=$((8 * 1024 * 1024 * 1024))
+ENABLE_SHMEM=1 python your_vllm_script.py
 ```
 
 ---
@@ -182,16 +197,13 @@ export SHMEM_INITIAL_POOL_SIZE=$((8 * 1024 * 1024 * 1024))
 | `.sleep(offload_tags=None)` | No-op (API compat with CaMemAllocator) |
 | `.wake_up(tags=None)` | No-op (API compat with CaMemAllocator) |
 
-#### Python — low-level module (`vllm_ascend.shmem_allocator`)
+#### Module-level flag
 
-These are called internally by `ShmemAllocator` and are rarely needed directly.
-
-| Function | Description |
-|----------|-------------|
-| `shmem_init()` | Initialise SHMEM pool (calls `aclshmemx_init_attr`) |
-| `shmem_finalize()` | Finalise SHMEM pool |
-| `is_shmem_initialized() → bool` | Query init state |
-| `get_memory_stats() → (total, used, avail)` | Pool statistics |
+```python
+from vllm_ascend.device_allocator.shmem_allocator import shmem_available
+# True  → extension was compiled and imported successfully
+# False → ENABLE_SHMEM=ON was not set at build time (or import failed)
+```
 
 #### C++ — NPUPluggableAllocator symbols
 
@@ -205,18 +217,23 @@ These are called internally by `ShmemAllocator` and are rarely needed directly.
 ### Troubleshooting
 
 **`ImportError: No module named 'vllm_ascend.shmem_allocator'`**
-Build was done without `ENABLE_SHMEM=1`.  Rebuild as shown above.
+Build was done without `ENABLE_SHMEM=1`. Rebuild as shown above.
+
+**`RuntimeError: SHMEM allocator is not available`**
+The extension module was not compiled in. Ensure `ENABLE_SHMEM=1` and
+`SHMEM_HOME_PATH` are set, then rebuild.
+
+**`RuntimeError: ENABLE_SHMEM and sleep mode are mutually exclusive`**
+`enable_sleep_mode=True` and `ENABLE_SHMEM=1` were set simultaneously.
+SHMEM does not support CPU offloading; choose one or the other.
 
 **`RuntimeError: aclshmemx_init_attr failed: <code>`**
-SHMEM initialisation failed.  Common causes:
+Common causes:
 - `SHMEM_HOME_PATH` not set or wrong — check `echo $SHMEM_HOME_PATH`.
-- `libshmem.so` bootstrap plugins not found — ensure `${SHMEM_HOME_PATH}/shmem/lib/` is on `LD_LIBRARY_PATH` or the RPATH is correct.
-- ACL not initialised before the allocator — vllm-ascend handles this; do not call `aclInit` / `aclrtSetDevice` manually before importing the allocator.
+- Bootstrap plugins (`aclshmem_bootstrap_uid.so`) not found — ensure
+  `${SHMEM_HOME_PATH}/shmem/lib/` is on `LD_LIBRARY_PATH` or the RPATH
+  embedded at build time is correct.
 
 **`aclshmem_malloc failed … falling back to aclrtMalloc`**
-The SHMEM pool failed to expand (device OOM).  Reduce `SHMEM_INITIAL_POOL_SIZE`
-or the model batch size.
-
-**Pool statistics show unexpected values**
-Call `aclshmem_cleanup_unused_memory()` (exposed via C++ but not yet in the
-Python API) to consolidate free blocks if heavy fragmentation is suspected.
+The SHMEM pool failed to expand (device OOM). Reduce
+`SHMEM_INITIAL_POOL_SIZE` or the model batch size.
