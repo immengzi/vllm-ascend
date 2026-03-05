@@ -90,6 +90,13 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
 endif()
 
+# shmem_allocator.cpp is built as a separate module (shmem_allocator); it must
+# not be included in vllm_ascend_C because (a) it needs shmem headers that are
+# not part of the standard include path and (b) it defines my_malloc/my_free
+# which would collide with the same symbols in camem_allocator.cpp.
+list(REMOVE_ITEM VLLM_ASCEND_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/shmem_allocator.cpp)
+
 include_directories(
   ${pybind11_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_PATH}
