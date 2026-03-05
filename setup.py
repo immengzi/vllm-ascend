@@ -457,6 +457,8 @@ except LookupError:
 ext_modules = []
 if envs.COMPILE_CUSTOM_KERNELS:
     ext_modules = [CMakeExtension(name="vllm_ascend.vllm_ascend_C")]
+    if envs.ENABLE_SHMEM:
+        ext_modules.append(CMakeExtension(name="vllm_ascend.shmem_allocator"))
 
 
 def get_path(*filepath) -> str:
