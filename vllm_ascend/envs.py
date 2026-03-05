@@ -140,15 +140,16 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
     # Whether to build the SHMEM-backed NPU pluggable allocator.
-    # Set to "1" to enable; requires SHMEM_HOME to also be set.
+    # Set to "1" to enable; requires SHMEM_HOME_PATH to also be set.
     "ENABLE_SHMEM":
     lambda: bool(int(os.getenv("ENABLE_SHMEM", "0"))),
-    # Root directory of the installed SHMEM library
-    # (e.g. the directory produced by `source install/set_env.sh` in the
-    # shmem source tree, or /usr/local/Ascend/shmem/latest for a package
-    # install).  Only used when ENABLE_SHMEM=1.
-    "SHMEM_HOME":
-    lambda: os.getenv("SHMEM_HOME", None),
+    # Parent directory of the installed SHMEM library, i.e. the directory
+    # that contains the shmem/ sub-directory with include/ and lib/ inside.
+    # This is the value exported by `source install/set_env.sh` in the shmem
+    # source tree (e.g. /root/shmem/install), or /usr/local/Ascend/shmem/latest
+    # for a binary-package install.  Only used when ENABLE_SHMEM=1.
+    "SHMEM_HOME_PATH":
+    lambda: os.getenv("SHMEM_HOME_PATH", None),
 }
 
 # end-env-vars-definition
