@@ -315,6 +315,16 @@ class cmake_build_ext(build_ext):
         # add TORCH_NPU_PATH
         cmake_args += [f"-DTORCH_NPU_PATH={torch_npu_path}"]
 
+        # Optional SHMEM allocator support
+        if envs.ENABLE_SHMEM:
+            cmake_args += ["-DENABLE_SHMEM=ON"]
+            check_or_set_default_env(
+                cmake_args,
+                "SHMEM_HOME",
+                envs.SHMEM_HOME,
+                "/usr/local/Ascend/shmem/latest",
+            )
+
         build_tool = []
         # TODO(ganyi): ninja and ccache support for ascend c auto codegen. now we can only use make build
         # if which('ninja') is not None:
