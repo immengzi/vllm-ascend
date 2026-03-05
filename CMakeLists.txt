@@ -113,35 +113,46 @@ set(
 # ---------------------------------------------------------------------------
 # Optional: SHMEM dynamic memory allocator module
 #
-# Enable with:   cmake -DENABLE_SHMEM=ON -DSHMEM_HOME=/path/to/shmem/install …
-# Or at pip-install time set ENABLE_SHMEM=1 and SHMEM_HOME env vars.
+# Enable with:
+#   cmake -DENABLE_SHMEM=ON -DSHMEM_HOME_PATH=/root/shmem/install …
+# Or at pip-install time:
+#   ENABLE_SHMEM=1 SHMEM_HOME_PATH=/root/shmem/install pip install -e .
+#
+# SHMEM_HOME_PATH is set by  `source install/set_env.sh`  in the shmem tree.
+# It points to the parent of the shmem/ sub-directory, e.g.:
+#   /root/shmem/install          ← source build
+#   /usr/local/Ascend/shmem/latest  ← binary package install
+# Headers are at  ${SHMEM_HOME_PATH}/shmem/include/
+# Libraries are at ${SHMEM_HOME_PATH}/shmem/lib/
 #
 # Why a separate pybind11_add_module?
 #   • camem_allocator.cpp (compiled into vllm_ascend_C) already exports
-#     my_malloc / my_free.  Adding a second definition to the same .so would
-#     cause a linker duplicate-symbol error.
-#   • libshmem.so is an optional dependency; gating it behind ENABLE_SHMEM
-#     keeps the default build free of that requirement.
-#   • NPUPluggableAllocator loads a .so by filesystem path and resolves
-#     my_malloc / my_free via dlsym.  The same .so that serves as a Python
-#     extension (PyInit_shmem_allocator) can also serve this role.
+#     my_malloc / my_free.  A second definition in the same .so causes a
+#     linker duplicate-symbol error.
+#   • libshmem.so is optional; gating it behind ENABLE_SHMEM keeps the
+#     default build free of that requirement.
+#   • NPUPluggableAllocator loads a .so by path and resolves my_malloc /
+#     my_free via dlsym.  The Python extension .so doubles as that backend.
 option(ENABLE_SHMEM "Build the SHMEM-backed NPU pluggable allocator" OFF)
 
 if(ENABLE_SHMEM)
-  set(SHMEM_HOME "$ENV{SHMEM_HOME}" CACHE PATH
-      "Root of the installed SHMEM library (e.g. shmem/install/shmem)")
-  if(NOT SHMEM_HOME)
-    set(SHMEM_HOME "/usr/local/Ascend/shmem/latest")
-    message(STATUS "SHMEM_HOME not set, using default: ${SHMEM_HOME}")
+  set(SHMEM_HOME_PATH "$ENV{SHMEM_HOME_PATH}" CACHE PATH
+      "Parent of the shmem/ install directory (set by source install/set_env.sh)")
+  if(NOT SHMEM_HOME_PATH)
+    set(SHMEM_HOME_PATH "/usr/local/Ascend/shmem/latest")
+    message(STATUS "SHMEM_HOME_PATH not set, using default: ${SHMEM_HOME_PATH}")
   else()
-    message(STATUS "SHMEM_HOME: ${SHMEM_HOME}")
+    message(STATUS "SHMEM_HOME_PATH: ${SHMEM_HOME_PATH}")
   endif()
+
+  # Actual library root: one level below SHMEM_HOME_PATH
+  set(_SHMEM_ROOT "${SHMEM_HOME_PATH}/shmem")
 
   pybind11_add_module(shmem_allocator
       ${CMAKE_CURRENT_SOURCE_DIR}/csrc/shmem_allocator.cpp)
 
   target_include_directories(shmem_allocator PRIVATE
-      ${SHMEM_HOME}/include
+      ${_SHMEM_ROOT}/include
       ${pybind11_INCLUDE_DIRS}
       ${PYTHON_INCLUDE_PATH}
       ${TORCH_INCLUDE_DIRS}
@@ -152,7 +163,7 @@ if(ENABLE_SHMEM)
       ${TORCH_LIBRARY_DIRS}
       ${TORCH_NPU_PATH}/lib/
       ${ASCEND_HOME_PATH}/lib64
-      ${SHMEM_HOME}/lib)
+      ${_SHMEM_ROOT}/lib)
 
   target_link_libraries(shmem_allocator PUBLIC
       ${TORCH_LIBRARIES}
@@ -160,13 +171,14 @@ if(ENABLE_SHMEM)
       ascendcl
       shmem)
 
-  # Embed RPATH so the .so can find libshmem.so at runtime without LD_LIBRARY_PATH.
+  # Embed RPATH so the .so finds libshmem.so and its bootstrap plugins at
+  # runtime without requiring LD_LIBRARY_PATH to be set.
   set_target_properties(shmem_allocator PROPERTIES
-      INSTALL_RPATH "$ORIGIN:${SHMEM_HOME}/lib"
+      INSTALL_RPATH "$ORIGIN:${_SHMEM_ROOT}/lib"
       BUILD_WITH_INSTALL_RPATH TRUE)
 
   install(TARGETS shmem_allocator DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
-  message(STATUS "SHMEM allocator module enabled")
+  message(STATUS "SHMEM allocator module enabled (root: ${_SHMEM_ROOT})")
 endif()
 # ---------------------------------------------------------------------------
 

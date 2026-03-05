@@ -337,8 +337,8 @@ class cmake_build_ext(build_ext):
             cmake_args += ["-DENABLE_SHMEM=ON"]
             check_or_set_default_env(
                 cmake_args,
-                "SHMEM_HOME",
-                envs.SHMEM_HOME,
+                "SHMEM_HOME_PATH",
+                envs.SHMEM_HOME_PATH,
                 "/usr/local/Ascend/shmem/latest",
             )
 
