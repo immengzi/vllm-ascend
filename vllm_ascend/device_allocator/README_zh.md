@@ -225,17 +225,8 @@ torch.empty(512 KB)              ← 单个张量申请
 内存来源），而非逐张量分配器。PyTorch 在段内部自行管理细粒度的子分配；SHMEM
 仅感知段级别的请求。
 
-20 MiB 是 PyTorch-NPU 对 1–10 MiB 区间"大型"分配的默认段大小
-（`kLargeBuffer = 20971520`）。vllm-ascend 在启用 SHMEM 时会**自动**向
-`PYTORCH_NPU_ALLOC_CONF` 注入 `segment_size_mb:2`，将段请求粒度降至 **2 MiB**，
-使 SHMEM 的 best-fit 算法能在更接近 KV-cache block 的粒度上生效。可通过环境变量
-覆盖：
-
-```bash
-export SHMEM_SEGMENT_SIZE_MB=1   # 取值范围 1–512 MiB，默认 2
-```
-
-若 `PYTORCH_NPU_ALLOC_CONF` 中已存在 `segment_size_mb`，则跳过自动注入。
+20 MiB 是 PyTorch-NPU 对 1–10 MiB 区间"大型"分配的固定段大小
+（`kLargeBuffer = 20971520`），无法从 vllm-ascend 或 SHMEM 层单独修改。
 
 #### 对动态扩容的影响
 
