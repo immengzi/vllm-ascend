@@ -216,10 +216,10 @@ from vllm_ascend.device_allocator.shmem_allocator import shmem_available
 
 ### Memory Allocation Granularity
 
-#### Why SHMEM logs show 28 MB allocations
+#### Why SHMEM logs show 20 MiB allocations
 
 When `ENABLE_SHMEM=1`, you may observe via SHMEM logs that every call to
-`aclshmem_malloc` requests exactly **28 MB** regardless of the individual
+`aclshmem_malloc` requests exactly **20 MiB** regardless of the individual
 tensor size. This is expected behaviour arising from the layered allocator
 architecture:
 
@@ -227,36 +227,43 @@ architecture:
 torch.empty(512 KB)              ← individual tensor request
   → PyTorch-NPU caching allocator
       → search internal free-block cache
-      → not found: call my_malloc(28 MB)  ← SHMEM sees this
-      → sub-allocate 512 KB from the 28 MB segment
-      → retain remaining 27.5 MB in internal cache
+      → not found: call my_malloc(20 MiB)  ← SHMEM sees this
+      → sub-allocate 512 KB from the 20 MiB segment
+      → retain remaining ~19.5 MiB in internal cache
 ```
 
 `NPUPluggableAllocator` positions SHMEM as the **segment allocator** (raw
 memory backend) for PyTorch's caching allocator, not as a per-tensor
 allocator. PyTorch manages fine-grained sub-allocations from segments
-internally; SHMEM only observes segment-level (28 MB) requests.
+internally; SHMEM only observes segment-level requests.
 
-The 28 MB value is PyTorch-NPU's default minimum segment size for large
-allocations. It can be influenced via
-`PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:N` (smaller N allows the
-caching allocator to split cached segments into finer pieces before
-requesting new ones from SHMEM).
+The 20 MiB value is `kLargeBuffer` — PyTorch-NPU's default segment size for
+"large" allocations (1–10 MiB range).  vllm-ascend automatically lowers this
+to **2 MiB** by injecting `segment_size_mb:2` into `PYTORCH_NPU_ALLOC_CONF`
+when SHMEM is enabled, so SHMEM's best-fit algorithm operates at 2 MiB
+granularity.  Override with:
+
+```bash
+export SHMEM_SEGMENT_SIZE_MB=1   # 1–512 MiB, default 2
+```
+
+If `segment_size_mb` is already present in `PYTORCH_NPU_ALLOC_CONF`, the
+automatic injection is skipped.
 
 #### Effect on dynamic expansion
 
-Dynamic expansion **still works correctly** at 28 MB granularity. When
-PyTorch exhausts the currently available 28 MB segments and requests a new
-one, `my_malloc` calls `aclshmem_malloc` which transparently expands the
-SHMEM pool (1.5× growth factor, up to 4 GiB per block).
+Dynamic expansion **still works correctly** at segment granularity. When
+PyTorch exhausts the currently available segments and requests a new one,
+`my_malloc` calls `aclshmem_malloc` which transparently expands the SHMEM
+pool (1.5× growth factor, up to 4 GiB per block).
 
 #### Segment cache and memory accounting
 
 After `load_model()` completes, temporary tensors created during weight
 loading (loader buffers, type-cast intermediates, etc.) are freed by PyTorch
-internally — but PyTorch retains the corresponding 28 MB segments in its
-internal cache rather than immediately returning them to SHMEM. This can make
-SHMEM report more memory "in use" than the permanent weights actually require.
+internally — but PyTorch retains the corresponding segments in its internal
+cache rather than immediately returning them to SHMEM. This can make SHMEM
+report more memory "in use" than the permanent weights actually require.
 
 To address this, vllm-ascend automatically calls `torch.npu.empty_cache()`
 after each `load_model()` phase when `ENABLE_SHMEM=1`. This flushes
@@ -266,7 +273,7 @@ available for KV cache initialisation.
 #### Architectural limitation
 
 SHMEM's fine-grained best-fit algorithm and pointer coalescing operate at the
-28 MB segment level, not at the individual tensor level. This is an inherent
+segment level, not at the individual tensor level. This is an inherent
 property of the `NPUPluggableAllocator` API: PyTorch's caching allocator
 always interposes between tensor requests and the custom backend. True
 tensor-level SHMEM management would require bypassing PyTorch's caching
