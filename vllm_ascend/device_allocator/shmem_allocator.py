@@ -283,3 +283,32 @@ class ShmemAllocator:
 
     def __del__(self) -> None:
         self.finalize()
+
+
+# ---------------------------------------------------------------------------
+# Auto-install at module import time.
+#
+# ``change_current_allocator`` must be called BEFORE the NPU allocator is
+# first initialised (i.e. before any NPU memory allocation in this process).
+# By the time ``NPUWorker.init_device()`` is reached, several operations in
+# ``NPUWorker.__init__()`` — such as ``get_ascend_device_type()``,
+# ``_register_atb_extensions()``, and ``super().__init__()`` — have already
+# triggered the first NPU allocation and thus initialised the default
+# allocator, making a late ``change_current_allocator`` call fail with
+# "Can't swap an already initialized allocator".
+#
+# Installing here — at module import time — guarantees we arrive before any
+# of those operations.  The ``install()`` method is idempotent, so the
+# ``install()`` call that remains in ``init_device()`` becomes a no-op.
+
+import os as _os
+
+if shmem_available and bool(int(_os.getenv("ENABLE_SHMEM", "0"))):
+    try:
+        ShmemAllocator.get_instance().install()
+    except Exception as _early_install_err:
+        logger.warning(
+            "SHMEM: early auto-install at import time failed: %s. "
+            "Allocator will NOT be active — NPU allocations go to default backend.",
+            _early_install_err,
+        )
