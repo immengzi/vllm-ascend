@@ -206,39 +206,48 @@ from vllm_ascend.device_allocator.shmem_allocator import shmem_available
 
 ### 内存分配粒度说明
 
-#### 为什么 SHMEM 日志中每次分配都是 28 MB
+#### 为什么 SHMEM 日志中每次分配都是 20 MiB
 
 启用 `ENABLE_SHMEM=1` 后，通过 SHMEM 日志可观察到每次 `aclshmem_malloc`
-申请的内存都固定为 **28 MB**，与实际张量大小无关。这是分层分配器架构的预期行为：
+申请的内存固定为 **20 MiB**（`kLargeBuffer`），与实际张量大小无关。
+这是分层分配器架构的预期行为：
 
 ```
 torch.empty(512 KB)              ← 单个张量申请
   → PyTorch-NPU 缓存分配器
       → 在内部空闲块缓存中查找
-      → 未命中：调用 my_malloc(28 MB)  ← SHMEM 看到的是这一层
-      → 从 28 MB 段中分配 512 KB
-      → 剩余 27.5 MB 留在内部缓存备用
+      → 未命中：调用 my_malloc(20 MiB)  ← SHMEM 看到的是这一层
+      → 从 20 MiB 段中分配 512 KB
+      → 剩余 ~19.5 MiB 留在内部缓存备用
 ```
 
 `NPUPluggableAllocator` 将 SHMEM 定位为 PyTorch 缓存分配器的**段分配器**（底层
 内存来源），而非逐张量分配器。PyTorch 在段内部自行管理细粒度的子分配；SHMEM
-仅感知段级别（28 MB）的请求。
+仅感知段级别的请求。
 
-28 MB 是 PyTorch-NPU 对"大型"分配的默认最小段大小。可通过
-`PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:N` 进行调整：N 越小，缓存分配器在
-向 SHMEM 申请新段之前会将已有缓存段拆分得更细。
+20 MiB 是 PyTorch-NPU 对 1–10 MiB 区间"大型"分配的默认段大小
+（`kLargeBuffer = 20971520`）。vllm-ascend 在启用 SHMEM 时会**自动**向
+`PYTORCH_NPU_ALLOC_CONF` 注入 `segment_size_mb:2`，将段请求粒度降至 **2 MiB**，
+使 SHMEM 的 best-fit 算法能在更接近 KV-cache block 的粒度上生效。可通过环境变量
+覆盖：
+
+```bash
+export SHMEM_SEGMENT_SIZE_MB=1   # 取值范围 1–512 MiB，默认 2
+```
+
+若 `PYTORCH_NPU_ALLOC_CONF` 中已存在 `segment_size_mb`，则跳过自动注入。
 
 #### 对动态扩容的影响
 
-动态扩容在 28 MB 粒度下**仍然正常工作**。当 PyTorch 用完当前所有 28 MB 段并
-申请新段时，`my_malloc` 会调用 `aclshmem_malloc`，后者透明地扩充 SHMEM 内存池
+动态扩容在任意段粒度下**均正常工作**。当 PyTorch 用完当前所有段并申请新段时，
+`my_malloc` 会调用 `aclshmem_malloc`，后者透明地扩充 SHMEM 内存池
 （扩容系数 1.5×，每次最多 4 GiB）。
 
 #### 段缓存与内存统计
 
 `load_model()` 完成后，权重加载过程中产生的临时张量（加载缓冲区、类型转换中间
-结果等）会被 PyTorch 内部释放——但 PyTorch 会将对应的 28 MB 段保留在内部缓存
-中，而不是立即归还给 SHMEM。这会导致 SHMEM 报告的"已用"内存高于实际权重所需。
+结果等）会被 PyTorch 内部释放——但 PyTorch 会将对应的段保留在内部缓存中，而不是
+立即归还给 SHMEM。这会导致 SHMEM 报告的"已用"内存高于实际权重所需。
 
 为解决这个问题，当 `ENABLE_SHMEM=1` 时，vllm-ascend 会在每次 `load_model()`
 阶段结束后自动调用 `torch.npu.empty_cache()`，将 PyTorch 缓存的段刷回 SHMEM，
@@ -246,7 +255,7 @@ torch.empty(512 KB)              ← 单个张量申请
 
 #### 架构层面的固有限制
 
-SHMEM 的细粒度最优适配（best-fit）算法和指针合并操作均在 28 MB 段的层级上运行，
+SHMEM 的细粒度最优适配（best-fit）算法和指针合并操作均在段的层级上运行，
 而非在单个张量层级上。这是 `NPUPluggableAllocator` API 的固有特性：PyTorch 缓存
 分配器始终介于张量申请和自定义后端之间。若要实现真正的张量级 SHMEM 管理，需要
 绕过 PyTorch 缓存分配器，这超出了本次集成的范围。
