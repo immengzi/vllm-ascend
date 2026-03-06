@@ -28,20 +28,18 @@
 ```
 Python 层（vllm-ascend）
 │
-│  worker.py: load_model()             → 模型权重分配在 SHMEM 池中
-│  worker.py: initialize_from_config() → KV Cache 分配在 SHMEM 池中
-│      ↓
-│  ShmemAllocator.use_memory_pool(tag)
-│      ↓
-│  torch.npu.memory.NPUPluggableAllocator(lib_path, 'my_malloc', 'my_free')
-│      ↓
-│  torch.npu.memory.MemPool  +  torch.npu.memory.use_mem_pool(pool)
+│  worker.py: init_device()
+│      └─ ShmemAllocator.install()           ← 一次性全局替换
+│              └─ change_current_allocator(NPUPluggableAllocator)
+│
+│  worker.py: load_model()             → 权重走 SHMEM
+│  worker.py: initialize_from_config() → KV Cache 走 SHMEM
 │      │
-│      │  上下文内所有 torch.empty() / 张量创建均走此路径
+│      │  所有 torch.empty() / NPU 张量创建均走此路径
 │      ↓
 C++ 层（shmem_allocator.cpython-*.so）
 │
-│  my_malloc(size, device, stream)
+│  my_malloc(size, device, stream)        ← 收到精确张量大小
 │      ├─ ensure_shmem_initialized()    ← 懒初始化，幂等，线程安全
 │      ├─ aclshmem_malloc(size)         ← SHMEM 池（自动动态扩容）
 │      │    └─ 失败时: aclrtMalloc      ← ACL 兜底
@@ -81,12 +79,16 @@ SHMEM 库（libshmem.so）
 
 ### vllm-ascend 中的分配范围
 
-当 `ENABLE_SHMEM=1` 时，两个主要 NPU 分配阶段都走 SHMEM 动态池：
+当 `ENABLE_SHMEM=1` 时，`ShmemAllocator.install()` 在 `worker.init_device()` 中、
+任何 NPU 内存分配发生之前被调用，将全局 NPU 分配器替换为 SHMEM 后端。
+此后进程内**所有** NPU 张量分配——模型权重、KV Cache、激活值、临时 buffer——
+均直接走 SHMEM 的 `my_malloc` / `my_free`。
 
-| 阶段 | 函数 | 池标签 |
-|------|------|--------|
-| 模型权重加载 | `worker.load_model()` | `"weights"` |
-| KV Cache 初始化 | `worker.initialize_from_config()` | `"kv_cache"` |
+| 阶段 | 函数 | 处理方式 |
+|------|------|----------|
+| 全局分配器安装 | `worker.init_device()` | `ShmemAllocator.install()` |
+| 模型权重加载 | `worker.load_model()` | 全局 SHMEM 分配器 |
+| KV Cache 初始化 | `worker.initialize_from_config()` | 全局 SHMEM 分配器 |
 
 ---
 
@@ -141,9 +143,11 @@ from vllm_ascend.device_allocator.shmem_allocator import ShmemAllocator
 
 allocator = ShmemAllocator.get_instance()
 
-with allocator.use_memory_pool(tag="kv_cache"):
-    kv_cache = torch.empty(shape, dtype=torch.float16, device="npu")
-    ...
+# 在任何 NPU 分配之前安装全局分配器
+allocator.install()
+
+# 此后所有 NPU 分配均走 SHMEM
+kv_cache = torch.empty(shape, dtype=torch.float16, device="npu")
 
 stats = allocator.get_memory_stats()
 if stats:
@@ -179,9 +183,9 @@ ENABLE_SHMEM=1 python your_vllm_script.py
 | 方法 | 说明 |
 |------|------|
 | `ShmemAllocator.get_instance()` | 获取单例实例 |
-| `.initialize() → bool` | 显式初始化内存池（幂等） |
+| `.install()` | 将全局 NPU 分配器替换为 SHMEM（在任何 NPU 分配之前调用，一次性生效） |
+| `.initialize() → bool` | 显式初始化 SHMEM 池（幂等；`my_malloc` 首次调用时也会懒初始化） |
 | `.finalize()` | 释放内存池并重置状态 |
-| `.use_memory_pool(tag=None)` | 上下文管理器：将分配路由到 SHMEM |
 | `.get_memory_stats() → (total, used, avail)` | 内存池统计（字节） |
 | `.get_current_usage() → int` | 当前已分配字节数 |
 | `.sleep(offload_tags=None)` | 空操作（兼容 CaMemAllocator 接口） |
@@ -206,50 +210,31 @@ from vllm_ascend.device_allocator.shmem_allocator import shmem_available
 
 ### 内存分配粒度说明
 
-#### 为什么 SHMEM 日志中每次分配都是 20 MiB
+#### 精确张量大小分配
 
-启用 `ENABLE_SHMEM=1` 后，通过 SHMEM 日志可观察到每次 `aclshmem_malloc`
-申请的内存固定为 **20 MiB**（`kLargeBuffer`），与实际张量大小无关。
-这是分层分配器架构的预期行为：
+`changeCurrentAllocator` 方式完全绕过 PyTorch 缓存分配器，每次 `torch.empty()`
+都以**精确的张量大小**调用 `my_malloc`：
 
 ```
-torch.empty(512 KB)              ← 单个张量申请
-  → PyTorch-NPU 缓存分配器
-      → 在内部空闲块缓存中查找
-      → 未命中：调用 my_malloc(20 MiB)  ← SHMEM 看到的是这一层
-      → 从 20 MiB 段中分配 512 KB
-      → 剩余 ~19.5 MiB 留在内部缓存备用
+torch.empty(512 KB)
+  → change_current_allocator 路径
+  → my_malloc(512 KB)    ← SHMEM 收到精确大小
+  → aclshmem_malloc(512 KB) 或 dynamic_memory_manager 子分配
 ```
 
-`NPUPluggableAllocator` 将 SHMEM 定位为 PyTorch 缓存分配器的**段分配器**（底层
-内存来源），而非逐张量分配器。PyTorch 在段内部自行管理细粒度的子分配；SHMEM
-仅感知段级别的请求。
+SHMEM 的最优适配选择（best-fit）和指针合并逻辑因此可以在真实分配粒度上生效，
+不再受 PyTorch 缓存分配器固定 20 MiB 段大小的制约。
 
-20 MiB 是 PyTorch-NPU 对 1–10 MiB 区间"大型"分配的固定段大小
-（`kLargeBuffer = 20971520`），无法从 vllm-ascend 或 SHMEM 层单独修改。
+#### 动态扩容
 
-#### 对动态扩容的影响
-
-动态扩容在任意段粒度下**均正常工作**。当 PyTorch 用完当前所有段并申请新段时，
-`my_malloc` 会调用 `aclshmem_malloc`，后者透明地扩充 SHMEM 内存池
+扩容机制不变：内存池耗尽时，`aclshmem_malloc` 透明扩充
 （扩容系数 1.5×，每次最多 4 GiB）。
 
-#### 段缓存与内存统计
+#### 内存统计
 
-`load_model()` 完成后，权重加载过程中产生的临时张量（加载缓冲区、类型转换中间
-结果等）会被 PyTorch 内部释放——但 PyTorch 会将对应的段保留在内部缓存中，而不是
-立即归还给 SHMEM。这会导致 SHMEM 报告的"已用"内存高于实际权重所需。
-
-为解决这个问题，当 `ENABLE_SHMEM=1` 时，vllm-ascend 会在每次 `load_model()`
-阶段结束后自动调用 `torch.npu.empty_cache()`，将 PyTorch 缓存的段刷回 SHMEM，
-确保 KV Cache 初始化阶段能够准确感知可用空间。
-
-#### 架构层面的固有限制
-
-SHMEM 的细粒度最优适配（best-fit）算法和指针合并操作均在段的层级上运行，
-而非在单个张量层级上。这是 `NPUPluggableAllocator` API 的固有特性：PyTorch 缓存
-分配器始终介于张量申请和自定义后端之间。若要实现真正的张量级 SHMEM 管理，需要
-绕过 PyTorch 缓存分配器，这超出了本次集成的范围。
+由于没有缓存层，每次 `del tensor` / 引用归零后会立即调用 `my_free`，内存即刻
+归还 SHMEM。SHMEM 统计始终准确反映实际活跃分配。
+`torch.npu.empty_cache()` 在此模式下为空操作。
 
 ---
 

@@ -25,6 +25,15 @@ The SHMEM extension module (shmem_allocator.cpython-*.so) serves two roles:
   2. NPUPluggableAllocator backend – my_malloc / my_free symbols loaded via
      torch.npu.memory.NPUPluggableAllocator(lib_path, 'my_malloc', 'my_free')
 
+This allocator uses ``change_current_allocator`` (not the MemPool API), so
+every NPU tensor allocation is routed directly to ``my_malloc`` / ``my_free``
+without going through PyTorch's caching layer.  As a result:
+
+* SHMEM sees the **exact tensor size**, not a rounded 20 MiB segment.
+* SHMEM's best-fit and coalescing algorithms operate at real allocation
+  granularity.
+* ``torch.npu.empty_cache()`` is a no-op (no cache exists).
+
 Build requirement
 -----------------
 vllm-ascend must be compiled with ``ENABLE_SHMEM=ON`` (and ``SHMEM_HOME``
@@ -32,8 +41,7 @@ pointing to the installed SHMEM library).  Without it the module is absent and
 ``shmem_available`` stays False, making the allocator silently unavailable.
 """
 
-from contextlib import contextmanager
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 from vllm.logger import logger
@@ -118,18 +126,27 @@ class ShmemAllocator:
     Usage::
 
         allocator = ShmemAllocator.get_instance()
-        with allocator.use_memory_pool(tag="kv_cache"):
-            # All NPU allocations here go through the SHMEM pool.
-            ...
+        # Install once, before any NPU allocation (e.g. in init_device):
+        allocator.install()
+        # All subsequent torch.empty() / tensor creations go to SHMEM.
 
     Why singleton?
     The C extension keeps global state (initialisation flag, pointer set).
     Creating multiple Python-side instances would not create multiple pools
     and would confuse the lifecycle management.
+
+    Why ``change_current_allocator`` instead of MemPool?
+    In the MemPool + use_mem_pool pattern, PyTorch's caching allocator
+    interposes between tensor requests and the SHMEM backend, requesting memory
+    in fixed 20 MiB segments regardless of actual tensor size.  SHMEM's
+    fine-grained best-fit and coalescing algorithms therefore have no effect.
+
+    ``change_current_allocator`` replaces the global allocator entirely so
+    every ``torch.empty()`` call reaches ``my_malloc`` with the exact tensor
+    size, allowing SHMEM to manage memory at real allocation granularity.
     """
 
     instance: Optional["ShmemAllocator"] = None
-    default_tag: str = "default"
 
     @staticmethod
     def get_instance() -> "ShmemAllocator":
@@ -141,8 +158,8 @@ class ShmemAllocator:
         # Set _initialized first so __del__ → finalize() never raises
         # AttributeError even if __init__ raises before completing.
         self._initialized: bool = False
-        self.current_tag: str = ShmemAllocator.default_tag
-        self._pools: Dict[str, Any] = {}
+        self._installed: bool = False
+        self._alloc = None  # strong reference to the installed allocator
         if not shmem_available:
             raise RuntimeError(
                 "SHMEM allocator is not available. "
@@ -181,10 +198,42 @@ class ShmemAllocator:
             try:
                 shmem_finalize()
                 self._initialized = False
-                self._pools.clear()
                 logger.info("SHMEM allocator finalized.")
             except Exception as e:
                 logger.error("Failed to finalize SHMEM allocator: %s", e)
+
+    # ------------------------------------------------------------------ #
+    # Global allocator installation                                        #
+    # ------------------------------------------------------------------ #
+
+    def install(self) -> None:
+        """Replace the global NPU allocator with the SHMEM backend.
+
+        Must be called **before** any NPU memory allocation occurs (i.e. before
+        ``torch.npu.set_device()`` or any ``torch.empty()`` on NPU).  This is
+        a one-time, process-wide change — calling it more than once is a no-op.
+
+        After this call, every ``torch.empty()`` / tensor creation on NPU
+        routes directly to ``my_malloc`` / ``my_free`` in the SHMEM allocator
+        shared library, bypassing PyTorch's caching layer entirely.
+        """
+        if self._installed:
+            return
+        if _lib_path is None:
+            raise RuntimeError(
+                "shmem_allocator .so path is unknown; cannot install allocator"
+            )
+        alloc = torch.npu.memory.NPUPluggableAllocator(
+            _lib_path, "my_malloc", "my_free"
+        )
+        torch.npu.memory.change_current_allocator(alloc)
+        # Keep a strong reference so the allocator object is not GC'd.
+        self._alloc = alloc
+        self._installed = True
+        logger.info(
+            "SHMEM: installed as global NPU allocator (changeCurrentAllocator). "
+            "All NPU allocations now go directly to my_malloc/my_free."
+        )
 
     # ------------------------------------------------------------------ #
     # Memory statistics                                                    #
@@ -212,92 +261,17 @@ class ShmemAllocator:
         return 0
 
     # ------------------------------------------------------------------ #
-    # NPUPluggableAllocator                                                #
-    # ------------------------------------------------------------------ #
-
-    def _get_pluggable_allocator(self) -> torch.npu.memory.NPUPluggableAllocator:
-        """Build an NPUPluggableAllocator that uses my_malloc / my_free."""
-        if _lib_path is None:
-            raise RuntimeError(
-                "shmem_allocator .so path is unknown; cannot create allocator"
-            )
-        return torch.npu.memory.NPUPluggableAllocator(
-            _lib_path, "my_malloc", "my_free"
-        )
-
-    # ------------------------------------------------------------------ #
-    # Context manager                                                      #
-    # ------------------------------------------------------------------ #
-
-    @contextmanager
-    def use_memory_pool(self, tag: Optional[str] = None):
-        """
-        Context manager: NPU tensor allocations inside the block are served
-        by the SHMEM dynamic pool.
-
-        :param tag: Optional label used to identify this allocation group
-            (e.g. ``"kv_cache"``, ``"weights"``).  Currently informational
-            only; it does not affect allocation routing.
-
-        **Important – pool lifetime**: The ``MemPool`` / ``NPUPluggableAllocator``
-        pair is intentionally kept alive in ``self._pools`` *even after the
-        context exits*.  Dropping the pool object while live tensors backed by
-        it still exist can cause PyTorch to release the underlying SHMEM
-        segments, turning those tensors into dangling pointers and triggering
-        OOM or corruption during inference.  Callers that genuinely want to
-        reclaim all memory for a tag should call :meth:`release_pool` explicitly
-        after all tensors allocated under that tag have been freed.
-        """
-        if tag is None:
-            tag = ShmemAllocator.default_tag
-
-        if not self._initialized and not self.initialize():
-            raise RuntimeError("SHMEM allocator failed to initialise")
-
-        old_tag = self.current_tag
-        self.current_tag = tag
-
-        alloc = self._get_pluggable_allocator()
-        pool = torch.npu.memory.MemPool(alloc._allocator)
-
-        # Keep hard references alive **beyond** the context so that tensors
-        # allocated here (weights, KV cache) remain valid during inference.
-        # This mirrors the approach in camem.py.
-        # See https://github.com/pytorch/pytorch/issues/146431.
-        self._pools[tag] = (pool, alloc)
-        try:
-            with torch.npu.memory.use_mem_pool(pool):
-                yield
-        finally:
-            self.current_tag = old_tag
-            # Do NOT pop self._pools[tag] here – the pool must outlive
-            # the context so that tensors allocated inside remain valid.
-
-    def release_pool(self, tag: Optional[str] = None) -> None:
-        """Drop the pool reference for *tag*, allowing GC to reclaim it.
-
-        Only call this after all tensors allocated under *tag* have been
-        freed; otherwise those tensors will reference released memory.
-        """
-        if tag is None:
-            tag = ShmemAllocator.default_tag
-        self._pools.pop(tag, None)
-
-    # ------------------------------------------------------------------ #
     # Sleep / wake-up stubs (API compatibility with CaMemAllocator)       #
     # ------------------------------------------------------------------ #
 
-    def sleep(
-        self,
-        offload_tags: Optional[Union[Tuple[str, ...], str]] = None,
-    ) -> None:
+    def sleep(self, offload_tags=None) -> None:
         """
         No-op.  SHMEM keeps device memory resident at all times; CPU
         offloading is not supported by this backend.
         """
         logger.debug("ShmemAllocator.sleep() called (no-op for shmem backend)")
 
-    def wake_up(self, tags: Optional[list] = None) -> None:  # type: ignore[type-arg]
+    def wake_up(self, tags=None) -> None:
         """
         No-op.  Counterpart to :meth:`sleep`.
         """

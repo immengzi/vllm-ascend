@@ -252,6 +252,14 @@ class NPUWorker(WorkerBase):
         # NOTE: KEEP device the member of `NPUWorker`, as it will be checked
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
         # for more details
+
+        # Install the SHMEM allocator as the global NPU allocator before any
+        # NPU memory is allocated.  change_current_allocator requires that the
+        # allocator has not yet been initialised, so this must happen before
+        # torch.npu.set_device() / torch.npu.empty_cache() in _init_device().
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            ShmemAllocator.get_instance().install()
+
         self.device = self._init_device()
         # Initialize workspace manager
         num_ubatches = 1
@@ -371,15 +379,17 @@ class NPUWorker(WorkerBase):
 
     def load_model(self) -> None:
         if envs_ascend.ENABLE_SHMEM and shmem_available:
-            # Use the SHMEM dynamic pool for weight allocation.
-            # SHMEM does not support CPU offloading, so sleep mode must be
-            # disabled when ENABLE_SHMEM is active.
+            # The SHMEM allocator is already installed globally via
+            # install() in init_device().  All NPU allocations during weight
+            # loading go directly to my_malloc / my_free without any caching
+            # layer, so no context manager or empty_cache() is needed here.
+            # SHMEM does not support CPU offloading.
             if self.vllm_config.model_config.enable_sleep_mode:
                 raise RuntimeError(
                     "ENABLE_SHMEM and sleep mode are mutually exclusive: "
                     "the SHMEM allocator does not support CPU offloading.")
-            allocator = ShmemAllocator.get_instance()
-            context = allocator.use_memory_pool(tag="weights")
+            from contextlib import nullcontext
+            context = nullcontext()  # type: ignore
         elif self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, (
@@ -392,15 +402,6 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
-
-        # After weight loading, flush PyTorch's internal segment cache back to
-        # the SHMEM pool. During loading, temporary tensors (optimizer states,
-        # intermediate buffers) are allocated and freed; PyTorch holds those
-        # freed segments in its cache rather than returning them to SHMEM
-        # immediately. Calling empty_cache() releases those segments so SHMEM
-        # can accurately account for free space before KV cache initialisation.
-        if envs_ascend.ENABLE_SHMEM and shmem_available:
-            torch.npu.empty_cache()
 
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.
@@ -467,15 +468,14 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         if envs_ascend.ENABLE_SHMEM and shmem_available:
-            allocator = ShmemAllocator.get_instance()
-            context = allocator.use_memory_pool(tag="kv_cache")
+            # Allocator is already global; KV cache allocations go directly
+            # to SHMEM without a context manager.
+            self.model_runner.initialize_kv_cache(kv_cache_config)
         elif self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
-            context = allocator.use_memory_pool(tag="kv_cache")
+            with allocator.use_memory_pool(tag="kv_cache"):
+                self.model_runner.initialize_kv_cache(kv_cache_config)
         else:
-            from contextlib import nullcontext
-            context = nullcontext()  # type: ignore
-        with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def profile(self, is_start: bool = True):

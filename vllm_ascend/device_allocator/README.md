@@ -31,20 +31,18 @@ the entire model and allows vllm to grow its KV-cache on demand.
 ```
 Python layer (vllm-ascend)
 │
-│  worker.py: load_model()            → weights in SHMEM pool
-│  worker.py: initialize_from_config() → KV cache in SHMEM pool
-│      ↓
-│  ShmemAllocator.use_memory_pool(tag)
-│      ↓
-│  torch.npu.memory.NPUPluggableAllocator(lib_path, 'my_malloc', 'my_free')
-│      ↓
-│  torch.npu.memory.MemPool  +  torch.npu.memory.use_mem_pool(pool)
+│  worker.py: init_device()
+│      └─ ShmemAllocator.install()           ← one-time global replacement
+│              └─ change_current_allocator(NPUPluggableAllocator)
+│
+│  worker.py: load_model()            → weights go to SHMEM
+│  worker.py: initialize_from_config() → KV cache goes to SHMEM
 │      │
-│      │  every torch.empty() / tensor creation inside the context
+│      │  every torch.empty() / tensor creation on NPU
 │      ↓
 C++ layer (shmem_allocator.cpython-*.so)
 │
-│  my_malloc(size, device, stream)
+│  my_malloc(size, device, stream)        ← called with exact tensor size
 │      ├─ ensure_shmem_initialized()    ← lazy, idempotent, thread-safe
 │      ├─ aclshmem_malloc(size)         ← SHMEM pool (expands automatically)
 │      │    └─ on failure: aclrtMalloc  ← ACL fallback
@@ -89,13 +87,17 @@ SHMEM library (libshmem.so)
 
 ### Allocation scope in vllm-ascend
 
-When `ENABLE_SHMEM=1`, both major NPU allocation phases are routed through
-the SHMEM dynamic pool:
+When `ENABLE_SHMEM=1`, `ShmemAllocator.install()` is called in
+`worker.init_device()` before any NPU memory is allocated, replacing the
+global NPU allocator for the entire process lifetime.  **All** NPU tensor
+allocations — model weights, KV cache, activations, and temporary buffers —
+are routed directly to SHMEM's `my_malloc` / `my_free`.
 
-| Phase | Function | Pool tag |
-|-------|----------|----------|
-| Model weight loading | `worker.load_model()` | `"weights"` |
-| KV cache initialisation | `worker.initialize_from_config()` | `"kv_cache"` |
+| Phase | Function | Handled by |
+|-------|----------|------------|
+| Global allocator install | `worker.init_device()` | `ShmemAllocator.install()` |
+| Model weight loading | `worker.load_model()` | global SHMEM allocator |
+| KV cache initialisation | `worker.initialize_from_config()` | global SHMEM allocator |
 
 ---
 
@@ -189,9 +191,9 @@ ENABLE_SHMEM=1 python your_vllm_script.py
 | Method | Description |
 |--------|-------------|
 | `ShmemAllocator.get_instance()` | Return singleton instance |
-| `.initialize() → bool` | Explicitly initialise the pool (idempotent) |
-| `.finalize()` | Release the pool and reset state |
-| `.use_memory_pool(tag=None)` | Context manager: route allocations to SHMEM |
+| `.install()` | Replace the global NPU allocator with SHMEM (call once before any NPU alloc) |
+| `.initialize() → bool` | Explicitly initialise the SHMEM pool (idempotent; called lazily by `my_malloc`) |
+| `.finalize()` | Release the SHMEM pool and reset state |
 | `.get_memory_stats() → (total, used, avail)` | Pool statistics in bytes |
 | `.get_current_usage() → int` | Bytes currently allocated |
 | `.sleep(offload_tags=None)` | No-op (API compat with CaMemAllocator) |
@@ -216,59 +218,35 @@ from vllm_ascend.device_allocator.shmem_allocator import shmem_available
 
 ### Memory Allocation Granularity
 
-#### Why SHMEM logs show 20 MiB allocations
+#### Exact tensor-size allocation
 
-When `ENABLE_SHMEM=1`, you may observe via SHMEM logs that every call to
-`aclshmem_malloc` requests exactly **20 MiB** regardless of the individual
-tensor size. This is expected behaviour arising from the layered allocator
-architecture:
+The `changeCurrentAllocator` approach bypasses PyTorch's caching allocator
+entirely.  Every `torch.empty()` call reaches `my_malloc` with the **exact
+tensor size**:
 
 ```
-torch.empty(512 KB)              ← individual tensor request
-  → PyTorch-NPU caching allocator
-      → search internal free-block cache
-      → not found: call my_malloc(20 MiB)  ← SHMEM sees this
-      → sub-allocate 512 KB from the 20 MiB segment
-      → retain remaining ~19.5 MiB in internal cache
+torch.empty(512 KB)
+  → change_current_allocator path
+  → my_malloc(512 KB)    ← SHMEM sees exact size
+  → aclshmem_malloc(512 KB) or dynamic_memory_manager sub-allocation
 ```
 
-`NPUPluggableAllocator` positions SHMEM as the **segment allocator** (raw
-memory backend) for PyTorch's caching allocator, not as a per-tensor
-allocator. PyTorch manages fine-grained sub-allocations from segments
-internally; SHMEM only observes segment-level requests.
+SHMEM's best-fit selection and coalescing logic therefore operate at real
+allocation granularity.  The previous 20 MiB segment rounding imposed by
+PyTorch's caching allocator no longer applies.
 
-The 20 MiB value is `kLargeBuffer` — PyTorch-NPU's fixed segment size for
-"large" allocations (1–10 MiB range). This is a property of the caching
-allocator and cannot be changed from the vllm-ascend or SHMEM layer alone.
+#### Dynamic expansion
 
-#### Effect on dynamic expansion
+Dynamic expansion works as before: when the current pool is exhausted,
+`aclshmem_malloc` transparently expands (1.5× growth factor, up to 4 GiB
+per block).
 
-Dynamic expansion **still works correctly** at segment granularity. When
-PyTorch exhausts the currently available segments and requests a new one,
-`my_malloc` calls `aclshmem_malloc` which transparently expands the SHMEM
-pool (1.5× growth factor, up to 4 GiB per block).
+#### Memory accounting
 
-#### Segment cache and memory accounting
-
-After `load_model()` completes, temporary tensors created during weight
-loading (loader buffers, type-cast intermediates, etc.) are freed by PyTorch
-internally — but PyTorch retains the corresponding segments in its internal
-cache rather than immediately returning them to SHMEM. This can make SHMEM
-report more memory "in use" than the permanent weights actually require.
-
-To address this, vllm-ascend automatically calls `torch.npu.empty_cache()`
-after each `load_model()` phase when `ENABLE_SHMEM=1`. This flushes
-PyTorch's cached segments back to SHMEM so that accurate free-pool space is
-available for KV cache initialisation.
-
-#### Architectural limitation
-
-SHMEM's fine-grained best-fit algorithm and pointer coalescing operate at the
-segment level, not at the individual tensor level. This is an inherent
-property of the `NPUPluggableAllocator` API: PyTorch's caching allocator
-always interposes between tensor requests and the custom backend. True
-tensor-level SHMEM management would require bypassing PyTorch's caching
-allocator entirely, which is outside the scope of this integration.
+Because there is no caching layer, every `del tensor` / reference drop
+immediately calls `my_free`, which returns the memory to SHMEM.  SHMEM
+statistics always reflect the actual live allocation accurately.
+`torch.npu.empty_cache()` is a no-op in this mode.
 
 ---
 
