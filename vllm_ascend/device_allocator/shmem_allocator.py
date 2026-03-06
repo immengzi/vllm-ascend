@@ -137,6 +137,15 @@ class ShmemAllocator:
             ShmemAllocator.instance = ShmemAllocator()
         return ShmemAllocator.instance
 
+    # Default segment size requested from PyTorch's caching allocator when
+    # SHMEM is the backend.  PyTorch normally uses kLargeBuffer = 20 MiB for
+    # allocations in the 1–10 MiB range, which means SHMEM only ever sees
+    # coarse 20 MiB requests and its fine-grained pool algorithms have no
+    # effect at the tensor level.  We reduce this to 2 MiB so SHMEM operates
+    # at a granularity closer to individual KV-cache blocks.
+    # Users can override via SHMEM_SEGMENT_SIZE_MB (1–512).
+    DEFAULT_SEGMENT_SIZE_MB: int = 2
+
     def __init__(self) -> None:
         # Set _initialized first so __del__ → finalize() never raises
         # AttributeError even if __init__ raises before completing.
@@ -157,6 +166,47 @@ class ShmemAllocator:
                 "https://github.com/pytorch/pytorch/issues/147851 "
                 "for the latest updates."
             )
+        self._configure_segment_size(conf)
+
+    # ------------------------------------------------------------------ #
+    # Segment-size configuration                                           #
+    # ------------------------------------------------------------------ #
+
+    def _configure_segment_size(self, existing_conf: str) -> None:
+        """Inject *segment_size_mb* into PYTORCH_NPU_ALLOC_CONF.
+
+        PyTorch NPU's caching allocator batches tensor allocations into
+        fixed-size *segments* before calling the pluggable allocator backend.
+        The default large-pool segment is 20 MiB (``kLargeBuffer``), making
+        SHMEM's fine-grained algorithms operate at 20 MiB granularity.
+
+        We lower this to ``DEFAULT_SEGMENT_SIZE_MB`` (2 MiB by default) so
+        SHMEM sees allocations closer in size to individual KV-cache blocks,
+        enabling its best-fit and coalescing logic to be effective.
+
+        Override with the ``SHMEM_SEGMENT_SIZE_MB`` environment variable.
+        """
+        import os
+        try:
+            seg_mb = int(os.environ.get(
+                "SHMEM_SEGMENT_SIZE_MB", self.DEFAULT_SEGMENT_SIZE_MB))
+            seg_mb = max(1, min(seg_mb, 512))
+        except ValueError:
+            seg_mb = self.DEFAULT_SEGMENT_SIZE_MB
+
+        # Only inject if segment_size_mb is not already set by the user.
+        if "segment_size_mb" not in existing_conf:
+            new_entry = f"segment_size_mb:{seg_mb}"
+            new_conf = (f"{existing_conf},{new_entry}"
+                        if existing_conf else new_entry)
+            os.environ["PYTORCH_NPU_ALLOC_CONF"] = new_conf
+            logger.info(
+                "SHMEM: set PYTORCH_NPU_ALLOC_CONF segment_size_mb=%d MiB "
+                "(override with SHMEM_SEGMENT_SIZE_MB env var)", seg_mb)
+        else:
+            logger.info(
+                "SHMEM: segment_size_mb already configured in "
+                "PYTORCH_NPU_ALLOC_CONF, skipping auto-configuration")
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
@@ -238,6 +288,15 @@ class ShmemAllocator:
         :param tag: Optional label used to identify this allocation group
             (e.g. ``"kv_cache"``, ``"weights"``).  Currently informational
             only; it does not affect allocation routing.
+
+        **Important – pool lifetime**: The ``MemPool`` / ``NPUPluggableAllocator``
+        pair is intentionally kept alive in ``self._pools`` *even after the
+        context exits*.  Dropping the pool object while live tensors backed by
+        it still exist can cause PyTorch to release the underlying SHMEM
+        segments, turning those tensors into dangling pointers and triggering
+        OOM or corruption during inference.  Callers that genuinely want to
+        reclaim all memory for a tag should call :meth:`release_pool` explicitly
+        after all tensors allocated under that tag have been freed.
         """
         if tag is None:
             tag = ShmemAllocator.default_tag
@@ -251,15 +310,28 @@ class ShmemAllocator:
         alloc = self._get_pluggable_allocator()
         pool = torch.npu.memory.MemPool(alloc._allocator)
 
-        # Keep hard references alive for the lifetime of the context
-        # (mirrors the workaround in camem.py for PyTorch GC bugs).
+        # Keep hard references alive **beyond** the context so that tensors
+        # allocated here (weights, KV cache) remain valid during inference.
+        # This mirrors the approach in camem.py.
+        # See https://github.com/pytorch/pytorch/issues/146431.
         self._pools[tag] = (pool, alloc)
         try:
             with torch.npu.memory.use_mem_pool(pool):
                 yield
         finally:
             self.current_tag = old_tag
-            self._pools.pop(tag, None)
+            # Do NOT pop self._pools[tag] here – the pool must outlive
+            # the context so that tensors allocated inside remain valid.
+
+    def release_pool(self, tag: Optional[str] = None) -> None:
+        """Drop the pool reference for *tag*, allowing GC to reclaim it.
+
+        Only call this after all tensors allocated under *tag* have been
+        freed; otherwise those tensors will reference released memory.
+        """
+        if tag is None:
+            tag = ShmemAllocator.default_tag
+        self._pools.pop(tag, None)
 
     # ------------------------------------------------------------------ #
     # Sleep / wake-up stubs (API compatibility with CaMemAllocator)       #
