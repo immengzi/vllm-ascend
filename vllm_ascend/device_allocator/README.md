@@ -237,18 +237,9 @@ memory backend) for PyTorch's caching allocator, not as a per-tensor
 allocator. PyTorch manages fine-grained sub-allocations from segments
 internally; SHMEM only observes segment-level requests.
 
-The 20 MiB value is `kLargeBuffer` — PyTorch-NPU's default segment size for
-"large" allocations (1–10 MiB range).  vllm-ascend automatically lowers this
-to **2 MiB** by injecting `segment_size_mb:2` into `PYTORCH_NPU_ALLOC_CONF`
-when SHMEM is enabled, so SHMEM's best-fit algorithm operates at 2 MiB
-granularity.  Override with:
-
-```bash
-export SHMEM_SEGMENT_SIZE_MB=1   # 1–512 MiB, default 2
-```
-
-If `segment_size_mb` is already present in `PYTORCH_NPU_ALLOC_CONF`, the
-automatic injection is skipped.
+The 20 MiB value is `kLargeBuffer` — PyTorch-NPU's fixed segment size for
+"large" allocations (1–10 MiB range). This is a property of the caching
+allocator and cannot be changed from the vllm-ascend or SHMEM layer alone.
 
 #### Effect on dynamic expansion
 

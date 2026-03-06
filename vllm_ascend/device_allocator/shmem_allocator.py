@@ -137,15 +137,6 @@ class ShmemAllocator:
             ShmemAllocator.instance = ShmemAllocator()
         return ShmemAllocator.instance
 
-    # Default segment size requested from PyTorch's caching allocator when
-    # SHMEM is the backend.  PyTorch normally uses kLargeBuffer = 20 MiB for
-    # allocations in the 1–10 MiB range, which means SHMEM only ever sees
-    # coarse 20 MiB requests and its fine-grained pool algorithms have no
-    # effect at the tensor level.  We reduce this to 2 MiB so SHMEM operates
-    # at a granularity closer to individual KV-cache blocks.
-    # Users can override via SHMEM_SEGMENT_SIZE_MB (1–512).
-    DEFAULT_SEGMENT_SIZE_MB: int = 2
-
     def __init__(self) -> None:
         # Set _initialized first so __del__ → finalize() never raises
         # AttributeError even if __init__ raises before completing.
@@ -166,47 +157,6 @@ class ShmemAllocator:
                 "https://github.com/pytorch/pytorch/issues/147851 "
                 "for the latest updates."
             )
-        self._configure_segment_size(conf)
-
-    # ------------------------------------------------------------------ #
-    # Segment-size configuration                                           #
-    # ------------------------------------------------------------------ #
-
-    def _configure_segment_size(self, existing_conf: str) -> None:
-        """Inject *segment_size_mb* into PYTORCH_NPU_ALLOC_CONF.
-
-        PyTorch NPU's caching allocator batches tensor allocations into
-        fixed-size *segments* before calling the pluggable allocator backend.
-        The default large-pool segment is 20 MiB (``kLargeBuffer``), making
-        SHMEM's fine-grained algorithms operate at 20 MiB granularity.
-
-        We lower this to ``DEFAULT_SEGMENT_SIZE_MB`` (2 MiB by default) so
-        SHMEM sees allocations closer in size to individual KV-cache blocks,
-        enabling its best-fit and coalescing logic to be effective.
-
-        Override with the ``SHMEM_SEGMENT_SIZE_MB`` environment variable.
-        """
-        import os
-        try:
-            seg_mb = int(os.environ.get(
-                "SHMEM_SEGMENT_SIZE_MB", self.DEFAULT_SEGMENT_SIZE_MB))
-            seg_mb = max(1, min(seg_mb, 512))
-        except ValueError:
-            seg_mb = self.DEFAULT_SEGMENT_SIZE_MB
-
-        # Only inject if segment_size_mb is not already set by the user.
-        if "segment_size_mb" not in existing_conf:
-            new_entry = f"segment_size_mb:{seg_mb}"
-            new_conf = (f"{existing_conf},{new_entry}"
-                        if existing_conf else new_entry)
-            os.environ["PYTORCH_NPU_ALLOC_CONF"] = new_conf
-            logger.info(
-                "SHMEM: set PYTORCH_NPU_ALLOC_CONF segment_size_mb=%d MiB "
-                "(override with SHMEM_SEGMENT_SIZE_MB env var)", seg_mb)
-        else:
-            logger.info(
-                "SHMEM: segment_size_mb already configured in "
-                "PYTORCH_NPU_ALLOC_CONF, skipping auto-configuration")
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #
