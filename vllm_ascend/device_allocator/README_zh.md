@@ -204,6 +204,55 @@ from vllm_ascend.device_allocator.shmem_allocator import shmem_available
 
 ---
 
+### 内存分配粒度说明
+
+#### 为什么 SHMEM 日志中每次分配都是 28 MB
+
+启用 `ENABLE_SHMEM=1` 后，通过 SHMEM 日志可观察到每次 `aclshmem_malloc`
+申请的内存都固定为 **28 MB**，与实际张量大小无关。这是分层分配器架构的预期行为：
+
+```
+torch.empty(512 KB)              ← 单个张量申请
+  → PyTorch-NPU 缓存分配器
+      → 在内部空闲块缓存中查找
+      → 未命中：调用 my_malloc(28 MB)  ← SHMEM 看到的是这一层
+      → 从 28 MB 段中分配 512 KB
+      → 剩余 27.5 MB 留在内部缓存备用
+```
+
+`NPUPluggableAllocator` 将 SHMEM 定位为 PyTorch 缓存分配器的**段分配器**（底层
+内存来源），而非逐张量分配器。PyTorch 在段内部自行管理细粒度的子分配；SHMEM
+仅感知段级别（28 MB）的请求。
+
+28 MB 是 PyTorch-NPU 对"大型"分配的默认最小段大小。可通过
+`PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:N` 进行调整：N 越小，缓存分配器在
+向 SHMEM 申请新段之前会将已有缓存段拆分得更细。
+
+#### 对动态扩容的影响
+
+动态扩容在 28 MB 粒度下**仍然正常工作**。当 PyTorch 用完当前所有 28 MB 段并
+申请新段时，`my_malloc` 会调用 `aclshmem_malloc`，后者透明地扩充 SHMEM 内存池
+（扩容系数 1.5×，每次最多 4 GiB）。
+
+#### 段缓存与内存统计
+
+`load_model()` 完成后，权重加载过程中产生的临时张量（加载缓冲区、类型转换中间
+结果等）会被 PyTorch 内部释放——但 PyTorch 会将对应的 28 MB 段保留在内部缓存
+中，而不是立即归还给 SHMEM。这会导致 SHMEM 报告的"已用"内存高于实际权重所需。
+
+为解决这个问题，当 `ENABLE_SHMEM=1` 时，vllm-ascend 会在每次 `load_model()`
+阶段结束后自动调用 `torch.npu.empty_cache()`，将 PyTorch 缓存的段刷回 SHMEM，
+确保 KV Cache 初始化阶段能够准确感知可用空间。
+
+#### 架构层面的固有限制
+
+SHMEM 的细粒度最优适配（best-fit）算法和指针合并操作均在 28 MB 段的层级上运行，
+而非在单个张量层级上。这是 `NPUPluggableAllocator` API 的固有特性：PyTorch 缓存
+分配器始终介于张量申请和自定义后端之间。若要实现真正的张量级 SHMEM 管理，需要
+绕过 PyTorch 缓存分配器，这超出了本次集成的范围。
+
+---
+
 ### 常见问题排查
 
 **`ImportError: No module named 'vllm_ascend.shmem_allocator'`**
@@ -227,3 +276,9 @@ CPU 卸载，二者只能选其一。
 **`aclshmem_malloc failed … falling back to aclrtMalloc`**
 SHMEM 池动态扩容失败（设备显存不足）。请减小 `SHMEM_INITIAL_POOL_SIZE`
 或降低模型批次大小。
+
+**`RuntimeError: expandable_segments:True is not compatible with the SHMEM memory pool`**
+环境变量中设置了 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`。
+PyTorch 的 expandable_segments 与可插拔内存池不兼容
+（参见 [pytorch#147851](https://github.com/pytorch/pytorch/issues/147851)）。
+请从 `PYTORCH_NPU_ALLOC_CONF` 中删除或取消 `expandable_segments:True`。

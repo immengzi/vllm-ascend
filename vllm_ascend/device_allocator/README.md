@@ -214,6 +214,66 @@ from vllm_ascend.device_allocator.shmem_allocator import shmem_available
 
 ---
 
+### Memory Allocation Granularity
+
+#### Why SHMEM logs show 28 MB allocations
+
+When `ENABLE_SHMEM=1`, you may observe via SHMEM logs that every call to
+`aclshmem_malloc` requests exactly **28 MB** regardless of the individual
+tensor size. This is expected behaviour arising from the layered allocator
+architecture:
+
+```
+torch.empty(512 KB)              ← individual tensor request
+  → PyTorch-NPU caching allocator
+      → search internal free-block cache
+      → not found: call my_malloc(28 MB)  ← SHMEM sees this
+      → sub-allocate 512 KB from the 28 MB segment
+      → retain remaining 27.5 MB in internal cache
+```
+
+`NPUPluggableAllocator` positions SHMEM as the **segment allocator** (raw
+memory backend) for PyTorch's caching allocator, not as a per-tensor
+allocator. PyTorch manages fine-grained sub-allocations from segments
+internally; SHMEM only observes segment-level (28 MB) requests.
+
+The 28 MB value is PyTorch-NPU's default minimum segment size for large
+allocations. It can be influenced via
+`PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:N` (smaller N allows the
+caching allocator to split cached segments into finer pieces before
+requesting new ones from SHMEM).
+
+#### Effect on dynamic expansion
+
+Dynamic expansion **still works correctly** at 28 MB granularity. When
+PyTorch exhausts the currently available 28 MB segments and requests a new
+one, `my_malloc` calls `aclshmem_malloc` which transparently expands the
+SHMEM pool (1.5× growth factor, up to 4 GiB per block).
+
+#### Segment cache and memory accounting
+
+After `load_model()` completes, temporary tensors created during weight
+loading (loader buffers, type-cast intermediates, etc.) are freed by PyTorch
+internally — but PyTorch retains the corresponding 28 MB segments in its
+internal cache rather than immediately returning them to SHMEM. This can make
+SHMEM report more memory "in use" than the permanent weights actually require.
+
+To address this, vllm-ascend automatically calls `torch.npu.empty_cache()`
+after each `load_model()` phase when `ENABLE_SHMEM=1`. This flushes
+PyTorch's cached segments back to SHMEM so that accurate free-pool space is
+available for KV cache initialisation.
+
+#### Architectural limitation
+
+SHMEM's fine-grained best-fit algorithm and pointer coalescing operate at the
+28 MB segment level, not at the individual tensor level. This is an inherent
+property of the `NPUPluggableAllocator` API: PyTorch's caching allocator
+always interposes between tensor requests and the custom backend. True
+tensor-level SHMEM management would require bypassing PyTorch's caching
+allocator entirely, which is outside the scope of this integration.
+
+---
+
 ### Troubleshooting
 
 **`ImportError: No module named 'vllm_ascend.shmem_allocator'`**
@@ -237,3 +297,9 @@ Common causes:
 **`aclshmem_malloc failed … falling back to aclrtMalloc`**
 The SHMEM pool failed to expand (device OOM). Reduce
 `SHMEM_INITIAL_POOL_SIZE` or the model batch size.
+
+**`RuntimeError: expandable_segments:True is not compatible with the SHMEM memory pool`**
+`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` was set in the environment.
+PyTorch expandable segments are incompatible with pluggable memory pools
+(see [pytorch#147851](https://github.com/pytorch/pytorch/issues/147851)).
+Unset or remove `expandable_segments:True` from `PYTORCH_NPU_ALLOC_CONF`.
