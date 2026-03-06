@@ -8,8 +8,7 @@ import psutil
 import torch_npu
 from vllm.logger import logger
 
-ASCEND_RT_VISIBLE_DEVICES = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
-CPU_BINDING_NUM = os.getenv("CPU_BINDING_NUM")
+
 
 
 def execute_command(cmd_list):
@@ -55,11 +54,11 @@ class NpuHbmInfo:
         """
         if cls.visible_npu_ids:
             return
-        if ASCEND_RT_VISIBLE_DEVICES is None:
+        visible_devices_str = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
+        if visible_devices_str is None:
             devices = sorted(list(_get_device_map_info().keys()))
         else:
-            devices_str = ASCEND_RT_VISIBLE_DEVICES
-            devices = [int(x) for x in devices_str.split(",")]
+            devices = [int(x) for x in visible_devices_str.split(",")]
         device_map_info = _get_device_map_info()
         npu_ids = []
         for device in devices:
@@ -272,7 +271,7 @@ def _get_cpu_info(numa_ids, keyword1="NUMAnode", keyword2="CPU(s)"):
 
 def bind_cpus(rank_id, ratio=0.5):
     # get all visible devices
-    visible_devices = ASCEND_RT_VISIBLE_DEVICES
+    visible_devices = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
 
     if visible_devices is None:
         devices = sorted(list(_get_device_map_info().keys()))
@@ -304,10 +303,11 @@ def bind_cpus(rank_id, ratio=0.5):
     )
 
     cpu_nums = len(all_cpus)
-    if CPU_BINDING_NUM is None:
+    cpu_binding_num = os.getenv("CPU_BINDING_NUM")
+    if cpu_binding_num is None:
         cpu_num_per_device = int(cpu_nums * ratio // len(shard_devices))
     else:
-        cpu_num_per_device = int(CPU_BINDING_NUM)
+        cpu_num_per_device = int(cpu_binding_num)
         if len(shard_devices) * cpu_num_per_device > cpu_nums:
             raise RuntimeError(
                 f"Cpu num in numa {numa_id} to assign {cpu_num_per_device} for every device is not enough, "

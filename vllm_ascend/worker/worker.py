@@ -307,6 +307,18 @@ class NPUWorker(WorkerBase):
             total_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
+        # When SHMEM is enabled for KV cache allocation, the SHMEM pool expands
+        # using device HBM via aclrtMalloc (one block per expansion step, up to
+        # 4 GiB each with a 1.5x growth factor). This means the pool consumes
+        # approximately 1.5x the actual data size in HBM (data + free headroom
+        # kept by the growth policy). Divide the budget by this factor so the
+        # KV cache target stays within actual device memory limits.
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            _SHMEM_EXPANSION_OVERHEAD = 1.5
+            available_kv_cache_memory = int(
+                available_kv_cache_memory / _SHMEM_EXPANSION_OVERHEAD)
+            available_kv_cache_memory = int(
+                max(available_kv_cache_memory, 0))
         logger.info(
             f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
         )
