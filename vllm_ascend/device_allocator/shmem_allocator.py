@@ -148,6 +148,15 @@ class ShmemAllocator:
                 "SHMEM allocator is not available. "
                 "Rebuild vllm-ascend with ENABLE_SHMEM=ON."
             )
+        import os
+        conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+        if "expandable_segments:True" in conf:
+            raise RuntimeError(
+                "expandable_segments:True is not compatible with the SHMEM "
+                "memory pool. Please track "
+                "https://github.com/pytorch/pytorch/issues/147851 "
+                "for the latest updates."
+            )
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                            #

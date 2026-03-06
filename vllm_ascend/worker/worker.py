@@ -376,6 +376,15 @@ class NPUWorker(WorkerBase):
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
+        # After weight loading, flush PyTorch's internal segment cache back to
+        # the SHMEM pool. During loading, temporary tensors (optimizer states,
+        # intermediate buffers) are allocated and freed; PyTorch holds those
+        # freed segments in its cache rather than returning them to SHMEM
+        # immediately. Calling empty_cache() releases those segments so SHMEM
+        # can accurately account for free space before KV cache initialisation.
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            torch.npu.empty_cache()
+
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes
