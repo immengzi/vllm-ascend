@@ -667,6 +667,86 @@ class TestACLGraphWrapper(TestBase):
                     # Verify debug log was called
                     mock_logger.debug.assert_called_once()
 
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    def test_initialization_with_shmem_active(self, mock_envs,
+                                              mock_current_platform):
+        """Test ACLGraphWrapper sets graph_pool=None when SHMEM allocator is active"""
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+
+        mock_shmem_instance = MagicMock()
+        mock_shmem_instance._installed = True
+
+        with patch(
+                'vllm_ascend.device_allocator.shmem_allocator.ShmemAllocator'
+        ) as mock_shmem_cls:
+            mock_shmem_cls.get_instance.return_value = mock_shmem_instance
+
+            wrapper = ACLGraphWrapper(runnable=self.mock_runnable,
+                                      vllm_config=self.mock_vllm_config,
+                                      runtime_mode=CUDAGraphMode.FULL)
+
+        # graph_pool must be None when SHMEM is active so that
+        # torch.npu.graph is called with pool=None, avoiding the
+        # NPUPluggableAllocator beginAllocateToPool error.
+        self.assertIsNone(wrapper.graph_pool)
+
+    @patch('vllm_ascend.compilation.acl_graph.torch')
+    @patch(
+        'vllm_ascend.compilation.acl_graph.validate_cudagraph_capturing_enabled'
+    )
+    @patch('vllm_ascend.compilation.acl_graph.get_forward_context')
+    @patch('vllm_ascend.compilation.acl_graph.current_platform')
+    @patch('vllm_ascend.compilation.acl_graph.envs')
+    @patch('vllm_ascend.compilation.acl_graph.compilation_counter')
+    @patch('vllm_ascend.compilation.acl_graph.weak_ref_tensors')
+    def test_call_capture_graph_with_shmem_uses_none_pool(
+            self, mock_weak_ref_tensors, mock_compilation_counter, mock_envs,
+            mock_current_platform, mock_get_forward_context,
+            mock_validate_cudagraph_capturing_enabled, mock_torch):
+        """Test that torch.npu.graph is called with pool=None when SHMEM is active"""
+        mock_envs.VLLM_LOGGING_LEVEL = "INFO"
+        mock_current_platform.get_global_graph_pool.return_value = self.mock_graph_pool
+        mock_get_forward_context.return_value = self.mock_forward_context
+        self.mock_forward_context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+
+        mock_npu_graph = MagicMock()
+        mock_torch.npu.NPUGraph.return_value = mock_npu_graph
+
+        mock_graph_context = MagicMock()
+        mock_torch.npu.graph.return_value = mock_graph_context
+        mock_graph_context.__enter__ = Mock(return_value=None)
+        mock_graph_context.__exit__ = Mock(return_value=None)
+
+        mock_weak_ref_tensors.return_value = "weak_ref_output"
+        mock_torch.Tensor = torch.Tensor
+        mock_compilation_counter.num_cudagraph_captured = 0
+
+        mock_shmem_instance = MagicMock()
+        mock_shmem_instance._installed = True
+
+        with patch(
+                'vllm_ascend.device_allocator.shmem_allocator.ShmemAllocator'
+        ) as mock_shmem_cls:
+            mock_shmem_cls.get_instance.return_value = mock_shmem_instance
+
+            wrapper = ACLGraphWrapper(
+                runnable=self.mock_runnable,
+                vllm_config=self.mock_vllm_config,
+                runtime_mode=CUDAGraphMode.FULL,
+                cudagraph_options=self.mock_cudagraph_options)
+
+        # Confirm graph_pool is None
+        self.assertIsNone(wrapper.graph_pool)
+
+        test_tensor = torch.tensor([1, 2, 3])
+        wrapper(test_tensor, "arg2")
+
+        # NPUPluggableAllocator does not support beginAllocateToPool, so
+        # pool must be None when SHMEM is active.
+        mock_torch.npu.graph.assert_called_once_with(mock_npu_graph, pool=None)
+
     def test_getattr_access_runnable_attributes(self):
         """Test __getattr__ method accesses runnable attributes"""
         mock_runnable = MagicMock()

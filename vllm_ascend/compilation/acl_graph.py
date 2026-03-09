@@ -86,7 +86,7 @@ class ACLGraphWrapper:
                 ShmemAllocator)
             if ShmemAllocator.get_instance()._installed:
                 self.graph_pool = None
-        except ImportError:
+        except (ImportError, RuntimeError):
             pass
 
         if cudagraph_options is None:
@@ -161,7 +161,7 @@ class ACLGraphWrapper:
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
-                with torch.npu.graph(aclgraph, pool=None):
+                with torch.npu.graph(aclgraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
