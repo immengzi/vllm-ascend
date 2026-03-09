@@ -234,52 +234,54 @@ class ShmemAllocator:
             "SHMEM: installed as global NPU allocator (changeCurrentAllocator). "
             "All NPU allocations now go directly to my_malloc/my_free."
         )
-        self._patch_memory_stats()
+        self._register_stats_callbacks(alloc)
 
     # ------------------------------------------------------------------ #
-    # torch_npu memory-stats compatibility shim                           #
+    # torch_npu memory-stats compatibility                                 #
     # ------------------------------------------------------------------ #
 
-    def _patch_memory_stats(self) -> None:
-        """Patch torch_npu.npu.memory_stats to serve SHMEM pool statistics.
+    def _register_stats_callbacks(self, alloc) -> None:
+        """Register getDeviceStats / resetPeakStats C++ callbacks.
 
-        NPUPluggableAllocator's C++ stub for getDeviceStats() has a missing
-        return statement in the else-branch (when get_device_stats_fn_ is not
-        registered).  On aarch64 a value-returning function that falls off its
-        end without a return corrupts the stack canary → "stack smashing
-        detected" crash.
+        NPUPluggableAllocator::getDeviceStats() in torch_npu has a missing
+        return statement when no callback is registered.  On aarch64 this
+        causes stack-canary corruption ("*** stack smashing detected ***")
+        because the function returns a large struct by value via a hidden
+        pointer but never writes to it.
 
-        All of torch_npu.npu.{memory_stats, memory_allocated, max_memory_allocated,
-        memory_reserved, max_memory_reserved} ultimately call memory_stats(), so
-        replacing that single Python function is sufficient to fix the crash and
-        to return accurate values from the SHMEM pool.
+        The crash is triggered from *both* the Python path
+        (torch_npu.npu.memory_stats()) and directly from within CANN during
+        model compilation.  A Python-level monkey-patch cannot intercept the
+        C++ call, so we must register a proper C++ function pointer via
+        set_get_device_stats_fn / set_reset_peak_status_fn.
+
+        shmem_allocator.cpython-*.so exports two address-getter functions with
+        C linkage that return the addresses of the C++ stat callback stubs.
+        We load those addresses with ctypes and hand them to the allocator.
         """
+        import ctypes
+
         try:
-            import torch_npu
+            so = ctypes.CDLL(_lib_path)
 
-            def _shmem_memory_stats(device=None):
-                if not is_shmem_initialized():
-                    return {}
-                result = get_memory_stats()
-                if result is None:
-                    return {}
-                total_bytes, used_bytes, _ = result
-                return {
-                    "allocated_bytes.all.current": used_bytes,
-                    "allocated_bytes.all.peak": used_bytes,
-                    "reserved_bytes.all.current": total_bytes,
-                    "reserved_bytes.all.peak": total_bytes,
-                }
+            so.shmem_get_device_stats_fn_addr.restype = ctypes.c_uint64
+            so.shmem_reset_peak_stats_fn_addr.restype = ctypes.c_uint64
 
-            torch_npu.npu.memory_stats = _shmem_memory_stats
+            get_stats_addr = int(so.shmem_get_device_stats_fn_addr())
+            reset_addr = int(so.shmem_reset_peak_stats_fn_addr())
+
+            cpp_alloc = alloc.allocator()
+            cpp_alloc.set_get_device_stats_fn(get_stats_addr)
+            cpp_alloc.set_reset_peak_status_fn(reset_addr)
+
             logger.info(
-                "SHMEM: patched torch_npu.npu.memory_stats to report "
-                "SHMEM pool statistics."
+                "SHMEM: registered getDeviceStats / resetPeakStats C++ "
+                "callbacks with NPUPluggableAllocator."
             )
         except Exception as e:
-            logger.warning(
-                "SHMEM: failed to patch torch_npu.npu.memory_stats: %s. "
-                "Memory statistics may be inaccurate or cause a crash.",
+            logger.error(
+                "SHMEM: failed to register stats callbacks: %s. "
+                "Calls to torch_npu.npu.memory_stats() will likely crash.",
                 e,
             )
 
