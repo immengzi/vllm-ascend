@@ -210,6 +210,13 @@ static void ensure_shmem_initialized()
 __attribute__((visibility("default")))
 void *my_malloc(ssize_t size, int device, aclrtStream stream)
 {
+    // PyTorch issues zero-size allocations for empty tensors; SHMEM does not
+    // handle size=0 and aclshmem_malloc(0) returns nullptr anyway.  Return
+    // early to avoid log noise and unnecessary aclrtMalloc fallback.
+    if (size <= 0) {
+        return nullptr;
+    }
+
     try {
         ensure_shmem_initialized();
     } catch (const std::exception &e) {
