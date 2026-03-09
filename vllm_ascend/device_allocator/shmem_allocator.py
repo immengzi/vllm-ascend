@@ -234,6 +234,54 @@ class ShmemAllocator:
             "SHMEM: installed as global NPU allocator (changeCurrentAllocator). "
             "All NPU allocations now go directly to my_malloc/my_free."
         )
+        self._patch_memory_stats()
+
+    # ------------------------------------------------------------------ #
+    # torch_npu memory-stats compatibility shim                           #
+    # ------------------------------------------------------------------ #
+
+    def _patch_memory_stats(self) -> None:
+        """Patch torch_npu.npu.memory_stats to serve SHMEM pool statistics.
+
+        NPUPluggableAllocator's C++ stub for getDeviceStats() has a missing
+        return statement in the else-branch (when get_device_stats_fn_ is not
+        registered).  On aarch64 a value-returning function that falls off its
+        end without a return corrupts the stack canary → "stack smashing
+        detected" crash.
+
+        All of torch_npu.npu.{memory_stats, memory_allocated, max_memory_allocated,
+        memory_reserved, max_memory_reserved} ultimately call memory_stats(), so
+        replacing that single Python function is sufficient to fix the crash and
+        to return accurate values from the SHMEM pool.
+        """
+        try:
+            import torch_npu
+
+            def _shmem_memory_stats(device=None):
+                if not is_shmem_initialized():
+                    return {}
+                result = get_memory_stats()
+                if result is None:
+                    return {}
+                total_bytes, used_bytes, _ = result
+                return {
+                    "allocated_bytes.all.current": used_bytes,
+                    "allocated_bytes.all.peak": used_bytes,
+                    "reserved_bytes.all.current": total_bytes,
+                    "reserved_bytes.all.peak": total_bytes,
+                }
+
+            torch_npu.npu.memory_stats = _shmem_memory_stats
+            logger.info(
+                "SHMEM: patched torch_npu.npu.memory_stats to report "
+                "SHMEM pool statistics."
+            )
+        except Exception as e:
+            logger.warning(
+                "SHMEM: failed to patch torch_npu.npu.memory_stats: %s. "
+                "Memory statistics may be inaccurate or cause a crash.",
+                e,
+            )
 
     # ------------------------------------------------------------------ #
     # Memory statistics                                                    #
