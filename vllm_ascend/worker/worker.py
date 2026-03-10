@@ -308,7 +308,28 @@ class NPUWorker(WorkerBase):
         )["allocated_bytes.all.current"]
         total_allocated_bytes = torch_npu.npu.mem_get_info(
         )[1] - torch_npu.npu.mem_get_info()[0]
-        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            # With the SHMEM pluggable allocator, torch.npu.empty_cache() is a
+            # no-op: the SHMEM pool retains its full pre-allocated capacity even
+            # after temporary tensors are freed.  aclrtMemGetInfo (used above for
+            # total_allocated_bytes) counts the entire SHMEM pool as device-used
+            # memory, while allocated_bytes.all.current only reflects the tensor
+            # bytes currently live inside the pool.  The difference – the pool's
+            # unused slack – must NOT be treated as non-torch overhead, because
+            # the slack is simply free space within our own allocator that will be
+            # consumed by KV-cache blocks.
+            #
+            # reserved_bytes.all.current (populated by shmem_get_device_stats_impl
+            # from aclshmem_get_memory_stats total) represents the SHMEM pool's
+            # total driver-visible footprint.  Subtracting it from
+            # total_allocated_bytes isolates the truly non-SHMEM, non-torch
+            # allocations (HCCL buffers, CANN workspace, etc.).
+            shmem_reserved = torch_npu.npu.memory_stats(
+            )["reserved_bytes.all.current"]
+            non_torch_allocations = max(0,
+                                        total_allocated_bytes - shmem_reserved)
+        else:
+            non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
         available_kv_cache_memory = int(
