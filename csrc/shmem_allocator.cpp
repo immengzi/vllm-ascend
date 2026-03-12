@@ -202,14 +202,59 @@ static void ensure_shmem_initialized()
     aclshmem_enable_dynamic_expansion(true);
 
     // Determine initial pool size.
-    int64_t local_mem_size = 2LL * 1024 * 1024 * 1024; // 2 GiB
+    //
+    // Priority:
+    //   1. SHMEM_INITIAL_POOL_SIZE env var (explicit override)
+    //   2. Auto-detect: free_HBM * 0.90 (leave ~10% for driver/CANN overhead)
+    //      Capped at ACLSHMEM_MAX_LOCAL_SIZE (40 GiB hard limit for symmetric memory).
+    //
+    // Setting the initial pool large enough so that most allocations land in the
+    // symmetric pool (O(log n) best-fit, cross-rank addressable) instead of the
+    // expansion path (aclrtMalloc blocks, non-symmetric, O(n) search).
+    constexpr int64_t ACLSHMEM_MAX_LOCAL_SIZE = 40LL * 1024 * 1024 * 1024;  // 40 GiB
+    constexpr int64_t DEFAULT_POOL_SIZE        =  2LL * 1024 * 1024 * 1024;  //  2 GiB fallback
+
+    int64_t local_mem_size = DEFAULT_POOL_SIZE;
+
     const char *env_size = std::getenv("SHMEM_INITIAL_POOL_SIZE");
     if (env_size != nullptr) {
+        // Explicit override: honour it but clamp to [1 MiB, ACLSHMEM_MAX_LOCAL_SIZE].
         try {
-            local_mem_size = std::stoll(env_size);
+            int64_t requested = std::stoll(env_size);
+            if (requested <= 0) {
+                std::cerr << "[shmem_allocator] SHMEM_INITIAL_POOL_SIZE must be > 0, "
+                             "using default " << DEFAULT_POOL_SIZE / (1024*1024) << " MiB.\n";
+            } else {
+                local_mem_size = std::min(requested, ACLSHMEM_MAX_LOCAL_SIZE);
+                if (local_mem_size != requested) {
+                    std::cerr << "[shmem_allocator] SHMEM_INITIAL_POOL_SIZE clamped from "
+                              << requested / (1024*1024) << " MiB to "
+                              << local_mem_size / (1024*1024) << " MiB (ACLSHMEM_MAX_LOCAL_SIZE).\n";
+                }
+            }
         } catch (...) {
             std::cerr << "[shmem_allocator] Invalid SHMEM_INITIAL_POOL_SIZE, "
-                         "using 2 GiB default.\n";
+                         "falling back to auto-detect.\n";
+            env_size = nullptr;  // trigger auto-detect below
+        }
+    }
+
+    if (env_size == nullptr) {
+        // Auto-detect: query free HBM and use 90% of it, capped at 40 GiB.
+        uint64_t free_mem = 0, total_mem = 0;
+        aclError mem_ret = aclrtGetMemInfo(ACL_HBM_MEM, &free_mem, &total_mem);
+        if (mem_ret == ACL_SUCCESS && free_mem > 0) {
+            // Reserve 10% for driver/CANN internal usage and future expansion blocks.
+            int64_t auto_size = static_cast<int64_t>(free_mem * 0.90);
+            local_mem_size = std::min(auto_size, ACLSHMEM_MAX_LOCAL_SIZE);
+            std::cout << "[shmem_allocator] Auto-detected HBM: free="
+                      << free_mem / (1024*1024) << " MiB, total="
+                      << total_mem / (1024*1024) << " MiB -> initial pool="
+                      << local_mem_size / (1024*1024) << " MiB\n";
+        } else {
+            std::cerr << "[shmem_allocator] aclrtGetMemInfo failed (ret=" << mem_ret
+                      << "), using " << DEFAULT_POOL_SIZE / (1024*1024) << " MiB default.\n";
+            local_mem_size = DEFAULT_POOL_SIZE;
         }
     }
 
