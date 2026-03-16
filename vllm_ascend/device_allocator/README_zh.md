@@ -259,8 +259,27 @@ CPU 卸载，二者只能选其一。
   或构建时嵌入的 RPATH 正确。
 
 **`aclshmem_malloc failed … falling back to aclrtMalloc`**
-SHMEM 池动态扩容失败（设备显存不足）。请减小 `SHMEM_INITIAL_POOL_SIZE`
-或降低模型批次大小。
+SHMEM 动态扩容时 `aclrtMalloc` 失败。通常意味着设备 HBM 已满。正常运行
+（`determine_available_memory` 计算正确）时此信息不应出现，若频繁出现请排查：
+- `gpu_memory_utilization` 设置是否合理（建议不超过 `0.9`）。
+- 是否有其他进程占用了显存（`npu-smi info -t usages`）。
+
+若 fallback `aclrtMalloc` 也失败，会立即抛出 `RuntimeError: Get data ptr failed`，
+并在其前打印 `fallback aclrtMalloc also failed … device is out of memory (OOM)` 消息。
+
+**历史根因（已修复）**：`gpu_memory_utilization` 较高时报此错误，是以下 bug 共同导致的：
+1. `determine_available_memory` 峰值内存统计错误（`allocated_bytes.all.peak` 始终返回
+   当前值而非真实高水位），导致 `available_kv_cache_memory` 虚报偏大，系统尝试分配超出
+   实际可用显存的 KV Cache。
+2. `determine_available_memory` 将 SHMEM 初始池的空闲部分（`total_driver_used −
+   torch_allocated`）误算为非 torch 额外开销，进一步影响内存预算。
+3. `dynamic_memory_manager::allocate_from_block` 使用 `used_size` 同时充当 bump 指针和
+   统计量，释放后重分配地址重叠导致 silent OOM（已由 `high_water` 字段修复）。
+
+上述问题已由以下提交修复，当前版本不存在此问题：
+- `28d31f4` — 修复 `used_size` 用作 bump 指针的内存覆写 OOM
+- `428f7d2` / `e9c2b6a` — `expand_pool` 添加折半重试逻辑，移除阻塞同步的 `aclrtGetMemInfo`
+- `fb5dcdf` — 修复 `determine_available_memory` 的峰值追踪与非 SHMEM overhead 计算
 
 **`RuntimeError: expandable_segments:True is not compatible with the SHMEM memory pool`**
 环境变量中设置了 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`。
