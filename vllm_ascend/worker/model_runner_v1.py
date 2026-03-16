@@ -105,6 +105,7 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                enable_sp, get_ascend_device_type,
                                is_drafter_moe_model, is_moe_model,
@@ -135,6 +136,17 @@ SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 # TODO: remove this after python update to 3.12
 NONE_REF_COUNT_THRESHOLDS = 500000
 U32_MAX = 0xFFFFFFFF
+
+
+def _mark_with_memory(tag: str) -> None:
+    """Insert a named point marker into the torch_npu.profiler timeline.
+
+    Emits a marker of the form "<tag> | mem=<X>MB" that appears as a
+    vertical annotation in the Ascend Insight / msprof timeline.  The call
+    is a no-op when no profiler session is active.
+    """
+    mem_mb = torch_npu.npu.memory_allocated() / 1024 / 1024
+    torch_npu.profiler.mark(f"{tag} | mem={mem_mb:.1f}MB")
 
 
 @dataclass
@@ -1491,8 +1503,12 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
 
+        _mark_with_memory("execute_model:start")
         with ProfileExecuteDuration().capture_async("prepare input"):
-            self._update_states(scheduler_output)
+            with record_function_or_nullcontext("vllm_ascend:update_states"):
+                _mark_with_memory("update_states:start")
+                self._update_states(scheduler_output)
+                _mark_with_memory("update_states:end")
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -1515,12 +1531,16 @@ class NPUModelRunner(GPUModelRunner):
             if self.dynamic_eplb:
                 self.eplb_updator.forward_before()
 
-            (attn_metadata, positions, num_scheduled_tokens_np,
-             num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
-             logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
-             intermediate_tensors, max_query_len, synced_cudagraph_mode,
-             model_kwargs) = (self._prepare_inputs(scheduler_output,
-                                                   intermediate_tensors))
+            with record_function_or_nullcontext("vllm_ascend:prepare_inputs"):
+                _mark_with_memory("prepare_inputs:start")
+                (attn_metadata, positions, num_scheduled_tokens_np,
+                 num_input_tokens, num_tokens_across_dp,
+                 maybe_padded_num_tokens, logits_indices, spec_decode_metadata,
+                 input_ids, inputs_embeds, intermediate_tensors, max_query_len,
+                 synced_cudagraph_mode,
+                 model_kwargs) = (self._prepare_inputs(scheduler_output,
+                                                       intermediate_tensors))
+                _mark_with_memory("prepare_inputs:end")
 
             if self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
@@ -1566,9 +1586,12 @@ class NPUModelRunner(GPUModelRunner):
                     is_multimodal_model=self.is_multimodal_model):
                 self.maybe_setup_kv_connector(scheduler_output)
 
-                hidden_states = self._generate_process_reqs_hidden_states(
-                    maybe_padded_num_tokens, input_ids, positions,
-                    intermediate_tensors, inputs_embeds, model_kwargs)
+                with record_function_or_nullcontext("vllm_ascend:model_forward"):
+                    _mark_with_memory("model_forward:start")
+                    hidden_states = self._generate_process_reqs_hidden_states(
+                        maybe_padded_num_tokens, input_ids, positions,
+                        intermediate_tensors, inputs_embeds, model_kwargs)
+                    _mark_with_memory("model_forward:end")
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(
@@ -1627,7 +1650,11 @@ class NPUModelRunner(GPUModelRunner):
                         isinstance(hidden_states[0], torch.Tensor):
                     hidden_states = hidden_states[0]
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                with record_function_or_nullcontext(
+                        "vllm_ascend:compute_logits"):
+                    _mark_with_memory("compute_logits:start")
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    _mark_with_memory("compute_logits:end")
             if broadcast_pp_output:
                 model_output_broadcast_data = {
                     "logits": logits.contiguous(),
@@ -1650,6 +1677,7 @@ class NPUModelRunner(GPUModelRunner):
                 positions,
             )
             self.kv_connector_output = kv_connector_output
+        _mark_with_memory("execute_model:end")
         return None
 
     @torch.inference_mode
@@ -1701,8 +1729,12 @@ class NPUModelRunner(GPUModelRunner):
                                   self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
+        _mark_with_memory("sample_tokens:start")
         with ProfileExecuteDuration().capture_async("Sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            with record_function_or_nullcontext("vllm_ascend:sampling"):
+                _mark_with_memory("sampling:start")
+                sampler_output = self._sample(logits, spec_decode_metadata)
+                _mark_with_memory("sampling:end")
 
         def propose_draft_token_ids(sampled_token_ids):
             assert self.spec_decode_common_attn_metadata is not None
@@ -1735,18 +1767,23 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with ProfileExecuteDuration().capture_async("Draft"):
-            if self.speculative_config:
-                use_padded_batch_for_eagle = self.speculative_config and \
-                    self.speculative_config.use_eagle() and \
-                    not self.speculative_config.disable_padded_drafter_batch
-                if use_padded_batch_for_eagle:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch_for_eagle:
-                    # ngram and other speculative decoding methods use the sampled
-                    # tokens on the CPU, so they are run after bookkeeping.
-                    propose_draft_token_ids(valid_sampled_token_ids)
+            with record_function_or_nullcontext("vllm_ascend:draft_generation"):
+                _mark_with_memory("draft_generation:start")
+                if self.speculative_config:
+                    use_padded_batch_for_eagle = self.speculative_config and \
+                        self.speculative_config.use_eagle() and \
+                        not self.speculative_config.disable_padded_drafter_batch
+                    if use_padded_batch_for_eagle:
+                        # EAGLE speculative decoding can use the GPU sampled
+                        # tokens as inputs, and does not need to wait for
+                        # bookkeeping to finish.
+                        propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    if self.speculative_config and not use_padded_batch_for_eagle:
+                        # ngram and other speculative decoding methods use the
+                        # sampled tokens on the CPU, so they are run after
+                        # bookkeeping.
+                        propose_draft_token_ids(valid_sampled_token_ids)
+                _mark_with_memory("draft_generation:end")
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
@@ -1763,6 +1800,7 @@ class NPUModelRunner(GPUModelRunner):
             **extra_args,
         )
 
+        _mark_with_memory("sample_tokens:end")
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
             dr_str = [
