@@ -31,6 +31,11 @@ from vllm_ascend.device_allocator.shared_cpu_pool import (
     SharedCPUMemoryPool,
     SharedMemoryBlock,
 )
+from vllm_ascend.device_allocator.shared_cpu_pool_multiprocess import (
+    CrossProcessSharedPool,
+    HybridSharedPool,
+    get_shared_pool,
+)
 
 __all__ = [
     # CaMem allocator
@@ -41,7 +46,11 @@ __all__ = [
     "get_pluggable_allocator",
     "unmap_and_release",
     "use_memory_pool_with_allocator",
-    # Shared CPU pool
+    # Shared CPU pool (intra-process)
     "SharedCPUMemoryPool",
     "SharedMemoryBlock",
+    # Shared CPU pool (cross-process)
+    "CrossProcessSharedPool",
+    "HybridSharedPool",
+    "get_shared_pool",
 ]

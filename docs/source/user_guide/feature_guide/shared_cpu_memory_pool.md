@@ -1,165 +1,165 @@
-# Shared CPU Memory Pool for Sleep Mode
+# Sleep Mode 共享 CPU 内存池
 
-## Overview
+## 概述
 
-The **Shared CPU Memory Pool** is an advanced memory management feature for vLLM-Ascend's sleep mode. It enables multiple NPU workers (across different processes or devices) to share offloaded weight memory through SHA256-based content deduplication.
+**共享 CPU 内存池**是 vLLM-Ascend sleep mode 的高级内存管理功能。它支持多 NPU Worker（跨不同进程或设备）通过基于 SHA256 的内容去重来共享卸载的权重内存。
 
-### Key Benefits
+### 主要优势
 
-| Benefit | Description |
-|---------|-------------|
-| **Memory Deduplication** | Identical weight tensors share the same CPU memory, reducing overall memory footprint |
-| **Multi-NPU Sharing** | Different NPU instances running the same model can share offloaded weights |
-| **Fast Sleep/Wake** | Avoids redundant memory allocation by reusing existing shared blocks |
-| **LRU Eviction** | Automatic memory management with configurable limits |
-| **Reference Counting** | Safe memory lifecycle management with automatic cleanup |
+| 优势 | 说明 |
+|------|------|
+| **内存去重** | 相同的权重张量共享同一块 CPU 内存，降低整体内存占用 |
+| **多 NPU 共享** | 运行相同模型的不同 NPU 实例可共享卸载的权重 |
+| **快速 Sleep/Wake** | 通过复用现有共享块避免重复内存分配 |
+| **LRU 淘汰** | 可配置限制下的自动内存管理 |
+| **引用计数** | 安全的内存生命周期管理，自动清理 |
 
-## Architecture
+## 架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                            NPU 0                    NPU 1        NPU N      │
 │  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐    │
-│  │   LLM Instance   │     │   LLM Instance   │     │   LLM Instance   │    │
-│  │   (Model Weights)│     │   (Model Weights)│     │   (Model Weights)│    │
+│  │   LLM 实例        │     │   LLM 实例        │     │   LLM 实例        │    │
+│  │   (模型权重)      │     │   (模型权重)      │     │   (模型权重)      │    │
 │  └────────┬─────────┘     └────────┬─────────┘     └────────┬─────────┘    │
-│           │ Sleep                     │ Sleep                    │ Sleep   │
-│           ▼                           ▼                        ▼           │
+│           │ Sleep                   │ Sleep                   │ Sleep      │
+│           ▼                         ▼                         ▼            │
 │  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐    │
 │  │ CaMemAllocator   │     │ CaMemAllocator   │     │ CaMemAllocator   │    │
-│  │ (with shared pool)│     │ (with shared pool)│    │ (with shared pool)│   │
+│  │ (使用共享池)      │     │ (使用共享池)      │     │ (使用共享池)      │    │
 │  └────────┬─────────┘     └────────┬─────────┘     └────────┬─────────┘    │
 │           │                        │                        │              │
-│           │    SHA256 Hash Lookup  │                        │              │
+│           │    SHA256 哈希查找     │                        │              │
 │           └───────────────────────▶│◀───────────────────────┘              │
 │                                    │                                       │
 │                                    ▼                                       │
 │                    ┌───────────────────────────────┐                       │
 │                    │   SharedCPUMemoryPool         │                       │
-│                    │   (Process-wide Singleton)    │                       │
+│                    │   (进程级单例)                 │                       │
 │                    │                               │                       │
 │                    │  ┌─────────────────────────┐  │                       │
-│                    │  │ Hash Table              │  │                       │
+│                    │  │ 哈希表                   │  │                       │
 │                    │  │ hash_abc → cpu_tensor_1 │  │                       │
 │                    │  │ hash_def → cpu_tensor_2 │  │                       │
 │                    │  │ ...                     │  │                       │
 │                    │  └─────────────────────────┘  │                       │
 │                    │                               │                       │
-│                    │  Reference Count: 3 (shared)  │                       │
+│                    │  引用计数：3 (共享)            │                       │
 │                    └───────────────────────────────┘                       │
 │                                                                            │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## How It Works
+## 工作原理
 
-### 1. Sleep Mode with Shared Pool
+### 1. 使用共享池的 Sleep 模式
 
-When `sleep()` is called with `enable_deduplication=True`:
+当调用 `sleep()` 且 `enable_deduplication=True` 时：
 
-1. **Hash Computation**: Each NPU memory block's SHA256 hash is computed
-2. **Deduplication Check**: The shared pool checks if a block with the same hash exists
-3. **Sharing**: If found, increment reference count and share the existing CPU tensor
-4. **New Allocation**: If not found, allocate new pinned CPU memory and store in pool
+1. **哈希计算**：计算每个 NPU 内存块的 SHA256 哈希
+2. **去重检查**：共享池检查是否存在相同哈希的块
+3. **共享**：如找到，增加引用计数并共享现有 CPU 张量
+4. **新分配**：如未找到，分配新的固定 CPU 内存并存入池中
 
-### 2. Wake Up from Shared Pool
+### 2. 从共享池 Wake Up
 
-When `wake_up()` is called:
+当调用 `wake_up()` 时：
 
-1. **Memory Mapping**: NPU virtual memory is remapped to physical memory
-2. **Data Restoration**: Data is copied from the shared CPU tensor back to NPU
-3. **Reference Tracking**: The NPU pointer is registered with the shared block
+1. **内存映射**：NPU 虚拟内存重新映射到物理内存
+2. **数据恢复**：数据从共享 CPU 张量复制回 NPU
+3. **引用追踪**：NPU 指针注册到共享块
 
-### 3. Reference Counting & Eviction
+### 3. 引用计数与淘汰
 
-- Each shared block maintains a reference count
-- When `release()` is called (during tensor garbage collection), the count decrements
-- Blocks with `ref_count <= 0` are eligible for LRU eviction
-- Eviction occurs when memory limit is reached
+- 每个共享块维护引用计数
+- 调用 `release()` 时（张量垃圾回收期间），计数递减
+- `ref_count <= 0` 的块可被 LRU 淘汰
+- 达到内存限制时触发淘汰
 
-## Usage
+## 使用方式
 
-### Basic Usage (Automatic)
+### 基本用法（自动）
 
-By default, the shared pool is automatically enabled when using sleep mode:
+默认情况下，使用 sleep mode 时自动启用共享池：
 
 ```python
 from vllm import LLM
 
-# Shared pool is automatically used
+# 自动使用共享 CPU 内存池
 llm = LLM("Qwen/Qwen2.5-0.5B-Instruct", enable_sleep_mode=True)
 
-# Sleep - weights are offloaded to shared pool with SHA256 deduplication
+# Sleep - 权重通过 SHA256 去重卸载到共享池
 llm.sleep(level=1)
 
-# Wake up - weights are restored from shared pool
+# Wake up - 从共享池恢复权重
 llm.wake_up()
 ```
 
-### Advanced Configuration
+### 高级配置
 
 ```python
 from vllm_ascend.device_allocator import SharedCPUMemoryPool
 
-# Configure custom memory limit (default: 256GB)
+# 配置自定义内存限制（默认：256GB）
 import os
 os.environ["VLLM_ASCEND_SHARED_POOL_LIMIT_GB"] = "128"
 
-# Get pool instance and check statistics
+# 获取池实例并检查统计信息
 pool = SharedCPUMemoryPool.get_instance()
 stats = pool.get_stats()
-print(f"Memory saved through sharing: {stats['total_shared_bytes'] / 1e9:.2f} GB")
-print(f"Sharing hits: {stats['total_sharing_hits']}")
+print(f"共享节省内存: {stats['total_shared_bytes'] / 1e9:.2f} GB")
+print(f"共享命中: {stats['total_sharing_hits']}")
 ```
 
-### Disabling Shared Pool
+### 禁用共享池
 
-If you need the legacy behavior (no sharing):
+如需传统行为（不共享）：
 
 ```python
 from vllm_ascend.device_allocator import CaMemAllocator
 
-# Create allocator without shared pool
+# 创建不使用共享池的分配器
 allocator = CaMemAllocator(use_shared_cpu_pool=False)
 ```
 
-### Sleep without Deduplication
+### 禁用去重
 
-To use shared pool but skip SHA256 computation (faster but no sharing):
+使用共享池但跳过 SHA256 计算（更快但不去重）：
 
 ```python
 llm.sleep(level=1, enable_deduplication=False)
 ```
 
-## Memory Savings Analysis
+## 内存节省分析
 
-### Scenario: Multi-NPU Inference with Same Model
+### 场景：多 NPU 使用相同模型推理
 
-| Configuration | Without Shared Pool | With Shared Pool | Savings |
-|--------------|---------------------|------------------|---------|
-| 4 NPUs × 7B Model (14GB weights) | 56 GB CPU memory | 14 GB CPU memory | **75%** |
-| 8 NPUs × 70B Model (140GB weights) | 1,120 GB CPU memory | 140 GB CPU memory | **87.5%** |
-| 16 NPUs × 405B Model (810GB weights) | 12,960 GB CPU memory | 810 GB CPU memory | **93.75%** |
+| 配置 | 无共享池 | 有共享池 | 节省 |
+|------|----------|----------|------|
+| 4 NPU × 7B 模型 (14GB 权重) | 56 GB CPU 内存 | 14 GB CPU 内存 | **75%** |
+| 8 NPU × 70B 模型 (140GB 权重) | 1,120 GB CPU 内存 | 140 GB CPU 内存 | **87.5%** |
+| 16 NPU × 405B 模型 (810GB 权重) | 12,960 GB CPU 内存 | 810 GB CPU 内存 | **93.75%** |
 
-### Real-World Example: RLHF Training
+### 实际案例：RLHF 训练
 
-In RLHF with PPO/GRPO:
-- **Actor model** (vLLM inference) and **Critic model** (training) often share architecture
-- During critic training, actor is put to sleep
-- Shared pool allows actor and critic weights to share CPU memory
-- Significant savings when both models are on the same node
+PPO/GRPO 场景：
+- **Actor 模型**（vLLM 推理）和 **Critic 模型**（训练）通常架构相同
+- Critic 训练期间，actor 进入 sleep
+- 共享池允许 actor 和 critic 权重共享 CPU 内存
+- 两模型在同一节点时节省显著
 
-## API Reference
+## API 参考
 
 ### SharedCPUMemoryPool
 
 ```python
 class SharedCPUMemoryPool:
-    """Process-wide singleton for shared CPU memory management."""
+    """进程级单例，用于共享 CPU 内存管理。"""
     
     @staticmethod
     def get_instance() -> "SharedCPUMemoryPool":
-        """Get the singleton instance."""
+        """获取单例实例。"""
         
     def allocate_from_npu(
         self,
@@ -168,7 +168,7 @@ class SharedCPUMemoryPool:
         compute_hash: bool = True,
         provided_hash: Optional[str] = None
     ) -> Tuple[torch.Tensor, str]:
-        """Allocate CPU memory and copy NPU data to it."""
+        """分配 CPU 内存并将 NPU 数据复制到其中。"""
         
     def copy_to_npu(
         self,
@@ -176,91 +176,91 @@ class SharedCPUMemoryPool:
         npu_ptr: int,
         size: int
     ) -> None:
-        """Copy data from shared pool back to NPU."""
+        """将数据从共享池复制回 NPU。"""
         
     def release(self, sha256_hash: str, npu_ptr: int) -> bool:
-        """Release a reference to a shared memory block."""
+        """释放对共享内存块的引用。"""
         
     def get_stats(self) -> Dict[str, Union[int, float]]:
-        """Get pool statistics."""
+        """获取池统计信息。"""
         
     def log_summary(self) -> None:
-        """Log a summary of pool status."""
+        """记录池状态摘要。"""
 ```
 
-### Modified CaMemAllocator
+### 修改后的 CaMemAllocator
 
 ```python
 class CaMemAllocator:
     def __init__(self, use_shared_cpu_pool: bool = True):
-        """Initialize with optional shared pool support."""
+        """初始化，可选共享池支持。"""
         
     def sleep(
         self,
         offload_tags: Optional[Union[Tuple[str, ...], str]] = None,
         enable_deduplication: bool = True
     ) -> None:
-        """Sleep with optional SHA256 deduplication."""
+        """Sleep，可选 SHA256 去重。"""
         
     def get_shared_pool_stats(self) -> Optional[Dict[str, Any]]:
-        """Get statistics from the shared CPU memory pool."""
+        """获取共享 CPU 内存池统计信息。"""
 ```
 
-## Configuration
+## 配置
 
-### Environment Variables
+### 环境变量
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `VLLM_ASCEND_SHARED_POOL_LIMIT_GB` | Maximum CPU memory for shared pool (GB) | 256 |
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `VLLM_ASCEND_SHARED_POOL_LIMIT_GB` | 共享池最大 CPU 内存 (GB) | 256 |
 
-### Programmatic Configuration
+### 编程配置
 
 ```python
 from vllm_ascend.device_allocator import SharedCPUMemoryPool
 
-# Custom memory limit
+# 自定义内存限制
 pool = SharedCPUMemoryPool(memory_limit_bytes=512 * 1024 * 1024 * 1024)  # 512GB
 ```
 
-## Performance Considerations
+## 性能考虑
 
-### SHA256 Computation Overhead
+### SHA256 计算开销
 
-- Computing SHA256 hashes adds overhead during `sleep()`
-- For large models, this is typically negligible compared to memory copy time
-- Can be disabled with `enable_deduplication=False` if not needed
+- 计算 SHA256 哈希在 `sleep()` 期间增加开销
+- 对大模型，与内存复制时间相比通常可忽略
+- 如不需要，可通过 `enable_deduplication=False` 禁用
 
-### Memory Access Patterns
+### 内存访问模式
 
-- Pinned (page-locked) CPU memory enables faster DMA transfers
-- Shared pool uses `pin_memory=True` for optimal NPU transfer performance
+- 固定（页锁定）CPU 内存支持更快的 DMA 传输
+- 共享池使用 `pin_memory=True` 实现最佳 NPU 传输性能
 
-### Thread Safety
+### 线程安全
 
-- All SharedCPUMemoryPool operations are thread-safe
-- Uses RLock for concurrent access from multiple NPU workers
+- 所有 SharedCPUMemoryPool 操作线程安全
+- 使用 RLock 支持多 NPU Worker 并发访问
 
-## Limitations
+## 限制
 
-1. **Process Scope**: Sharing is limited to a single process. Cross-process sharing requires additional mechanisms (e.g., POSIX shared memory)
+1. **进程范围**：共享限于单进程。跨进程共享需要额外机制（如 POSIX 共享内存）
 
-2. **Hash Collisions**: SHA256 collisions are theoretically possible but extremely unlikely
+2. **哈希碰撞**：SHA256 碰撞理论上可能但极不可能
 
-3. **Memory Alignment**: Memory blocks must be aligned for efficient DMA transfers
+3. **内存对齐**：内存块必须对齐以实现高效 DMA 传输
 
-4. **Fallback**: If shared pool allocation fails, automatically falls back to legacy mode
+4. **回退**：共享池分配失败时自动回退到传统模式
 
-## Debugging
+## 调试
 
-### Enable Debug Logging
+### 启用调试日志
 
 ```python
 import logging
 logging.getLogger("vllm_ascend.device_allocator").setLevel(logging.DEBUG)
 ```
 
-### Check Pool Statistics
+### 检查池统计
 
 ```python
 from vllm_ascend.device_allocator import SharedCPUMemoryPool
@@ -269,7 +269,7 @@ pool = SharedCPUMemoryPool.get_instance()
 pool.log_summary()
 ```
 
-Example output:
+示例输出：
 ```
 SharedCPUMemoryPool Summary:
   Current blocks: 42
@@ -279,21 +279,21 @@ SharedCPUMemoryPool Summary:
   Evictions: 0
 ```
 
-## Migration from Legacy Sleep Mode
+## 从传统 Sleep Mode 迁移
 
-The shared pool is **fully backward compatible**. Existing code continues to work without changes:
+共享池**完全向后兼容**。现有代码无需修改继续工作：
 
 ```python
-# Legacy code (still works)
+# 传统代码（仍可用）
 llm = LLM(model_name, enable_sleep_mode=True)
 llm.sleep(level=1)
 llm.wake_up()
 
-# Automatically benefits from shared pool
+# 自动受益于共享池
 ```
 
-To opt-out:
+选择退出：
 ```python
-# Disable shared pool for specific allocator
+# 为特定分配器禁用共享池
 allocator = CaMemAllocator(use_shared_cpu_pool=False)
 ```

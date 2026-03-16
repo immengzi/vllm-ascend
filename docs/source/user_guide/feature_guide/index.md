@@ -9,6 +9,7 @@ graph_mode
 quantization
 sleep_mode
 shared_cpu_memory_pool
+shared_cpu_memory_pool_multiprocess
 structured_output
 lora
 eplb_swift_balancer

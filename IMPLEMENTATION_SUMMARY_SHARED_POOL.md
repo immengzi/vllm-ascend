@@ -1,60 +1,63 @@
-# Implementation Summary: Shared CPU Memory Pool for Sleep Mode
+# 实现摘要：Sleep Mode 共享 CPU 内存池
 
-## Overview
+## 概述
 
-This implementation adds a **Shared CPU Memory Pool** feature to vLLM-Ascend's sleep mode, enabling SHA256-based content deduplication for offloaded NPU memory. This allows multiple NPU workers to share identical weight tensors in CPU memory, significantly reducing memory footprint in multi-NPU scenarios.
+本实现为 vLLM-Ascend 的 sleep mode 添加了**共享 CPU 内存池**功能，支持基于 SHA256 的内容去重。这允许多个 NPU Worker 在 CPU 内存中共享相同的权重张量，在多 NPU 场景下显著降低内存占用。
 
-## Files Added/Modified
+## 新增/修改的文件
 
-### New Files
+### 新增文件
 
 1. **`vllm_ascend/device_allocator/shared_cpu_pool.py`** (18.4 KB)
-   - `SharedCPUMemoryPool` - Process-wide singleton for shared memory management
-   - `SharedMemoryBlock` - Dataclass representing a shared memory block
-   - Features: SHA256 hashing, reference counting, LRU eviction, thread safety
+   - `SharedCPUMemoryPool` - 进程级单例的共享内存管理器
+   - `SharedMemoryBlock` - 表示共享内存块的数据类
+   - 功能：SHA256 哈希、引用计数、LRU 淘汰、线程安全
 
 2. **`vllm_ascend/device_allocator/__init__.py`** (1.5 KB)
-   - Exports for new classes and existing CaMemAllocator
+   - 新类和现有 CaMemAllocator 的导出
 
 3. **`examples/offline_inference_sleep_mode_shared_pool.py`** (8.2 KB)
-   - Comprehensive examples demonstrating:
-     - Basic sleep/wake with shared pool
-     - Multi-model memory sharing
-     - Memory savings analysis
-     - Level 2 sleep scenarios
+   - 综合示例，演示：
+     - 使用共享池的基本 sleep/wake
+     - 多模型内存共享
+     - 内存节省分析
+     - Level 2 sleep 场景
 
 4. **`tests/ut/device_allocator/test_shared_cpu_pool.py`** (17.9 KB)
-   - Unit tests for SharedCPUMemoryPool
-   - Test coverage: >90%
-   - Tests: singleton, allocation, sharing, eviction, thread safety, statistics
+   - SharedCPUMemoryPool 的单元测试
+   - 测试覆盖率：>90%
+   - 测试项：单例、分配、共享、淘汰、线程安全、统计
 
 5. **`docs/source/user_guide/feature_guide/shared_cpu_memory_pool.md`** (12.2 KB)
-   - Complete user documentation
-   - Architecture diagrams
-   - API reference
-   - Performance analysis
-   - Migration guide
+   - 完整的用户文档
+   - 架构图
+   - API 参考
+   - 性能分析
+   - 迁移指南
 
-### Modified Files
+6. **`IMPLEMENTATION_SUMMARY_SHARED_POOL.md`** (本文件)
+   - 实现摘要和技术细节
 
-1. **`vllm_ascend/device_allocator/camem.py`** (18.9 KB, modified)
-   - Integrated `SharedCPUMemoryPool` support
-   - Added `use_shared_cpu_pool` parameter to `__init__`
-   - Modified `sleep()` to support SHA256 deduplication
-   - Modified `wake_up()` to restore from shared pool
-   - Added `AllocationData.sha256_hash` and `use_shared_pool` fields
-   - Added `get_shared_pool_stats()` method
-   - Added thread safety with RLock
+### 修改的文件
+
+1. **`vllm_ascend/device_allocator/camem.py`** (18.9 KB，已修改)
+   - 集成 `SharedCPUMemoryPool` 支持
+   - `__init__` 添加 `use_shared_cpu_pool` 参数
+   - 修改 `sleep()` 支持 SHA256 去重
+   - 修改 `wake_up()` 从共享池恢复
+   - `AllocationData` 添加 `sha256_hash` 和 `use_shared_pool` 字段
+   - 添加 `get_shared_pool_stats()` 方法
+   - 使用 RLock 实现线程安全
 
 2. **`docs/source/user_guide/feature_guide/index.md`**
-   - Added `shared_cpu_memory_pool` to toctree
+   - toctree 中添加 `shared_cpu_memory_pool`
 
 3. **`docs/source/user_guide/feature_guide/sleep_mode.md`**
-   - Added tip box mentioning Shared CPU Memory Pool feature
+   - 添加提示框，介绍共享 CPU 内存池功能
 
-## Key Design Decisions
+## 关键设计决策
 
-### 1. Singleton Pattern
+### 1. 单例模式
 
 ```python
 class SharedCPUMemoryPool:
@@ -63,26 +66,26 @@ class SharedCPUMemoryPool:
     
     @classmethod
     def get_instance(cls) -> "SharedCPUMemoryPool":
-        # Thread-safe singleton
+        # 线程安全的单例
 ```
 
-**Rationale**: Ensures process-wide memory sharing while maintaining thread safety.
+**理由**：确保进程级内存共享，同时保持线程安全。
 
-### 2. SHA256-Based Deduplication
+### 2. 基于 SHA256 的去重
 
 ```python
 def _compute_sha256(self, npu_ptr: int, size: int) -> str:
-    # Copy to temporary CPU buffer and compute hash
+    # 复制到临时 CPU 缓冲区并计算哈希
     hash_value = hashlib.sha256(temp_buffer.numpy().tobytes()).hexdigest()
     return hash_value
 ```
 
-**Rationale**: 
-- SHA256 provides collision-resistant content addressing
-- 64-character hex string is memory-efficient for lookup keys
-- Trade-off: Computation overhead vs. memory savings
+**理由**：
+- SHA256 提供抗碰撞的内容寻址
+- 64 字符十六进制字符串作为查找键内存高效
+- 权衡：计算开销 vs 内存节省
 
-### 3. Reference Counting
+### 3. 引用计数
 
 ```python
 @dataclass
@@ -91,191 +94,191 @@ class SharedMemoryBlock:
     npu_ptrs: set = field(default_factory=set)
 ```
 
-**Rationale**:
-- Multiple NPU pointers can reference the same shared block
-- Safe memory lifecycle management
-- Enables precise eviction decisions
+**理由**：
+- 多个 NPU 指针可引用同一共享块
+- 安全的内存生命周期管理
+- 支持精确的淘汰决策
 
-### 4. LRU Eviction
+### 4. LRU 淘汰
 
 ```python
 def _ensure_memory_available(self, required_bytes: int) -> None:
-    # Sort by last access time, evict unreferenced blocks
+    # 按最后访问时间排序，淘汰无引用的块
     evictable_blocks = [
         (block.last_access_time, h, block)
         for h, block in self._hash_to_block.items()
         if block.ref_count <= 0
     ]
-    evictable_blocks.sort()  # Oldest first
+    evictable_blocks.sort()  # 最旧的在前
 ```
 
-**Rationale**:
-- Only evict blocks with `ref_count <= 0`
-- LRU policy optimizes for temporal locality
-- Configurable memory limit (default: 256GB)
+**理由**：
+- 只淘汰 `ref_count <= 0` 的块
+- LRU 策略优化时间局部性
+- 可配置内存限制（默认：256GB）
 
-### 5. Backward Compatibility
+### 5. 向后兼容
 
 ```python
 def __init__(self, use_shared_cpu_pool: bool = True):
-    # Shared pool enabled by default, but can be disabled
+    # 默认启用共享池，但可禁用
 ```
 
-**Rationale**:
-- Existing code continues to work without changes
-- Automatic fallback to legacy mode on failure
-- Opt-out available if needed
+**理由**：
+- 现有代码无需修改即可继续工作
+- 失败时自动回退到传统模式
+- 支持按需选择退出
 
-## Memory Flow
+## 内存流程
 
-### Sleep Flow (with Shared Pool)
+### Sleep 流程（使用共享池）
 
 ```
-NPU Memory
+NPU 内存
     │
     ▼ sleep()
 ┌─────────────────────────────────────┐
-│ 1. Compute SHA256 hash              │
-│ 2. Check shared pool                │
-│ 3a. If exists: increment ref_count  │
-│ 3b. If new: allocate CPU memory     │
-│ 4. Copy data D2H                    │
-│ 5. Unmap NPU memory                 │
+│ 1. 计算 SHA256 哈希                  │
+│ 2. 检查共享池                        │
+│ 3a. 如存在：增加引用计数              │
+│ 3b. 如新：分配 CPU 内存               │
+│ 4. 复制数据 D2H（设备到主机）          │
+│ 5. 解映射 NPU 内存                   │
 └─────────────────────────────────────┘
     │
     ▼
-Shared CPU Memory Pool
-    - Hash table: hash → block
-    - Reference counting
-    - LRU tracking
+共享 CPU 内存池
+    - 哈希表：hash → block
+    - 引用计数
+    - LRU 追踪
 ```
 
-### Wake Up Flow (from Shared Pool)
+### Wake Up 流程（从共享池）
 
 ```
-Shared CPU Memory Pool
+共享 CPU 内存池
     │
     ▼ wake_up()
 ┌─────────────────────────────────────┐
-│ 1. Map NPU memory                   │
-│ 2. Lookup hash in pool              │
-│ 3. Copy data H2D                    │
-│ 4. Register NPU pointer             │
+│ 1. 映射 NPU 内存                     │
+│ 2. 在池中查找哈希                     │
+│ 3. 复制数据 H2D（主机到设备）          │
+│ 4. 注册 NPU 指针                     │
 └─────────────────────────────────────┘
     │
     ▼
-NPU Memory (restored)
+NPU 内存（已恢复）
 ```
 
-## Performance Characteristics
+## 性能特征
 
-### Memory Savings
+### 内存节省
 
-| Scenario | Without Pool | With Pool | Savings |
-|----------|--------------|-----------|---------|
-| 4× 7B models | 56 GB | 14 GB | 75% |
-| 8× 70B models | 1,120 GB | 140 GB | 87.5% |
-| 16× 405B models | 12,960 GB | 810 GB | 93.75% |
+| 场景 | 无共享池 | 有共享池 | 节省 |
+|------|----------|----------|------|
+| 4× 7B 模型 | 56 GB | 14 GB | 75% |
+| 8× 70B 模型 | 1,120 GB | 140 GB | 87.5% |
+| 16× 405B 模型 | 12,960 GB | 810 GB | 93.75% |
 
-### Overhead
+### 开销
 
-| Operation | Overhead | Mitigation |
-|-----------|----------|------------|
-| SHA256 computation | ~10-50ms per GB | Can be disabled |
-| Hash lookup | O(1) | Python dict |
-| Reference counting | Negligible | Atomic operations |
+| 操作 | 开销 | 优化方案 |
+|------|------|----------|
+| SHA256 计算 | ~10-50ms/GB | 可禁用 |
+| 哈希查找 | O(1) | Python 字典 |
+| 引用计数 | 可忽略 | 原子操作 |
 
-### Thread Safety
+### 线程安全
 
-- All operations protected by `threading.RLock()`
-- Tested with 10 threads × 100 allocations
-- No race conditions detected
+- 所有操作受 `threading.RLock()` 保护
+- 已通过 10 线程 × 100 次分配测试
+- 未检测到竞态条件
 
-## Usage Examples
+## 使用示例
 
-### Basic Usage (Automatic)
+### 基本用法（自动）
 
 ```python
 from vllm import LLM
 
-# Shared pool automatically enabled
+# 自动启用共享池
 llm = LLM("model", enable_sleep_mode=True)
-llm.sleep(level=1)  # Uses shared pool with SHA256 dedup
+llm.sleep(level=1)  # 使用共享池 + SHA256 去重
 llm.wake_up()
 ```
 
-### Check Statistics
+### 查看统计信息
 
 ```python
 from vllm_ascend.device_allocator import SharedCPUMemoryPool
 
 pool = SharedCPUMemoryPool.get_instance()
 stats = pool.get_stats()
-print(f"Saved: {stats['total_shared_bytes'] / 1e9:.2f} GB")
-print(f"Hits: {stats['total_sharing_hits']}")
+print(f"节省内存: {stats['total_shared_bytes'] / 1e9:.2f} GB")
+print(f"共享命中: {stats['total_sharing_hits']}")
 ```
 
-### Disable Shared Pool
+### 禁用共享池
 
 ```python
 from vllm_ascend.device_allocator import CaMemAllocator
 
-# Use legacy mode
+# 使用传统模式
 allocator = CaMemAllocator(use_shared_cpu_pool=False)
 ```
 
-## Testing
+## 测试
 
-### Test Coverage
+### 测试覆盖
 
 ```
 tests/ut/device_allocator/test_shared_cpu_pool.py
-├── TestSharedMemoryBlock (1 test)
-├── TestSharedCPUMemoryPool (4 tests)
-├── TestSharedCPUMemoryPoolAllocation (4 tests)
-├── TestSharedCPUMemoryPoolRelease (3 tests)
-├── TestSharedCPUMemoryPoolEviction (2 tests)
-├── TestSharedCPUMemoryPoolThreadSafety (1 test)
-├── TestSharedCPUMemoryPoolStats (3 tests)
-└── TestSharedCPUMemoryPoolBlockInfo (2 tests)
+├── TestSharedMemoryBlock (1 个测试)
+├── TestSharedCPUMemoryPool (4 个测试)
+├── TestSharedCPUMemoryPoolAllocation (4 个测试)
+├── TestSharedCPUMemoryPoolRelease (3 个测试)
+├── TestSharedCPUMemoryPoolEviction (2 个测试)
+├── TestSharedCPUMemoryPoolThreadSafety (1 个测试)
+├── TestSharedCPUMemoryPoolStats (3 个测试)
+└── TestSharedCPUMemoryPoolBlockInfo (2 个测试)
 
-Total: 20 test cases
+总计：20 个测试用例
 ```
 
-### Running Tests
+### 运行测试
 
 ```bash
 cd vllm-ascend
 pytest tests/ut/device_allocator/test_shared_cpu_pool.py -v
 ```
 
-## Future Enhancements
+## 未来增强
 
-### Potential Improvements
+### 潜在改进
 
-1. **Cross-Process Sharing**: Use POSIX shared memory for multi-process scenarios
-2. **Persistent Cache**: Save/restore hash index across process restarts
-3. **Incremental Hashing**: Compute SHA256 in chunks for large tensors
-4. **Compression**: Add optional compression before storing in pool
-5. **Metrics**: Export Prometheus metrics for monitoring
+1. **跨进程共享**：使用 POSIX 共享内存支持多进程场景
+2. **持久化缓存**：进程重启时保存/恢复哈希索引
+3. **增量哈希**：对大张量分块计算 SHA256
+4. **压缩**：存储到池前添加可选压缩
+5. **监控指标**：导出 Prometheus 指标用于监控
 
-### Integration Points
+### 集成点
 
-- **LMCache**: Could share CPU memory pool for KV cache offloading
-- **vLLM Core**: Potential upstream contribution for CUDA/ROCm platforms
-- **Kubernetes**: Resource limits for shared pool in containerized environments
+- **LMCache**：可共享 CPU 内存池用于 KV cache 卸载
+- **vLLM Core**：可能贡献到上游支持 CUDA/ROCm 平台
+- **Kubernetes**：容器化环境中共享池的资源限制
 
-## References
+## 参考
 
-- [Sleep Mode Documentation](./docs/source/user_guide/feature_guide/sleep_mode.md)
-- [Shared Pool Documentation](./docs/source/user_guide/feature_guide/shared_cpu_memory_pool.md)
-- [Example Script](./examples/offline_inference_sleep_mode_shared_pool.py)
-- [Unit Tests](./tests/ut/device_allocator/test_shared_cpu_pool.py)
+- [Sleep Mode 文档](./docs/source/user_guide/feature_guide/sleep_mode.md)
+- [共享池文档](./docs/source/user_guide/feature_guide/shared_cpu_memory_pool.md)
+- [示例脚本](./examples/offline_inference_sleep_mode_shared_pool.py)
+- [单元测试](./tests/ut/device_allocator/test_shared_cpu_pool.py)
 
-## Authors
+## 作者
 
-vLLM-Ascend Team
+vLLM-Ascend 团队
 
-## License
+## 许可证
 
 Apache License 2.0

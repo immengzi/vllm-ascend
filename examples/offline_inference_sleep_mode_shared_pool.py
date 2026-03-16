@@ -15,11 +15,10 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-# Example: Using Shared CPU Memory Pool with Sleep Mode
+# 示例：使用共享 CPU 内存池的 Sleep Mode
 #
-# This example demonstrates how the shared CPU memory pool enables
-# multiple LLM instances to share offloaded weight memory through
-# SHA256-based deduplication.
+# 本示例演示共享 CPU 内存池如何使多个 LLM 实例通过
+# SHA256 去重共享卸载的权重内存。
 #
 
 import os
@@ -37,136 +36,135 @@ os.environ["VLLM_ASCEND_ENABLE_NZ"] = "0"
 
 
 def print_memory_stats(label: str):
-    """Print current NPU memory usage."""
+    """打印当前 NPU 内存使用情况。"""
     free, total = torch.npu.mem_get_info()
     used = total - free
-    print(f"[{label}] NPU Memory: Used={used / GiB_bytes:.2f} GB, "
-          f"Free={free / GiB_bytes:.2f} GB, Total={total / GiB_bytes:.2f} GB")
+    print(f"[{label}] NPU 内存: 已用={used / GiB_bytes:.2f} GB, "
+          f"空闲={free / GiB_bytes:.2f} GB, 总计={total / GiB_bytes:.2f} GB")
 
 
 def print_shared_pool_stats(label: str):
-    """Print shared CPU memory pool statistics."""
+    """打印共享 CPU 内存池统计信息。"""
     pool = SharedCPUMemoryPool.get_instance()
     stats = pool.get_stats()
-    print(f"[{label}] Shared Pool Stats:")
-    print(f"  - Current blocks: {stats['current_blocks']}")
-    print(f"  - Current usage: {stats['current_bytes'] / GiB_bytes:.2f} GB")
-    print(f"  - Memory utilization: {stats['memory_utilization'] * 100:.1f}%")
-    print(f"  - Total sharing hits: {stats['total_sharing_hits']}")
-    print(f"  - Total shared bytes (saved): {stats['total_shared_bytes'] / GiB_bytes:.2f} GB")
+    print(f"[{label}] 共享池统计:")
+    print(f"  - 当前块数: {stats['current_blocks']}")
+    print(f"  - 当前使用: {stats['current_bytes'] / GiB_bytes:.2f} GB")
+    print(f"  - 内存利用率: {stats['memory_utilization'] * 100:.1f}%")
+    print(f"  - 总共享命中: {stats['total_sharing_hits']}")
+    print(f"  - 总节省内存: {stats['total_shared_bytes'] / GiB_bytes:.2f} GB")
 
 
 def demo_basic_sleep_wake():
-    """Demo 1: Basic sleep/wake with shared pool."""
+    """演示 1：使用共享池的基本 sleep/wake。"""
     print("\n" + "=" * 70)
-    print("Demo 1: Basic Sleep/Wake with Shared CPU Memory Pool")
+    print("演示 1：使用共享 CPU 内存池的基本 Sleep/Wake")
     print("=" * 70 + "\n")
     
     prompt = "How are you?"
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     
-    print_memory_stats("Before Model Load")
+    print_memory_stats("模型加载前")
     
-    # Initialize LLM with sleep mode enabled
-    # By default, it uses the shared CPU memory pool
+    # 初始化 LLM，启用 sleep mode
+    # 默认使用共享 CPU 内存池
     llm = LLM(model_name, enable_sleep_mode=True)
     sampling_params = SamplingParams(temperature=0, max_tokens=10)
     
-    print_memory_stats("After Model Load")
+    print_memory_stats("模型加载后")
     
-    # First inference
-    print("\n--- First inference ---")
+    # 第一次推理
+    print("\n--- 第一次推理 ---")
     output1 = llm.generate(prompt, sampling_params)
-    print(f"Output: {output1[0].outputs[0].text}")
+    print(f"输出: {output1[0].outputs[0].text}")
     
-    # Sleep - weights are offloaded to shared CPU memory pool
+    # Sleep - 权重卸载到共享 CPU 内存池
     print("\n--- Sleep (Level 1) ---")
     llm.sleep(level=1)
-    print_memory_stats("After Sleep")
-    print_shared_pool_stats("After Sleep")
+    print_memory_stats("Sleep 后")
+    print_shared_pool_stats("Sleep 后")
     
     # Wake up
     print("\n--- Wake Up ---")
     llm.wake_up()
-    print_memory_stats("After Wake Up")
+    print_memory_stats("Wake Up 后")
     
-    # Second inference
-    print("\n--- Second inference ---")
+    # 第二次推理
+    print("\n--- 第二次推理 ---")
     output2 = llm.generate(prompt, sampling_params)
-    print(f"Output: {output2[0].outputs[0].text}")
+    print(f"输出: {output2[0].outputs[0].text}")
     
-    # Verify outputs match
+    # 验证输出一致
     assert output1[0].outputs[0].text == output2[0].outputs[0].text
-    print("\n✓ Outputs match!")
+    print("\n✓ 输出一致！")
     
     print("\n" + "=" * 70)
 
 
 def demo_multiple_models_sharing():
-    """Demo 2: Multiple models sharing memory through the pool."""
+    """演示 2：多模型通过共享池共享内存。"""
     print("\n" + "=" * 70)
-    print("Demo 2: Multiple Models Sharing Memory (Simulated)")
+    print("演示 2：多模型共享内存（模拟）")
     print("=" * 70 + "\n")
     
-    # Note: In a real scenario with multiple processes/NPUs,
-    # the shared pool would automatically deduplicate identical weights.
-    # Here we demonstrate the pool behavior within a single process.
+    # 注意：在真实的多进程/NPU 场景中，
+    # 共享池会自动去重相同的权重。
+    # 这里演示单进程内的池行为。
     
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     
-    print("Loading first model instance...")
+    print("加载第一个模型实例...")
     llm1 = LLM(model_name, enable_sleep_mode=True)
     sampling_params = SamplingParams(temperature=0, max_tokens=5)
     
     output1 = llm1.generate("Hello", sampling_params)
-    print(f"Model 1 output: {output1[0].outputs[0].text}")
+    print(f"模型 1 输出: {output1[0].outputs[0].text}")
     
-    # Sleep first model
-    print("\nSleeping first model...")
+    # Sleep 第一个模型
+    print("\nSleep 第一个模型...")
     llm1.sleep(level=1)
-    print_shared_pool_stats("After Model 1 Sleep")
+    print_shared_pool_stats("模型 1 Sleep 后")
     
-    # In a multi-process scenario, loading a second model with the same
-    # architecture would share the offloaded weights.
-    # For this demo, we just show the pool state.
+    # 在多进程场景中，加载第二个相同架构的模型会共享已卸载的权重。
+    # 本演示仅展示池状态。
     
-    print("\n--- Simulating second model with same weights ---")
-    print("In a real multi-process setup, the second model would:")
-    print("1. Compute SHA256 of its weights during sleep")
-    print("2. Find matching blocks in the shared pool")
-    print("3. Reuse existing CPU memory instead of allocating new")
+    print("\n--- 模拟第二个模型使用相同权重 ---")
+    print("真实多进程场景中，第二个模型会：")
+    print("1. 在 Sleep 期间计算权重 SHA256")
+    print("2. 在共享池中找到匹配的块")
+    print("3. 复用现有 CPU 内存而非分配新内存")
     
     print("\n" + "=" * 70)
 
 
 def demo_memory_savings():
-    """Demo 3: Show memory savings with deduplication."""
+    """演示 3：展示去重带来的内存节省。"""
     print("\n" + "=" * 70)
-    print("Demo 3: Memory Savings Analysis")
+    print("演示 3：内存节省分析")
     print("=" * 70 + "\n")
     
     pool = SharedCPUMemoryPool.get_instance()
     
-    print("Scenario: 4 NPUs running the same 7B model (14GB weights each)")
+    print("场景：4 个 NPU 运行相同 7B 模型（每个 14GB 权重）")
     print("-" * 50)
-    print("Without Shared Pool:")
-    print("  CPU Memory needed: 4 × 14GB = 56 GB")
+    print("不使用共享池：")
+    print("  需要 CPU 内存：4 × 14GB = 56 GB")
     print("")
-    print("With Shared Pool (SHA256 deduplication):")
-    print("  CPU Memory needed: 14 GB (shared across all NPUs)")
-    print("  Savings: 42 GB (75% reduction)")
+    print("使用共享池（SHA256 去重）：")
+    print("  需要 CPU 内存：14 GB（所有 NPU 共享）")
+    print("  节省：42 GB（减少 75%）")
     print("-" * 50)
     
-    print("\nCurrent pool statistics:")
-    print_shared_pool_stats("Current")
+    print("\n当前池统计：")
+    print_shared_pool_stats("当前")
     
     print("\n" + "=" * 70)
 
 
 def demo_level2_sleep():
-    """Demo 4: Level 2 sleep with shared pool."""
+    """演示 4：Level 2 sleep 与共享池。"""
     print("\n" + "=" * 70)
-    print("Demo 4: Level 2 Sleep (Weight Update Scenario)")
+    print("演示 4：Level 2 Sleep（权重更新场景）")
     print("=" * 70 + "\n")
     
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -175,63 +173,63 @@ def demo_level2_sleep():
     sampling_params = SamplingParams(temperature=0, max_tokens=5)
     
     output1 = llm.generate("Test", sampling_params)
-    print(f"Before sleep: {output1[0].outputs[0].text}")
+    print(f"Sleep 前: {output1[0].outputs[0].text}")
     
-    # Level 2 sleep - discard weights
+    # Level 2 sleep - 丢弃权重
     print("\n--- Level 2 Sleep ---")
     llm.sleep(level=2)
-    print_memory_stats("After Level 2 Sleep")
-    print_shared_pool_stats("After Level 2 Sleep")
+    print_memory_stats("Level 2 Sleep 后")
+    print_shared_pool_stats("Level 2 Sleep 后")
     
-    # Wake up only weights
-    print("\n--- Wake Up (Weights Only) ---")
+    # 仅唤醒权重
+    print("\n--- Wake Up（仅权重）---")
     llm.wake_up(tags=["weights"])
-    print_memory_stats("After Wake Up (Weights)")
+    print_memory_stats("Wake Up（权重）后")
     
-    # Simulate weight update
-    print("\n--- Simulating Weight Update ---")
-    print("At this point, you would update the model weights.")
-    print("After update, wake up KV cache:")
+    # 模拟权重更新
+    print("\n--- 模拟权重更新 ---")
+    print("此时您可以更新模型权重。")
+    print("更新完成后，唤醒 KV cache：")
     
     llm.wake_up(tags=["kv_cache"])
-    print_memory_stats("After Full Wake Up")
+    print_memory_stats("完全 Wake Up 后")
     
     print("\n" + "=" * 70)
 
 
 def main():
-    """Run all demos."""
+    """运行所有演示。"""
     print("\n" + "#" * 70)
-    print("# Shared CPU Memory Pool Demo for vLLM-Ascend Sleep Mode")
+    print("# vLLM-Ascend Sleep Mode 共享 CPU 内存池演示")
     print("#" * 70)
     
-    # Check if NPU is available
+    # 检查 NPU 是否可用
     if not torch.npu.is_available():
-        print("ERROR: NPU is not available. This demo requires Ascend NPU.")
+        print("错误：NPU 不可用。本演示需要昇腾 NPU。")
         return
     
-    print("\nInitializing Shared CPU Memory Pool...")
+    print("\n初始化共享 CPU 内存池...")
     pool = SharedCPUMemoryPool.get_instance()
-    print(f"Memory limit: {pool.memory_limit_bytes / GiB_bytes:.2f} GB")
+    print(f"内存限制：{pool.memory_limit_bytes / GiB_bytes:.2f} GB")
     
     try:
-        # Run demos
+        # 运行演示
         demo_basic_sleep_wake()
         demo_multiple_models_sharing()
         demo_memory_savings()
         demo_level2_sleep()
         
         print("\n" + "#" * 70)
-        print("# All demos completed successfully!")
+        print("# 所有演示成功完成！")
         print("#" * 70 + "\n")
         
     except Exception as e:
-        print(f"\nError during demo: {e}")
+        print(f"\n演示期间出错: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # Print final statistics
-        print("\nFinal Shared Pool Statistics:")
+        # 打印最终统计
+        print("\n最终共享池统计：")
         pool.log_summary()
 
 

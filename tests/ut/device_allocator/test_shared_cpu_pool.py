@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Unit tests for SharedCPUMemoryPool
+# SharedCPUMemoryPool 单元测试
 #
 
 import threading
@@ -32,10 +32,10 @@ from vllm_ascend.device_allocator.shared_cpu_pool import (
 
 
 class TestSharedMemoryBlock(unittest.TestCase):
-    """Test cases for SharedMemoryBlock dataclass."""
+    """SharedMemoryBlock 数据类的测试用例。"""
     
     def test_block_creation(self):
-        """Test creating a SharedMemoryBlock."""
+        """测试创建 SharedMemoryBlock。"""
         tensor = torch.empty(1024, dtype=torch.uint8)
         block = SharedMemoryBlock(
             sha256_hash="abc123",
@@ -51,25 +51,25 @@ class TestSharedMemoryBlock(unittest.TestCase):
 
 
 class TestSharedCPUMemoryPool(unittest.TestCase):
-    """Test cases for SharedCPUMemoryPool singleton."""
+    """SharedCPUMemoryPool 单例的测试用例。"""
     
     def setUp(self):
-        """Reset singleton before each test."""
+        """每个测试前重置单例。"""
         SharedCPUMemoryPool.reset_instance()
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     def test_singleton_pattern(self):
-        """Test that get_instance returns the same object."""
+        """测试 get_instance 返回相同对象。"""
         pool1 = SharedCPUMemoryPool.get_instance()
         pool2 = SharedCPUMemoryPool.get_instance()
         
         self.assertIs(pool1, pool2)
     
     def test_reset_instance(self):
-        """Test that reset_instance creates a new object."""
+        """测试 reset_instance 创建新对象。"""
         pool1 = SharedCPUMemoryPool.get_instance()
         pool1._hash_to_block["test"] = MagicMock()
         
@@ -80,7 +80,7 @@ class TestSharedCPUMemoryPool(unittest.TestCase):
         self.assertEqual(len(pool2._hash_to_block), 0)
     
     def test_initial_stats(self):
-        """Test initial statistics."""
+        """测试初始统计信息。"""
         pool = SharedCPUMemoryPool.get_instance()
         stats = pool.get_stats()
         
@@ -90,12 +90,12 @@ class TestSharedCPUMemoryPool(unittest.TestCase):
         self.assertEqual(stats["total_sharing_hits"], 0)
     
     def test_memory_limit_default(self):
-        """Test default memory limit."""
+        """测试默认内存限制。"""
         pool = SharedCPUMemoryPool.get_instance()
         self.assertEqual(pool.memory_limit_bytes, 256 * 1024 * 1024 * 1024)
     
     def test_memory_limit_custom(self):
-        """Test custom memory limit."""
+        """测试自定义内存限制。"""
         SharedCPUMemoryPool.reset_instance()
         pool = SharedCPUMemoryPool(memory_limit_bytes=1024 * 1024 * 1024)
         
@@ -103,21 +103,21 @@ class TestSharedCPUMemoryPool(unittest.TestCase):
 
 
 class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
-    """Test cases for allocation functionality."""
+    """分配功能的测试用例。"""
     
     def setUp(self):
-        """Reset singleton before each test."""
+        """每个测试前重置单例。"""
         SharedCPUMemoryPool.reset_instance()
         self.pool = SharedCPUMemoryPool.get_instance()
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_allocate_with_provided_hash(self, mock_memcpy):
-        """Test allocation with pre-computed hash."""
-        # Mock the memcpy function
+        """测试使用预计算哈希分配。"""
+        # Mock memcpy 函数
         mock_memcpy.return_value = None
         
         npu_ptr = 0x1000
@@ -138,12 +138,12 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_allocate_same_hash_sharing(self, mock_memcpy):
-        """Test that same hash values share memory."""
+        """测试相同哈希值共享内存。"""
         mock_memcpy.return_value = None
         
         hash_value = "shared_hash_12345"
         
-        # First allocation
+        # 第一次分配
         tensor1, hash1 = self.pool.allocate_from_npu(
             npu_ptr=0x1000,
             size=1024,
@@ -151,7 +151,7 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
             provided_hash=hash_value
         )
         
-        # Second allocation with same hash but different NPU pointer
+        # 第二次分配，相同哈希但不同 NPU 指针
         tensor2, hash2 = self.pool.allocate_from_npu(
             npu_ptr=0x2000,
             size=1024,
@@ -159,19 +159,19 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
             provided_hash=hash_value
         )
         
-        # Should return the same tensor (shared)
+        # 应返回相同张量（共享）
         self.assertIs(hash1, hash2)
         self.assertEqual(self.pool._hash_to_block[hash_value].ref_count, 2)
         self.assertEqual(self.pool._stats["total_sharing_hits"], 1)
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_allocate_different_sizes_collision(self, mock_memcpy):
-        """Test hash collision with different sizes."""
+        """测试不同大小但哈希碰撞的情况。"""
         mock_memcpy.return_value = None
         
         hash_value = "collision_hash"
         
-        # First allocation
+        # 第一次分配
         self.pool.allocate_from_npu(
             npu_ptr=0x1000,
             size=1024,
@@ -179,7 +179,7 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
             provided_hash=hash_value
         )
         
-        # Second allocation with same hash but different size
+        # 第二次分配，相同哈希但不同大小
         tensor2, hash2 = self.pool.allocate_from_npu(
             npu_ptr=0x2000,
             size=2048,
@@ -187,19 +187,19 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
             provided_hash=hash_value
         )
         
-        # Should create a new unique hash
+        # 应创建新的唯一哈希
         self.assertNotEqual(hash2, hash_value)
         self.assertTrue(hash2.startswith(hash_value))
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_allocate_same_npu_ptr_reuse(self, mock_memcpy):
-        """Test that same NPU pointer reuses existing block."""
+        """测试相同 NPU 指针复用现有块。"""
         mock_memcpy.return_value = None
         
         npu_ptr = 0x1000
         hash_value = "test_hash"
         
-        # First allocation
+        # 第一次分配
         tensor1, hash1 = self.pool.allocate_from_npu(
             npu_ptr=npu_ptr,
             size=1024,
@@ -207,7 +207,7 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
             provided_hash=hash_value
         )
         
-        # Second allocation with same NPU pointer
+        # 第二次分配，相同 NPU 指针
         tensor2, hash2 = self.pool.allocate_from_npu(
             npu_ptr=npu_ptr,
             size=1024,
@@ -215,26 +215,26 @@ class TestSharedCPUMemoryPoolAllocation(unittest.TestCase):
             provided_hash="different_hash"
         )
         
-        # Should return the existing block
+        # 应返回现有块
         self.assertEqual(hash1, hash2)
         self.assertIs(tensor1, tensor2)
 
 
 class TestSharedCPUMemoryPoolRelease(unittest.TestCase):
-    """Test cases for release functionality."""
+    """释放功能的测试用例。"""
     
     def setUp(self):
-        """Reset singleton before each test."""
+        """每个测试前重置单例。"""
         SharedCPUMemoryPool.reset_instance()
         self.pool = SharedCPUMemoryPool.get_instance()
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_release_decrements_ref_count(self, mock_memcpy):
-        """Test that release decrements reference count."""
+        """测试释放减少引用计数。"""
         mock_memcpy.return_value = None
         
         hash_value = "test_hash"
@@ -255,18 +255,18 @@ class TestSharedCPUMemoryPoolRelease(unittest.TestCase):
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_release_unknown_hash(self, mock_memcpy):
-        """Test releasing unknown hash."""
+        """测试释放未知哈希。"""
         result = self.pool.release("unknown_hash", 0x1000)
         self.assertFalse(result)
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_release_multiple_refs(self, mock_memcpy):
-        """Test release with multiple references."""
+        """测试多引用释放。"""
         mock_memcpy.return_value = None
         
         hash_value = "shared_hash"
         
-        # Allocate twice (same hash, different NPU ptrs)
+        # 分配两次（相同哈希，不同 NPU 指针）
         self.pool.allocate_from_npu(
             npu_ptr=0x1000,
             size=1024,
@@ -282,32 +282,32 @@ class TestSharedCPUMemoryPoolRelease(unittest.TestCase):
         
         self.assertEqual(self.pool._hash_to_block[hash_value].ref_count, 2)
         
-        # Release one
+        # 释放一个
         self.pool.release(hash_value, 0x1000)
         self.assertEqual(self.pool._hash_to_block[hash_value].ref_count, 1)
         
-        # Block should still exist
+        # 块应仍存在
         self.assertIn(hash_value, self.pool._hash_to_block)
 
 
 class TestSharedCPUMemoryPoolEviction(unittest.TestCase):
-    """Test cases for memory eviction."""
+    """内存淘汰的测试用例。"""
     
     def setUp(self):
-        """Reset singleton with small memory limit."""
+        """使用较小内存限制重置单例。"""
         SharedCPUMemoryPool.reset_instance()
-        self.pool = SharedCPUMemoryPool(memory_limit_bytes=4096)  # 4KB limit
+        self.pool = SharedCPUMemoryPool(memory_limit_bytes=4096)  # 4KB 限制
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_eviction_on_memory_limit(self, mock_memcpy):
-        """Test that old blocks are evicted when memory limit is reached."""
+        """测试达到内存限制时淘汰旧块。"""
         mock_memcpy.return_value = None
         
-        # Allocate first block
+        # 分配第一个块
         self.pool.allocate_from_npu(
             npu_ptr=0x1000,
             size=2048,
@@ -315,37 +315,37 @@ class TestSharedCPUMemoryPoolEviction(unittest.TestCase):
             provided_hash="hash1"
         )
         
-        # Release it (make it eligible for eviction)
+        # 释放（使其可被淘汰）
         self.pool.release("hash1", 0x1000)
         
-        # Allocate second block (should trigger eviction)
+        # 分配第二个块（应触发淘汰）
         self.pool.allocate_from_npu(
             npu_ptr=0x2000,
-            size=3072,  # Larger than remaining space
+            size=3072,  # 大于剩余空间
             compute_hash=False,
             provided_hash="hash2"
         )
         
-        # First block should be evicted
+        # 第一个块应被淘汰
         self.assertNotIn("hash1", self.pool._hash_to_block)
         self.assertIn("hash2", self.pool._hash_to_block)
         self.assertEqual(self.pool._stats["total_evictions"], 1)
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_no_eviction_for_referenced_blocks(self, mock_memcpy):
-        """Test that referenced blocks are not evicted."""
+        """测试已引用块不被淘汰。"""
         mock_memcpy.return_value = None
         
-        # Allocate and keep reference
+        # 分配并保留引用
         self.pool.allocate_from_npu(
             npu_ptr=0x1000,
             size=2048,
             compute_hash=False,
             provided_hash="hash1"
         )
-        # Don't release - ref_count stays at 1
+        # 不释放 - 引用计数保持为 1
         
-        # Try to allocate more (should log warning but not evict referenced block)
+        # 尝试分配更多（应记录警告但不淘汰已引用块）
         self.pool.allocate_from_npu(
             npu_ptr=0x2000,
             size=3072,
@@ -353,25 +353,25 @@ class TestSharedCPUMemoryPoolEviction(unittest.TestCase):
             provided_hash="hash2"
         )
         
-        # Both should exist (even if over limit, referenced blocks stay)
+        # 两者都应存在（即使超过限制，已引用块保留）
         self.assertIn("hash1", self.pool._hash_to_block)
 
 
 class TestSharedCPUMemoryPoolThreadSafety(unittest.TestCase):
-    """Test cases for thread safety."""
+    """线程安全的测试用例。"""
     
     def setUp(self):
-        """Reset singleton before each test."""
+        """每个测试前重置单例。"""
         SharedCPUMemoryPool.reset_instance()
         self.pool = SharedCPUMemoryPool.get_instance()
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_concurrent_allocations(self, mock_memcpy):
-        """Test concurrent allocations from multiple threads."""
+        """测试多线程并发分配。"""
         mock_memcpy.return_value = None
         
         num_threads = 10
@@ -396,26 +396,26 @@ class TestSharedCPUMemoryPoolThreadSafety(unittest.TestCase):
         for t in threads:
             t.join()
         
-        # Verify all allocations exist
+        # 验证所有分配存在
         stats = self.pool.get_stats()
         self.assertEqual(stats["current_blocks"], num_threads * allocations_per_thread)
 
 
 class TestSharedCPUMemoryPoolStats(unittest.TestCase):
-    """Test cases for statistics."""
+    """统计信息的测试用例。"""
     
     def setUp(self):
-        """Reset singleton before each test."""
+        """每个测试前重置单例。"""
         SharedCPUMemoryPool.reset_instance()
         self.pool = SharedCPUMemoryPool.get_instance()
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_stats_after_allocation(self, mock_memcpy):
-        """Test statistics after allocation."""
+        """测试分配后统计。"""
         mock_memcpy.return_value = None
         
         self.pool.allocate_from_npu(
@@ -431,10 +431,10 @@ class TestSharedCPUMemoryPoolStats(unittest.TestCase):
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_stats_after_sharing(self, mock_memcpy):
-        """Test statistics after memory sharing."""
+        """测试共享后统计。"""
         mock_memcpy.return_value = None
         
-        # Allocate same hash twice
+        # 相同哈希分配两次
         self.pool.allocate_from_npu(
             npu_ptr=0x1000,
             size=1024,
@@ -455,7 +455,7 @@ class TestSharedCPUMemoryPoolStats(unittest.TestCase):
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_clear_resets_stats(self, mock_memcpy):
-        """Test that clear resets statistics."""
+        """测试 clear 重置统计。"""
         mock_memcpy.return_value = None
         
         self.pool.allocate_from_npu(
@@ -473,20 +473,20 @@ class TestSharedCPUMemoryPoolStats(unittest.TestCase):
 
 
 class TestSharedCPUMemoryPoolBlockInfo(unittest.TestCase):
-    """Test cases for block info retrieval."""
+    """块信息获取的测试用例。"""
     
     def setUp(self):
-        """Reset singleton before each test."""
+        """每个测试前重置单例。"""
         SharedCPUMemoryPool.reset_instance()
         self.pool = SharedCPUMemoryPool.get_instance()
     
     def tearDown(self):
-        """Clean up after each test."""
+        """每个测试后清理。"""
         SharedCPUMemoryPool.reset_instance()
     
     @patch("vllm_ascend.device_allocator.shared_cpu_pool.memcpy")
     def test_get_block_info_existing(self, mock_memcpy):
-        """Test getting info for existing block."""
+        """测试获取现有块信息。"""
         mock_memcpy.return_value = None
         
         hash_value = "test_hash"
@@ -508,7 +508,7 @@ class TestSharedCPUMemoryPoolBlockInfo(unittest.TestCase):
         self.assertIn(npu_ptr, info["npu_ptrs"])
     
     def test_get_block_info_nonexistent(self):
-        """Test getting info for non-existent block."""
+        """测试获取不存在的块信息。"""
         info = self.pool.get_block_info("nonexistent_hash")
         self.assertIsNone(info)
 
