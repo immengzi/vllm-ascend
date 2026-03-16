@@ -18,12 +18,15 @@
 #
 import dataclasses
 import os
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 from acl.rt import memcpy  # type: ignore # noqa: F401
 from vllm.logger import logger
+
+from vllm_ascend.device_allocator.shared_cpu_pool import SharedCPUMemoryPool
 
 
 def find_loaded_library(lib_name) -> Optional[str]:
@@ -76,6 +79,8 @@ class AllocationData:
     handle: HandleType
     tag: str
     cpu_backup_tensor: Optional[torch.Tensor] = None
+    sha256_hash: Optional[str] = None
+    use_shared_pool: bool = False
 
 
 def create_and_map(allocation_handle: HandleType) -> None:
@@ -119,6 +124,14 @@ class CaMemAllocator:
     When we call `wake_up`, all tensors that are previously offloaded
     will be loaded back to GPU memory, and the rest of the tensors will
     have empty memory.
+    
+    **Shared CPU Memory Pool Support:**
+    When `use_shared_cpu_pool=True`, the allocator uses the process-wide
+    SharedCPUMemoryPool for offloading memory during sleep. This allows:
+    1. Multiple NPU workers to share identical weight tensors (SHA256-based deduplication)
+    2. Reduced CPU memory usage when multiple models have overlapping weights
+    3. Faster sleep/wake cycles by avoiding redundant memory allocation
+    
     Why it needs to be a singleton?
     When allocated tensors are garbage collected, PyTorch will call
     the free callback, which will call the `python_free_callback` method.
@@ -141,7 +154,14 @@ class CaMemAllocator:
             CaMemAllocator.instance = CaMemAllocator()
         return CaMemAllocator.instance
 
-    def __init__(self):
+    def __init__(self, use_shared_cpu_pool: bool = True):
+        """
+        Initialize the CaMemAllocator.
+        
+        Args:
+            use_shared_cpu_pool: Whether to use the shared CPU memory pool
+                                for sleep mode. Defaults to True.
+        """
         conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
         assert "expandable_segments:True" not in conf, \
             ("Expandable segments are not compatible with memory pool. "
@@ -151,35 +171,66 @@ class CaMemAllocator:
         self.pointer_to_data: Dict[int, AllocationData] = {}
         self.current_tag: str = CaMemAllocator.default_tag
         self.allocator_and_pools: Dict[str, Any] = {}
+        
+        # Shared CPU memory pool settings
+        self._use_shared_cpu_pool = use_shared_cpu_pool
+        self._shared_pool: Optional[SharedCPUMemoryPool] = None
+        if use_shared_cpu_pool:
+            self._shared_pool = SharedCPUMemoryPool.get_instance()
+            logger.info("CaMemAllocator initialized with SharedCPUMemoryPool enabled")
+        else:
+            logger.info("CaMemAllocator initialized with SharedCPUMemoryPool disabled")
+        
+        # Thread safety for pointer_to_data modifications during sleep/wake
+        self._lock: threading.RLock = threading.RLock()
 
     def python_malloc_callback(self, allocation_handle: HandleType) -> None:
         """
         Internal method to store the allocation data
         when memory is allocated in the memory pool."""
         py_d_mem = allocation_handle[2]
-        self.pointer_to_data[py_d_mem] = AllocationData(
-            allocation_handle, self.current_tag)
+        with self._lock:
+            self.pointer_to_data[py_d_mem] = AllocationData(
+                handle=allocation_handle,
+                tag=self.current_tag,
+                use_shared_pool=self._use_shared_cpu_pool
+            )
         return
 
     def python_free_callback(self, ptr: int) -> HandleType:
         """
         Internal method to look up the allocation data
         when memory is freed in the memory pool."""
-        data = self.pointer_to_data.pop(ptr)
-        if data.cpu_backup_tensor is not None:
-            data.cpu_backup_tensor = None
-        return data.handle
+        with self._lock:
+            data = self.pointer_to_data.pop(ptr, None)
+            if data is None:
+                # This can happen if the pointer was already cleaned up
+                # during sleep mode. Return a dummy handle.
+                return (0, 0, ptr, 0)
+            
+            # Release from shared pool if needed
+            if data.use_shared_pool and data.sha256_hash and self._shared_pool:
+                self._shared_pool.release(data.sha256_hash, ptr)
+            
+            if data.cpu_backup_tensor is not None:
+                data.cpu_backup_tensor = None
+            return data.handle
 
     def sleep(
             self,
             offload_tags: Optional[Union[Tuple[str, ...],
-                                         str]] = None) -> None:
+                                         str]] = None,
+            enable_deduplication: bool = True) -> None:
         """
         Put the allocator in sleep mode.
         All data in the memory allocation with the specified tag will be 
         offloaded to CPU memory, and others will be discarded.
-        :param offload_tags: The tags of the memory allocation that will be
-            offloaded. The rest of the memory allocation will be discarded.
+        
+        Args:
+            offload_tags: The tags of the memory allocation that will be
+                offloaded. The rest of the memory allocation will be discarded.
+            enable_deduplication: Whether to enable SHA256-based deduplication
+                when using shared CPU memory pool. Defaults to True.
         """
         if offload_tags is None:
             # by default, allocated tensors are offloaded
@@ -190,42 +241,112 @@ class CaMemAllocator:
 
         assert isinstance(offload_tags, tuple)
 
-        for ptr, data in self.pointer_to_data.items():
-            handle = data.handle
-            if data.tag in offload_tags:
-                size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes,
-                                                dtype=torch.uint8,
-                                                device='cpu',
-                                                pin_memory=True)
-                cpu_ptr = cpu_backup_tensor.data_ptr()
-                ACL_MEMCPY_DEVICE_TO_HOST = 2
-                dest_max = cpu_ptr + size_in_bytes * 2
-                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes,
-                       ACL_MEMCPY_DEVICE_TO_HOST)
-                data.cpu_backup_tensor = cpu_backup_tensor
-            unmap_and_release(handle)
+        with self._lock:
+            for ptr, data in self.pointer_to_data.items():
+                handle = data.handle
+                if data.tag in offload_tags:
+                    size_in_bytes = handle[1]
+                    
+                    if self._use_shared_cpu_pool and self._shared_pool and enable_deduplication:
+                        # Use shared CPU memory pool with SHA256 deduplication
+                        try:
+                            cpu_tensor, sha256_hash = self._shared_pool.allocate_from_npu(
+                                npu_ptr=ptr,
+                                size=size_in_bytes,
+                                compute_hash=True
+                            )
+                            data.cpu_backup_tensor = cpu_tensor
+                            data.sha256_hash = sha256_hash
+                            data.use_shared_pool = True
+                            
+                            logger.debug(
+                                "Sleep: Offloaded %s bytes to shared pool, hash=%s...",
+                                size_in_bytes, sha256_hash[:16] if sha256_hash else "N/A"
+                            )
+                        except Exception as e:
+                            # Fallback to legacy mode if shared pool fails
+                            logger.warning(
+                                "Shared pool allocation failed, falling back to legacy mode: %s",
+                                e
+                            )
+                            cpu_backup_tensor = torch.empty(size_in_bytes,
+                                                            dtype=torch.uint8,
+                                                            device='cpu',
+                                                            pin_memory=True)
+                            cpu_ptr = cpu_backup_tensor.data_ptr()
+                            ACL_MEMCPY_DEVICE_TO_HOST = 2
+                            dest_max = cpu_ptr + size_in_bytes * 2
+                            memcpy(cpu_ptr, dest_max, ptr, size_in_bytes,
+                                   ACL_MEMCPY_DEVICE_TO_HOST)
+                            data.cpu_backup_tensor = cpu_backup_tensor
+                            data.sha256_hash = None
+                            data.use_shared_pool = False
+                    else:
+                        # Legacy mode: allocate dedicated CPU memory
+                        cpu_backup_tensor = torch.empty(size_in_bytes,
+                                                        dtype=torch.uint8,
+                                                        device='cpu',
+                                                        pin_memory=True)
+                        cpu_ptr = cpu_backup_tensor.data_ptr()
+                        ACL_MEMCPY_DEVICE_TO_HOST = 2
+                        dest_max = cpu_ptr + size_in_bytes * 2
+                        memcpy(cpu_ptr, dest_max, ptr, size_in_bytes,
+                               ACL_MEMCPY_DEVICE_TO_HOST)
+                        data.cpu_backup_tensor = cpu_backup_tensor
+                        data.sha256_hash = None
+                        data.use_shared_pool = False
+                
+                # Unmap and release NPU memory regardless of offload
+                unmap_and_release(handle)
+            
+            # Log shared pool statistics if enabled
+            if self._use_shared_cpu_pool and self._shared_pool:
+                self._shared_pool.log_summary()
 
     def wake_up(self, tags: Optional[list[str]] = None) -> None:
         """
         Wake up the allocator from sleep mode.
         All data that is previously offloaded will be loaded back to GPU 
-        memory, and the rest of the data will have empty memory."""
-        for ptr, data in self.pointer_to_data.items():
-            if tags is None or data.tag in tags:
-                handle = data.handle
-                create_and_map(handle)
-                if data.cpu_backup_tensor is not None:
-                    cpu_backup_tensor = data.cpu_backup_tensor
-                    if cpu_backup_tensor is not None:
-                        size_in_bytes = cpu_backup_tensor.numel(
-                        ) * cpu_backup_tensor.element_size()
-                        cpu_ptr = cpu_backup_tensor.data_ptr()
-                        ACL_MEMCPY_HOST_TO_DEVICE = 1
-                        dest_max = ptr + size_in_bytes * 2
-                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes,
-                               ACL_MEMCPY_HOST_TO_DEVICE)
-                        data.cpu_backup_tensor = None
+        memory, and the rest of the data will have empty memory.
+        
+        Args:
+            tags: Optional list of tags to selectively wake up.
+                  If None, all offloaded memory is restored.
+        """
+        with self._lock:
+            for ptr, data in self.pointer_to_data.items():
+                if tags is None or data.tag in tags:
+                    handle = data.handle
+                    create_and_map(handle)
+                    
+                    if data.use_shared_pool and data.sha256_hash and self._shared_pool:
+                        # Restore from shared CPU memory pool
+                        try:
+                            self._shared_pool.copy_to_npu(
+                                sha256_hash=data.sha256_hash,
+                                npu_ptr=ptr,
+                                size=handle[1]
+                            )
+                            # Note: We don't release from shared pool here
+                            # The reference is kept for potential future use
+                        except Exception as e:
+                            logger.error(
+                                "Failed to restore from shared pool (hash=%s...): %s",
+                                data.sha256_hash[:16] if data.sha256_hash else "N/A", e
+                            )
+                            raise
+                    elif data.cpu_backup_tensor is not None:
+                        # Legacy mode: restore from dedicated CPU memory
+                        cpu_backup_tensor = data.cpu_backup_tensor
+                        if cpu_backup_tensor is not None:
+                            size_in_bytes = cpu_backup_tensor.numel(
+                            ) * cpu_backup_tensor.element_size()
+                            cpu_ptr = cpu_backup_tensor.data_ptr()
+                            ACL_MEMCPY_HOST_TO_DEVICE = 1
+                            dest_max = ptr + size_in_bytes * 2
+                            memcpy(ptr, dest_max, cpu_ptr, size_in_bytes,
+                                   ACL_MEMCPY_HOST_TO_DEVICE)
+                            data.cpu_backup_tensor = None
 
     @contextmanager
     def use_memory_pool(self, tag: Optional[str] = None):
@@ -251,7 +372,6 @@ class CaMemAllocator:
             # to avoid the issue, we keep a reference of the data.
             # see https://github.com/pytorch/pytorch/issues/146431 .
             self.allocator_and_pools[tag] = data
-            yield
             # PyTorch's bug, calling torch.cuda.empty_cache() will error
             # when using pluggable allocator, see
             # https://github.com/pytorch/pytorch/issues/145168 .
@@ -262,14 +382,42 @@ class CaMemAllocator:
             # allocate memory.
             # TODO: we need to find a way to release the memory,
             # i.e. calling torch.cuda.empty_cache()
+            yield
             self.current_tag = old_tag
 
     def get_current_usage(self) -> int:
         """
         Get the total number of bytes allocated in the memory pool.
         """
-        sum_bytes: int = 0
-        for ptr, data in self.pointer_to_data.items():
-            handle = data.handle
-            sum_bytes += handle[1]
-        return sum_bytes
+        with self._lock:
+            sum_bytes: int = 0
+            for ptr, data in self.pointer_to_data.items():
+                handle = data.handle
+                sum_bytes += handle[1]
+            return sum_bytes
+    
+    def get_shared_pool_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        Get statistics from the shared CPU memory pool.
+        
+        Returns:
+            Dictionary with statistics, or None if shared pool is not enabled.
+        """
+        if self._shared_pool:
+            return self._shared_pool.get_stats()
+        return None
+    
+    def release_from_shared_pool(self, ptr: int) -> None:
+        """
+        Explicitly release a pointer's reference from the shared pool.
+        This is useful when you want to clean up shared pool references
+        without waiting for garbage collection.
+        
+        Args:
+            ptr: The NPU pointer to release.
+        """
+        with self._lock:
+            data = self.pointer_to_data.get(ptr)
+            if data and data.sha256_hash and self._shared_pool:
+                self._shared_pool.release(data.sha256_hash, ptr)
+                data.sha256_hash = None

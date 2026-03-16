@@ -8,6 +8,7 @@ This section provides a detailed usage guide of vLLM Ascend features.
 graph_mode
 quantization
 sleep_mode
+shared_cpu_memory_pool
 structured_output
 lora
 eplb_swift_balancer
