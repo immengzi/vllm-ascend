@@ -552,9 +552,12 @@ class NPUWorker(WorkerBase):
                         torch_profiler_trace_dir)
 
             experimental_config = torch_npu.profiler._ExperimentalConfig(
-                export_type=torch_npu.profiler.ExportType.Text,
+                export_type=[
+                    torch_npu.profiler.ExportType.Text,
+                    torch_npu.profiler.ExportType.Db,
+                ],
                 profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                msprof_tx=False,
+                mstx=True,
                 aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
                 l2_cache=False,
                 op_attr=False,

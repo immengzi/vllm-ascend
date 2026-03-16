@@ -105,7 +105,6 @@ from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
-from vllm.v1.utils import record_function_or_nullcontext
 from vllm_ascend.utils import (AscendDeviceType, ProfileExecuteDuration,
                                enable_sp, get_ascend_device_type,
                                is_drafter_moe_model, is_moe_model,
@@ -139,14 +138,31 @@ U32_MAX = 0xFFFFFFFF
 
 
 def _mark_with_memory(tag: str) -> None:
-    """Insert a named point marker into the torch_npu.profiler timeline.
+    """Insert a named point marker with NPU memory info via mstx.
 
-    Emits a marker of the form "<tag> | mem=<X>MB" that appears as a
-    vertical annotation in the Ascend Insight / msprof timeline.  The call
-    is a no-op when no profiler session is active.
+    Calls torch_npu.npu.mstx.mark() which is visible in Ascend Insight /
+    msprof timeline when the profiler is started with mstx=True.
+    The call is a no-op when the profiler is not active.
     """
     mem_mb = torch_npu.npu.memory_allocated() / 1024 / 1024
-    torch_npu.profiler.mark(f"{tag} | mem={mem_mb:.1f}MB")
+    torch_npu.npu.mstx.mark(f"{tag} | mem={mem_mb:.1f}MB")
+
+
+@contextmanager
+def _mstx_range(name: str, stream=None):
+    """Context manager for mstx range profiling (range_start / range_end).
+
+    Wraps a code block with torch_npu.npu.mstx.range_start / range_end so
+    that the named range appears as a coloured span in the Ascend Insight /
+    msprof timeline.  Passing a stream captures both host-side and
+    device-side duration; omitting it (or passing None) records host-side
+    duration only.
+    """
+    range_id = torch_npu.npu.mstx.range_start(name, stream)
+    try:
+        yield
+    finally:
+        torch_npu.npu.mstx.range_end(range_id)
 
 
 @dataclass
@@ -1505,7 +1521,7 @@ class NPUModelRunner(GPUModelRunner):
 
         _mark_with_memory("execute_model:start")
         with ProfileExecuteDuration().capture_async("prepare input"):
-            with record_function_or_nullcontext("vllm_ascend:update_states"):
+            with _mstx_range("vllm_ascend:update_states"):
                 _mark_with_memory("update_states:start")
                 self._update_states(scheduler_output)
                 _mark_with_memory("update_states:end")
@@ -1531,7 +1547,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.dynamic_eplb:
                 self.eplb_updator.forward_before()
 
-            with record_function_or_nullcontext("vllm_ascend:prepare_inputs"):
+            with _mstx_range("vllm_ascend:prepare_inputs"):
                 _mark_with_memory("prepare_inputs:start")
                 (attn_metadata, positions, num_scheduled_tokens_np,
                  num_input_tokens, num_tokens_across_dp,
@@ -1586,7 +1602,7 @@ class NPUModelRunner(GPUModelRunner):
                     is_multimodal_model=self.is_multimodal_model):
                 self.maybe_setup_kv_connector(scheduler_output)
 
-                with record_function_or_nullcontext("vllm_ascend:model_forward"):
+                with _mstx_range("vllm_ascend:model_forward"):
                     _mark_with_memory("model_forward:start")
                     hidden_states = self._generate_process_reqs_hidden_states(
                         maybe_padded_num_tokens, input_ids, positions,
@@ -1650,7 +1666,7 @@ class NPUModelRunner(GPUModelRunner):
                         isinstance(hidden_states[0], torch.Tensor):
                     hidden_states = hidden_states[0]
                 sample_hidden_states = hidden_states[logits_indices]
-                with record_function_or_nullcontext(
+                with _mstx_range(
                         "vllm_ascend:compute_logits"):
                     _mark_with_memory("compute_logits:start")
                     logits = self.model.compute_logits(sample_hidden_states)
@@ -1731,7 +1747,7 @@ class NPUModelRunner(GPUModelRunner):
 
         _mark_with_memory("sample_tokens:start")
         with ProfileExecuteDuration().capture_async("Sample"):
-            with record_function_or_nullcontext("vllm_ascend:sampling"):
+            with _mstx_range("vllm_ascend:sampling"):
                 _mark_with_memory("sampling:start")
                 sampler_output = self._sample(logits, spec_decode_metadata)
                 _mark_with_memory("sampling:end")
@@ -1767,7 +1783,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         with ProfileExecuteDuration().capture_async("Draft"):
-            with record_function_or_nullcontext("vllm_ascend:draft_generation"):
+            with _mstx_range("vllm_ascend:draft_generation"):
                 _mark_with_memory("draft_generation:start")
                 if self.speculative_config:
                     use_padded_batch_for_eagle = self.speculative_config and \
