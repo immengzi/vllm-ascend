@@ -314,6 +314,15 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
     aclrtMalloc(&fb, static_cast<size_t>(size), ACL_MEM_MALLOC_HUGE_FIRST);
     if (fb != nullptr) {
         alloc_track_add(size);
+    } else {
+        // Both SHMEM and direct aclrtMalloc failed – genuine OOM.
+        // Log explicitly so the user gets a clear message instead of a
+        // cryptic "Get data ptr failed" / "ERR00001" from the NPU runtime.
+        std::cerr << "[shmem_allocator] my_malloc: fallback aclrtMalloc also "
+                     "failed for size=" << size
+                  << " -- device is out of memory (OOM). "
+                     "Consider reducing gpu_memory_utilization or "
+                     "max_model_len.\n";
     }
     return fb;
 }
