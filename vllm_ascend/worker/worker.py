@@ -106,7 +106,19 @@ class NPUWorker(WorkerBase):
         # This lazy import avoids torch_npu re-initialization in patch
         from vllm.triton_utils import HAS_TRITON
         if HAS_TRITON:
-            import torch_npu._inductor  # noqa: F401
+            try:
+                import torch_npu._inductor  # noqa: F401
+            except RuntimeError as e:
+                # torch_npu._inductor registers FA fusion patterns using AOT
+                # autograd tracing with FakeTensors. Tools like msleaks that
+                # register __torch_dispatch__ hooks may intercept these fake
+                # ops and crash on data_ptr(). Skip the import gracefully so
+                # that profiling tools can still work at the cost of inductor
+                # FA pattern optimizations being unavailable.
+                logger.warning(
+                    "torch_npu._inductor import skipped due to an error "
+                    "during pattern registration (e.g. caused by an active "
+                    "__torch_dispatch__ hook such as msleaks): %s", e)
         # Register ops when worker init.
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
