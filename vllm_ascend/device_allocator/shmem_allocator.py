@@ -238,6 +238,15 @@ class ShmemAllocator:
         :param tag: Optional label used to identify this allocation group
             (e.g. ``"kv_cache"``, ``"weights"``).  Currently informational
             only; it does not affect allocation routing.
+
+        **Important – pool lifetime**: The ``MemPool`` / ``NPUPluggableAllocator``
+        pair is intentionally kept alive in ``self._pools`` *even after the
+        context exits*.  Dropping the pool object while live tensors backed by
+        it still exist can cause PyTorch to release the underlying SHMEM
+        segments, turning those tensors into dangling pointers and triggering
+        OOM or corruption during inference.  Callers that genuinely want to
+        reclaim all memory for a tag should call :meth:`release_pool` explicitly
+        after all tensors allocated under that tag have been freed.
         """
         if tag is None:
             tag = ShmemAllocator.default_tag
@@ -251,15 +260,28 @@ class ShmemAllocator:
         alloc = self._get_pluggable_allocator()
         pool = torch.npu.memory.MemPool(alloc._allocator)
 
-        # Keep hard references alive for the lifetime of the context
-        # (mirrors the workaround in camem.py for PyTorch GC bugs).
+        # Keep hard references alive **beyond** the context so that tensors
+        # allocated here (weights, KV cache) remain valid during inference.
+        # This mirrors the approach in camem.py.
+        # See https://github.com/pytorch/pytorch/issues/146431.
         self._pools[tag] = (pool, alloc)
         try:
             with torch.npu.memory.use_mem_pool(pool):
                 yield
         finally:
             self.current_tag = old_tag
-            self._pools.pop(tag, None)
+            # Do NOT pop self._pools[tag] here – the pool must outlive
+            # the context so that tensors allocated inside remain valid.
+
+    def release_pool(self, tag: Optional[str] = None) -> None:
+        """Drop the pool reference for *tag*, allowing GC to reclaim it.
+
+        Only call this after all tensors allocated under *tag* have been
+        freed; otherwise those tensors will reference released memory.
+        """
+        if tag is None:
+            tag = ShmemAllocator.default_tag
+        self._pools.pop(tag, None)
 
     # ------------------------------------------------------------------ #
     # Sleep / wake-up stubs (API compatibility with CaMemAllocator)       #
