@@ -77,6 +77,17 @@ class ACLGraphWrapper:
         # need to initialize a ACLGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
         self.graph_pool = current_platform.get_global_graph_pool()
+        # NPUPluggableAllocator (used by the SHMEM backend) does not implement
+        # beginAllocateToPool, so pool-based ACL graph capture is unavailable.
+        # Fall back to pool=None (each graph manages its own memory) when the
+        # SHMEM allocator is active.
+        try:
+            from vllm_ascend.device_allocator.shmem_allocator import (
+                ShmemAllocator)
+            if ShmemAllocator.get_instance()._installed:
+                self.graph_pool = None
+        except ImportError:
+            pass
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -150,7 +161,7 @@ class ACLGraphWrapper:
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
-                with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                with torch.npu.graph(aclgraph, pool=None):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
