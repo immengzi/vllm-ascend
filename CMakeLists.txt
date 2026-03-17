@@ -90,6 +90,13 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
 endif()
 
+# shmem_allocator.cpp is built as a separate module (shmem_allocator); it must
+# not be included in vllm_ascend_C because (a) it needs shmem headers that are
+# not part of the standard include path and (b) it defines my_malloc/my_free
+# which would collide with the same symbols in camem_allocator.cpp.
+list(REMOVE_ITEM VLLM_ASCEND_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/shmem_allocator.cpp)
+
 include_directories(
   ${pybind11_INCLUDE_DIRS}
   ${PYTHON_INCLUDE_PATH}
@@ -109,6 +116,78 @@ set(
   ${ASCEND_HOME_PATH}/aarch64-linux/include/experiment/platform
   ${ASCEND_HOME_PATH}/x86_64-linux/include/experiment/platform
 )
+
+# ---------------------------------------------------------------------------
+# Optional: SHMEM dynamic memory allocator module
+#
+# Enable with:
+#   cmake -DENABLE_SHMEM=ON -DSHMEM_HOME_PATH=/root/shmem/install …
+# Or at pip-install time:
+#   ENABLE_SHMEM=1 SHMEM_HOME_PATH=/root/shmem/install pip install -e .
+#
+# SHMEM_HOME_PATH is set by  `source install/set_env.sh`  in the shmem tree.
+# It points to the parent of the shmem/ sub-directory, e.g.:
+#   /root/shmem/install          ← source build
+#   /usr/local/Ascend/shmem/latest  ← binary package install
+# Headers are at  ${SHMEM_HOME_PATH}/shmem/include/
+# Libraries are at ${SHMEM_HOME_PATH}/shmem/lib/
+#
+# Why a separate pybind11_add_module?
+#   • camem_allocator.cpp (compiled into vllm_ascend_C) already exports
+#     my_malloc / my_free.  A second definition in the same .so causes a
+#     linker duplicate-symbol error.
+#   • libshmem.so is optional; gating it behind ENABLE_SHMEM keeps the
+#     default build free of that requirement.
+#   • NPUPluggableAllocator loads a .so by path and resolves my_malloc /
+#     my_free via dlsym.  The Python extension .so doubles as that backend.
+option(ENABLE_SHMEM "Build the SHMEM-backed NPU pluggable allocator" OFF)
+
+if(ENABLE_SHMEM)
+  set(SHMEM_HOME_PATH "$ENV{SHMEM_HOME_PATH}" CACHE PATH
+      "Parent of the shmem/ install directory (set by source install/set_env.sh)")
+  if(NOT SHMEM_HOME_PATH)
+    set(SHMEM_HOME_PATH "/usr/local/Ascend/shmem/latest")
+    message(STATUS "SHMEM_HOME_PATH not set, using default: ${SHMEM_HOME_PATH}")
+  else()
+    message(STATUS "SHMEM_HOME_PATH: ${SHMEM_HOME_PATH}")
+  endif()
+
+  # Actual library root: one level below SHMEM_HOME_PATH
+  set(_SHMEM_ROOT "${SHMEM_HOME_PATH}/shmem")
+
+  pybind11_add_module(shmem_allocator
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/shmem_allocator.cpp)
+
+  target_include_directories(shmem_allocator PRIVATE
+      ${_SHMEM_ROOT}/include
+      ${pybind11_INCLUDE_DIRS}
+      ${PYTHON_INCLUDE_PATH}
+      ${TORCH_INCLUDE_DIRS}
+      ${TORCH_NPU_PATH}/include
+      ${ASCEND_HOME_PATH}/include)
+
+  target_link_directories(shmem_allocator PRIVATE
+      ${TORCH_LIBRARY_DIRS}
+      ${TORCH_NPU_PATH}/lib/
+      ${ASCEND_HOME_PATH}/lib64
+      ${_SHMEM_ROOT}/lib)
+
+  target_link_libraries(shmem_allocator PUBLIC
+      ${TORCH_LIBRARIES}
+      torch_npu
+      ascendcl
+      shmem)
+
+  # Embed RPATH so the .so finds libshmem.so and its bootstrap plugins at
+  # runtime without requiring LD_LIBRARY_PATH to be set.
+  set_target_properties(shmem_allocator PROPERTIES
+      INSTALL_RPATH "$ORIGIN:${_SHMEM_ROOT}/lib"
+      BUILD_WITH_INSTALL_RPATH TRUE)
+
+  install(TARGETS shmem_allocator DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  message(STATUS "SHMEM allocator module enabled (root: ${_SHMEM_ROOT})")
+endif()
+# ---------------------------------------------------------------------------
 
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
 
