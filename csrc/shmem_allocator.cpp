@@ -39,6 +39,8 @@
  */
 
 // ── C++ standard headers (must precede extern "C") ──────────────────────────
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -48,6 +50,76 @@
 
 // ── SHMEM public API (C++ header, cannot be inside extern "C") ──────────────
 #include "shmem.h"
+
+// ── DeviceStats layout mirror ─────────────────────────────────────────────────
+// Mirrors c10_npu::NPUCachingAllocator::DeviceStats from torch_npu 2.8.0.
+// Defined here to avoid pulling in the heavy NPUCachingAllocator.h (which
+// drags in HCCL, ATen, and other large dependencies incompatible with the
+// shmem_allocator build target).
+//
+// Binary layout must match exactly so the aarch64 struct-return ABI works
+// correctly when torch_npu calls our function via the stored std::function.
+// StatType::NUM_TYPES == 3 in torch_npu 2.8.0.
+namespace shmem_npu_compat {
+
+struct Stat {
+    int64_t current   = 0;
+    int64_t peak      = 0;
+    int64_t allocated = 0;
+    int64_t freed     = 0;
+};
+
+using StatArray = std::array<Stat, 3>;  // NUM_TYPES = 3
+
+struct DeviceStats {
+    StatArray allocation;
+    StatArray segment;
+    StatArray active;
+    StatArray inactive_split;
+    StatArray allocated_bytes;
+    StatArray reserved_bytes;
+    StatArray active_bytes;
+    StatArray inactive_split_bytes;
+    StatArray requested_bytes;
+    int64_t   num_alloc_retries = 0;
+    int64_t   num_ooms          = 0;
+    Stat      oversize_allocations;
+    Stat      oversize_segments;
+    int64_t   max_split_size    = 0;
+};
+
+// Compile-time sanity check: 9 StatArrays × 96 bytes + 88 bytes = 952 bytes.
+static_assert(sizeof(DeviceStats) == 952,
+    "DeviceStats layout mismatch – verify against torch_npu 2.8.0");
+
+} // namespace shmem_npu_compat
+
+// ── Stats callbacks (C++ linkage, outside extern "C") ────────────────────────
+// g_shmem_initialized lives inside extern "C"; access it via this accessor.
+static bool shmem_is_initialized_flag() noexcept;  // defined after extern "C"
+
+// getDeviceStats: returns SHMEM pool statistics mapped to DeviceStats format.
+// The AGGREGATE slot (index 0) is filled; SMALL_POOL/LARGE_POOL remain zero.
+static shmem_npu_compat::DeviceStats shmem_get_device_stats_impl(int /*device*/)
+{
+    shmem_npu_compat::DeviceStats stats{};
+    if (shmem_is_initialized_flag()) {
+        uint64_t total = 0, used = 0, avail = 0;
+        aclshmem_get_memory_stats(&total, &used, &avail);
+        // allocated_bytes: how much the allocator client currently holds.
+        stats.allocated_bytes[0].current   = static_cast<int64_t>(used);
+        stats.allocated_bytes[0].peak      = static_cast<int64_t>(used);
+        stats.allocated_bytes[0].allocated = static_cast<int64_t>(used);
+        // reserved_bytes: total capacity of the SHMEM pool.
+        stats.reserved_bytes[0].current    = static_cast<int64_t>(total);
+        stats.reserved_bytes[0].peak       = static_cast<int64_t>(total);
+        stats.reserved_bytes[0].allocated  = static_cast<int64_t>(total);
+    }
+    return stats;
+}
+
+// resetPeakStats: SHMEM does not track peak separately; no-op.
+static void shmem_reset_peak_stats_impl(int /*device*/) {}
 
 // ── Everything else can live inside extern "C" ──────────────────────────────
 extern "C" {
@@ -283,3 +355,30 @@ PyMODINIT_FUNC PyInit_shmem_allocator(void)
 }
 
 } // extern "C"
+
+// ── Post-extern-"C" definitions ───────────────────────────────────────────────
+
+// Accessor for g_shmem_initialized (defined in extern "C" above).
+static bool shmem_is_initialized_flag() noexcept
+{
+    return g_shmem_initialized;
+}
+
+// C-linkage address getters: Python uses ctypes to retrieve these and passes
+// them to torch_npu's set_get_device_stats_fn / set_reset_peak_status_fn.
+// Using uint64_t matches the type expected by Module.cpp's Python bindings.
+extern "C" {
+
+__attribute__((visibility("default")))
+uint64_t shmem_get_device_stats_fn_addr(void)
+{
+    return reinterpret_cast<uint64_t>(&shmem_get_device_stats_impl);
+}
+
+__attribute__((visibility("default")))
+uint64_t shmem_reset_peak_stats_fn_addr(void)
+{
+    return reinterpret_cast<uint64_t>(&shmem_reset_peak_stats_impl);
+}
+
+} // extern "C" (address getters)

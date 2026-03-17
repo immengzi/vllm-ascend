@@ -234,6 +234,56 @@ class ShmemAllocator:
             "SHMEM: installed as global NPU allocator (changeCurrentAllocator). "
             "All NPU allocations now go directly to my_malloc/my_free."
         )
+        self._register_stats_callbacks(alloc)
+
+    # ------------------------------------------------------------------ #
+    # torch_npu memory-stats compatibility                                 #
+    # ------------------------------------------------------------------ #
+
+    def _register_stats_callbacks(self, alloc) -> None:
+        """Register getDeviceStats / resetPeakStats C++ callbacks.
+
+        NPUPluggableAllocator::getDeviceStats() in torch_npu has a missing
+        return statement when no callback is registered.  On aarch64 this
+        causes stack-canary corruption ("*** stack smashing detected ***")
+        because the function returns a large struct by value via a hidden
+        pointer but never writes to it.
+
+        The crash is triggered from *both* the Python path
+        (torch_npu.npu.memory_stats()) and directly from within CANN during
+        model compilation.  A Python-level monkey-patch cannot intercept the
+        C++ call, so we must register a proper C++ function pointer via
+        set_get_device_stats_fn / set_reset_peak_status_fn.
+
+        shmem_allocator.cpython-*.so exports two address-getter functions with
+        C linkage that return the addresses of the C++ stat callback stubs.
+        We load those addresses with ctypes and hand them to the allocator.
+        """
+        import ctypes
+
+        try:
+            so = ctypes.CDLL(_lib_path)
+
+            so.shmem_get_device_stats_fn_addr.restype = ctypes.c_uint64
+            so.shmem_reset_peak_stats_fn_addr.restype = ctypes.c_uint64
+
+            get_stats_addr = int(so.shmem_get_device_stats_fn_addr())
+            reset_addr = int(so.shmem_reset_peak_stats_fn_addr())
+
+            cpp_alloc = alloc.allocator()
+            cpp_alloc.set_get_device_stats_fn(get_stats_addr)
+            cpp_alloc.set_reset_peak_status_fn(reset_addr)
+
+            logger.info(
+                "SHMEM: registered getDeviceStats / resetPeakStats C++ "
+                "callbacks with NPUPluggableAllocator."
+            )
+        except Exception as e:
+            logger.error(
+                "SHMEM: failed to register stats callbacks: %s. "
+                "Calls to torch_npu.npu.memory_stats() will likely crash.",
+                e,
+            )
 
     # ------------------------------------------------------------------ #
     # Memory statistics                                                    #
