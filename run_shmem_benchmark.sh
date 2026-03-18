@@ -115,6 +115,21 @@ for qa_args in "${QA_ARGS_LIST[@]}"; do
       wait "$VLLM_PID" 2>/dev/null || true
       echo ">>> vllm serve stopped"
 
+      # 确认端口 8000 已释放，防止下一轮健康检查误判
+      echo ">>> Waiting for port 8000 to be released..."
+      port_wait=0
+      while curl -sf http://localhost:8000/health > /dev/null 2>&1; do
+        if [ "$port_wait" -ge 60 ]; then
+          echo ">>> WARNING: port 8000 still occupied after 60s, force killing any remaining process..."
+          fuser -k 8000/tcp 2>/dev/null || true
+          sleep 2
+          break
+        fi
+        sleep 2
+        port_wait=$((port_wait + 2))
+      done
+      echo ">>> Port 8000 released"
+
       # 记录结果
       {
         echo ""
