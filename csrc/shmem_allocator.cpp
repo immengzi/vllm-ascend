@@ -47,7 +47,17 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <deque>
 #include <unordered_set>
+#include <vector>
+
+// ── ACL runtime API (needed for aclrtEvent / aclrtStream types) ──────────────
+// Included here (outside extern "C") because the helper functions that use
+// aclrtEvent, aclrtCreateEventWithFlag, aclrtRecordEvent, etc. are defined
+// before the extern "C" block.  acl_rt.h ships its own extern "C" guards so
+// it is safe to include from C++ without wrapping.
+#include <sys/types.h>
+#include "acl/acl.h"
 
 // ── SHMEM public API (C++ header, cannot be inside extern "C") ──────────────
 #include "shmem.h"
@@ -124,6 +134,110 @@ static void alloc_track_sub(int64_t size) noexcept
     g_alloc_cur_bytes.fetch_sub(size, std::memory_order_relaxed);
 }
 
+// ── Event-based deferred freeing ─────────────────────────────────────────────
+// Instead of blocking on aclrtSynchronizeStream in every my_free call, we
+// record a lightweight ACL event on the stream, push the pending free onto a
+// deferred queue, and actually free the memory later once the event signals
+// completion.  This is the same pattern used by PyTorch's NPU caching
+// allocator and avoids host-device synchronisation on the hot path.
+
+struct DeferredFreeEntry {
+    void       *ptr;
+    ssize_t     size;
+    bool        is_shmem;
+    aclrtEvent  event;
+};
+
+// All access to g_deferred_frees and g_event_pool is guarded by g_ptrs_mutex
+// (declared later in the extern "C" block).  Forward-declare the mutex here so
+// the helpers can reference it in comments; actual locking is done by callers.
+static std::deque<DeferredFreeEntry>  g_deferred_frees;
+static std::vector<aclrtEvent>        g_event_pool;
+
+// NOTE: g_deferred_frees and g_event_pool are guarded by g_ptrs_mutex which
+// is declared in the extern "C" block below.  All helper functions below
+// require the caller to already hold that lock.
+
+// Acquire an ACL event from the pool, or create a new one.
+// Caller MUST hold g_ptrs_mutex.
+static aclrtEvent acquire_event()
+{
+    if (!g_event_pool.empty()) {
+        aclrtEvent ev = g_event_pool.back();
+        g_event_pool.pop_back();
+        return ev;
+    }
+    aclrtEvent ev = nullptr;
+    aclError err = aclrtCreateEventWithFlag(&ev, ACL_EVENT_CAPTURE_STREAM_PROGRESS);
+    if (err != ACL_ERROR_NONE) {
+        std::cerr << "[shmem_allocator] aclrtCreateEventWithFlag failed: "
+                  << err << "\n";
+        return nullptr;
+    }
+    return ev;
+}
+
+// Return an ACL event to the pool for reuse.
+// Caller MUST hold g_ptrs_mutex.
+static void release_event(aclrtEvent ev)
+{
+    g_event_pool.push_back(ev);
+}
+
+// Poll the deferred-free queue and actually free entries whose events have
+// completed.  Stops at the first not-ready entry (events on a stream complete
+// in FIFO order, so everything behind it is also not ready).
+// Caller MUST hold g_ptrs_mutex.
+static void process_deferred_frees()
+{
+    while (!g_deferred_frees.empty()) {
+        auto &entry = g_deferred_frees.front();
+        aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+        aclError err = aclrtQueryEventStatus(entry.event, &status);
+        if (err != ACL_ERROR_NONE ||
+            status != ACL_EVENT_RECORDED_STATUS_COMPLETE) {
+            break;
+        }
+        // Event completed – reclaim the memory.
+        release_event(entry.event);
+        if (entry.is_shmem) {
+            aclshmem_free(entry.ptr);
+        } else {
+            aclrtFree(entry.ptr);
+        }
+        alloc_track_sub(entry.size);
+        g_deferred_frees.pop_front();
+    }
+}
+
+// Blocking drain: synchronise every outstanding event and free all deferred
+// entries.  Used during finalization when we must release everything.
+// Caller MUST hold g_ptrs_mutex.
+static void drain_deferred_frees()
+{
+    for (auto &entry : g_deferred_frees) {
+        aclrtSynchronizeEvent(entry.event);
+        release_event(entry.event);
+        if (entry.is_shmem) {
+            aclshmem_free(entry.ptr);
+        } else {
+            aclrtFree(entry.ptr);
+        }
+        alloc_track_sub(entry.size);
+    }
+    g_deferred_frees.clear();
+}
+
+// Destroy all pooled events.  Called during finalization after draining.
+// Caller MUST hold g_ptrs_mutex.
+static void destroy_event_pool()
+{
+    for (auto ev : g_event_pool) {
+        aclrtDestroyEvent(ev);
+    }
+    g_event_pool.clear();
+}
+
 // ── Stats callbacks (C++ linkage, outside extern "C") ────────────────────────
 // g_shmem_initialized lives inside extern "C"; access it via this accessor.
 static bool shmem_is_initialized_flag() noexcept;  // defined after extern "C"
@@ -171,8 +285,7 @@ extern "C" {
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
-#include <sys/types.h>
-#include "acl/acl.h"
+// acl/acl.h and sys/types.h are already included above (outside extern "C").
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -284,6 +397,13 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         return nullptr;
     }
 
+    // Reclaim memory from completed deferred frees before allocating, so that
+    // the SHMEM pool / device allocator can reuse it immediately.
+    {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        process_deferred_frees();
+    }
+
     try {
         ensure_shmem_initialized();
     } catch (const std::exception &e) {
@@ -334,37 +454,53 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         return;
     }
 
-    // Synchronise the stream before returning memory to the pool.
+    // Event-based deferred freeing.
     //
-    // Unlike PyTorch's built-in caching allocator (which tracks per-stream
-    // usage and defers reuse until the stream has finished), the SHMEM pool
-    // and aclrtFree have no stream awareness.  aclshmem_free / aclrtFree
-    // make the memory immediately available for reuse.  If an NPU kernel
-    // submitted on `stream` is still reading/writing this memory, the next
-    // aclshmem_malloc could hand the same region to a new tensor whose
-    // initialisation (e.g. aclrtMemset from torch.zeros, or a kernel on
-    // another stream) would race with the in-flight kernel, corrupting data.
+    // The SHMEM pool and aclrtFree have no stream awareness – freed memory is
+    // immediately available for reuse.  If an NPU kernel submitted on `stream`
+    // is still reading/writing this memory, the next aclshmem_malloc could
+    // hand the same region to a new tensor, causing a data race.
     //
-    // aclrtSynchronizeStream ensures all previously submitted work on this
-    // stream has completed before the memory is recycled.
-    //
-    // Performance note: a per-free stream sync is expensive.  A future
-    // optimisation can use aclrtEvent-based deferred freeing (record an
-    // event here, check completion in my_malloc) to avoid blocking the host.
-    if (stream != nullptr) {
-        aclrtSynchronizeStream(stream);
-    }
+    // Instead of blocking the host with aclrtSynchronizeStream (which
+    // serialises host/device and severely hurts throughput), we record a
+    // lightweight ACL event on the stream and push the pending free onto a
+    // deferred queue.  The memory is actually freed later – in my_malloc or
+    // my_free – once the event signals that all prior work on the stream has
+    // completed.  If event creation or recording fails we fall back to the
+    // synchronous path for safety.
 
     bool is_shmem = false;
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+
+        // Opportunistically reclaim completed deferred frees.
+        process_deferred_frees();
+
         auto it = g_shmem_ptrs.find(ptr);
         if (it != g_shmem_ptrs.end()) {
             is_shmem = true;
             g_shmem_ptrs.erase(it);
         }
+
+        if (stream != nullptr) {
+            aclrtEvent ev = acquire_event();
+            if (ev != nullptr) {
+                aclError err = aclrtRecordEvent(ev, stream);
+                if (err == ACL_ERROR_NONE) {
+                    g_deferred_frees.push_back({ptr, size, is_shmem, ev});
+                    return;  // deferred – do not free or track_sub yet
+                }
+                // Record failed; return event and fall back to sync path.
+                release_event(ev);
+                std::cerr << "[shmem_allocator] aclrtRecordEvent failed: "
+                          << err << ", falling back to sync free\n";
+            }
+            // Event creation failed; fall back to sync path.
+            aclrtSynchronizeStream(stream);
+        }
     }
 
+    // Immediate free (stream == nullptr, or event fallback).
     if (is_shmem) {
         aclshmem_free(ptr);
     } else {
@@ -391,6 +527,15 @@ static PyObject *py_shmem_finalize(PyObject * /*self*/, PyObject * /*args*/)
 {
     std::lock_guard<std::mutex> lock(g_shmem_mutex);
     if (g_shmem_initialized) {
+        // Drain all deferred frees before tearing down the pool – any
+        // shmem pointers still in the deferred queue would become invalid
+        // after aclshmem_finalize.
+        {
+            std::lock_guard<std::mutex> plock(g_ptrs_mutex);
+            drain_deferred_frees();
+            destroy_event_pool();
+        }
+
         int ret = aclshmem_finalize();
         if (ret != ACLSHMEM_SUCCESS) {
             std::cerr << "[shmem_allocator] aclshmem_finalize returned "
