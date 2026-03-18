@@ -99,9 +99,26 @@ struct DeviceStats {
     int64_t   max_split_size    = 0;
 };
 
-// Compile-time sanity check: 9 StatArrays × 96 bytes + 88 bytes = 952 bytes.
-static_assert(sizeof(DeviceStats) == 952,
-    "DeviceStats layout mismatch – verify against torch_npu 2.8.0");
+// Compile-time ABI sanity checks against torch_npu 2.8.0.
+// sizeof(Stat)=32, sizeof(StatArray)=96. Layout (all offsets in bytes):
+//   9 × StatArray (0..863), then int64 × 2 (864,872), Stat × 2 (880,912), int64 (944).
+static_assert(sizeof(Stat)      == 32,  "Stat size mismatch");
+static_assert(sizeof(StatArray) == 96,  "StatArray size mismatch");
+static_assert(sizeof(DeviceStats) == 952, "DeviceStats total size mismatch");
+static_assert(offsetof(DeviceStats, allocation)            ==   0);
+static_assert(offsetof(DeviceStats, segment)               ==  96);
+static_assert(offsetof(DeviceStats, active)                == 192);
+static_assert(offsetof(DeviceStats, inactive_split)        == 288);
+static_assert(offsetof(DeviceStats, allocated_bytes)       == 384);
+static_assert(offsetof(DeviceStats, reserved_bytes)        == 480);
+static_assert(offsetof(DeviceStats, active_bytes)          == 576);
+static_assert(offsetof(DeviceStats, inactive_split_bytes)  == 672);
+static_assert(offsetof(DeviceStats, requested_bytes)       == 768);
+static_assert(offsetof(DeviceStats, num_alloc_retries)     == 864);
+static_assert(offsetof(DeviceStats, num_ooms)              == 872);
+static_assert(offsetof(DeviceStats, oversize_allocations)  == 880);
+static_assert(offsetof(DeviceStats, oversize_segments)     == 912);
+static_assert(offsetof(DeviceStats, max_split_size)        == 944);
 
 } // namespace shmem_npu_compat
 

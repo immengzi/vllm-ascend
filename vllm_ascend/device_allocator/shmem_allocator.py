@@ -195,9 +195,12 @@ class ShmemAllocator:
     def finalize(self) -> None:
         """Release the SHMEM pool.  Safe to call more than once."""
         if self._initialized:
+            # Reset state before the call so that a subsequent finalize() call
+            # (e.g. from __del__) does not attempt a double-finalize if
+            # shmem_finalize() raises.
+            self._initialized = False
             try:
                 shmem_finalize()
-                self._initialized = False
                 logger.info("SHMEM allocator finalized.")
             except Exception as e:
                 logger.error("Failed to finalize SHMEM allocator: %s", e)
