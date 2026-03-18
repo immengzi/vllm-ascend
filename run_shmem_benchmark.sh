@@ -8,6 +8,7 @@ QA_SCRIPT_PATH="/root/LMCache/benchmarks/multi_round_qa/multi-round-qa.py"
 SUMMARY_CSV_PATH="/root/LMCache/benchmarks/multi_round_qa/summary.csv"
 WAIT_AFTER_QA=60          # 等待 vllm serve 输出结束的秒数
 COOLDOWN=30               # 每轮结束后冷却秒数
+VLLM_PORT=8100            # vllm serve 端口（避免与手动启动的 8000 冲突）
 OUTPUT_DIR="/root/benchmark_results"
 
 # ========== 测试用例数组（全自动遍历） ==========
@@ -40,6 +41,7 @@ for qa_args in "${QA_ARGS_LIST[@]}"; do
       # 启动 vllm serve
       ENABLE_SHMEM=$shmem vllm serve "$MODEL_PATH" \
         --gpu-memory-utilization "$gpu_mem" \
+        --port "$VLLM_PORT" \
         $VLLM_SERVE_EXTRA_ARGS > "$log_file" 2>&1 &
       VLLM_PID=$!
       echo ">>> vllm serve started, PID=${VLLM_PID}"
@@ -47,7 +49,7 @@ for qa_args in "${QA_ARGS_LIST[@]}"; do
       # 等待 vllm serve 就绪
       echo ">>> Waiting for vllm serve to be ready..."
       elapsed=0
-      while ! curl -sf http://localhost:8000/health > /dev/null 2>&1; do
+      while ! curl -sf http://localhost:${VLLM_PORT}/health > /dev/null 2>&1; do
         if ! kill -0 "$VLLM_PID" 2>/dev/null; then
           echo ">>> ERROR: vllm serve exited unexpectedly. Check log: ${log_file}"
           echo "[${tag}] ERROR: vllm serve exited unexpectedly" | tee -a "$RESULTS_FILE"
@@ -70,7 +72,7 @@ for qa_args in "${QA_ARGS_LIST[@]}"; do
       echo ">>> Running multi-round-qa.py..."
       python3 "$QA_SCRIPT_PATH" \
         --model "$MODEL_PATH" \
-        --base-url http://localhost:8000/v1 \
+        --base-url http://localhost:${VLLM_PORT}/v1 \
         $qa_args || true
 
       # 保留原始 summary.csv
@@ -116,12 +118,12 @@ for qa_args in "${QA_ARGS_LIST[@]}"; do
       echo ">>> vllm serve stopped"
 
       # 确认端口 8000 已释放，防止下一轮健康检查误判
-      echo ">>> Waiting for port 8000 to be released..."
+      echo ">>> Waiting for port ${VLLM_PORT} to be released..."
       port_wait=0
-      while curl -sf http://localhost:8000/health > /dev/null 2>&1; do
+      while curl -sf http://localhost:${VLLM_PORT}/health > /dev/null 2>&1; do
         if [ "$port_wait" -ge 60 ]; then
-          echo ">>> WARNING: port 8000 still occupied after 60s, force killing any remaining process..."
-          fuser -k 8000/tcp 2>/dev/null || true
+          echo ">>> WARNING: port ${VLLM_PORT} still occupied after 60s, force killing any remaining process..."
+          fuser -k ${VLLM_PORT}/tcp 2>/dev/null || true
           sleep 2
           break
         fi
