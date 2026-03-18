@@ -334,6 +334,27 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         return;
     }
 
+    // Synchronise the stream before returning memory to the pool.
+    //
+    // Unlike PyTorch's built-in caching allocator (which tracks per-stream
+    // usage and defers reuse until the stream has finished), the SHMEM pool
+    // and aclrtFree have no stream awareness.  aclshmem_free / aclrtFree
+    // make the memory immediately available for reuse.  If an NPU kernel
+    // submitted on `stream` is still reading/writing this memory, the next
+    // aclshmem_malloc could hand the same region to a new tensor whose
+    // initialisation (e.g. aclrtMemset from torch.zeros, or a kernel on
+    // another stream) would race with the in-flight kernel, corrupting data.
+    //
+    // aclrtSynchronizeStream ensures all previously submitted work on this
+    // stream has completed before the memory is recycled.
+    //
+    // Performance note: a per-free stream sync is expensive.  A future
+    // optimisation can use aclrtEvent-based deferred freeing (record an
+    // event here, check completion in my_malloc) to avoid blocking the host.
+    if (stream != nullptr) {
+        aclrtSynchronizeStream(stream);
+    }
+
     bool is_shmem = false;
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
