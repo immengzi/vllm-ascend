@@ -5,7 +5,6 @@ set -euo pipefail
 MODEL_PATH="/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562/"
 VLLM_SERVE_EXTRA_ARGS="--enforce-eager --max-model-len 8192"
 QA_SCRIPT_PATH="/root/LMCache/benchmarks/multi_round_qa/multi-round-qa.py"
-SUMMARY_CSV_PATH="/root/LMCache/benchmarks/multi_round_qa/summary.csv"
 WAIT_AFTER_QA=60          # 等待 vllm serve 输出结束的秒数
 COOLDOWN=30               # 每轮结束后冷却秒数
 VLLM_PORT=8100            # vllm serve 端口（避免与手动启动的 8000 冲突）
@@ -73,15 +72,8 @@ for qa_args in "${QA_ARGS_LIST[@]}"; do
       python3 "$QA_SCRIPT_PATH" \
         --model "$MODEL_PATH" \
         --base-url http://localhost:${VLLM_PORT}/v1 \
+        --output "$csv_file" \
         $qa_args || true
-
-      # 保留原始 summary.csv
-      if [ -f "$SUMMARY_CSV_PATH" ]; then
-        cp "$SUMMARY_CSV_PATH" "$csv_file"
-        echo ">>> Saved summary CSV to ${csv_file}"
-      else
-        echo ">>> WARNING: summary.csv not found at ${SUMMARY_CSV_PATH}"
-      fi
 
       # 解析 TTFT（第3列，跳过表头）
       ttft_avg="N/A"
