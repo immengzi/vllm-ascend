@@ -215,7 +215,24 @@ static void process_deferred_frees()
             status != ACL_EVENT_RECORDED_STATUS_COMPLETE) {
             break;
         }
-        // Event completed – reclaim the memory.
+        // Event completed: all NPU kernels that used entry.ptr have finished.
+        // Zero the shmem region NOW – before returning it to the pool.
+        //
+        // Why here and not at allocation time:
+        //   aclrtMemset uses the NPU default stream. PyTorch's inference kernels
+        //   run on a separate inference stream. Zeroing at alloc time would race
+        //   with those kernels (default stream vs inference stream have no ordering
+        //   guarantee), overwriting data the kernels just wrote and producing
+        //   completely garbled output.
+        //
+        //   Here the event guarantee means no NPU operation is pending on this
+        //   buffer, so aclrtMemset (synchronous) is safe: it completes before
+        //   aclshmem_free returns the pointer to the pool, ensuring any future
+        //   allocator reuse sees clean memory.
+        if (entry.is_shmem && entry.size > 0) {
+            aclrtMemset(entry.ptr, static_cast<size_t>(entry.size),
+                        0, static_cast<size_t>(entry.size));
+        }
         release_event(entry.event);
         if (entry.is_shmem) {
             aclshmem_free(entry.ptr);
@@ -234,6 +251,11 @@ static void drain_deferred_frees()
 {
     for (auto &entry : g_deferred_frees) {
         aclrtSynchronizeEvent(entry.event);
+        // All NPU ops have finished (sync'd above); zero before returning to pool.
+        if (entry.is_shmem && entry.size > 0) {
+            aclrtMemset(entry.ptr, static_cast<size_t>(entry.size),
+                        0, static_cast<size_t>(entry.size));
+        }
         release_event(entry.event);
         if (entry.is_shmem) {
             aclshmem_free(entry.ptr);
@@ -517,7 +539,13 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         }
     }
 
-    // Immediate free (stream == nullptr, or event fallback).
+    // Immediate free (stream == nullptr, or event fallback after sync).
+    // For stream==nullptr the NPU is idle (init/teardown phase), so aclrtMemset
+    // is safe.  For the event-fallback branch, aclrtSynchronizeStream was called
+    // above, ensuring all NPU ops have finished before we zero.
+    if (is_shmem && size > 0) {
+        aclrtMemset(ptr, static_cast<size_t>(size), 0, static_cast<size_t>(size));
+    }
     if (is_shmem) {
         aclshmem_free(ptr);
     } else {
