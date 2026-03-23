@@ -27,6 +27,8 @@
 # - 模型并行场景下的内存去重
 #
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
