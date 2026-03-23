@@ -139,6 +139,13 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING":
     lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", '0'))),
+    # Whether to use direct CANN API (aclrtMalloc/aclrtFree) for memory allocation
+    # instead of using NPUPluggableAllocator and mempool.
+    # When set to 1 (default), the allocator will directly call CANN's native memory allocation APIs,
+    # bypassing PyTorch's NPUCachingAllocator and mempool mechanism.
+    # Set to 0 to use the original NPUCachingAllocator.
+    "ENABLE_ACLAPI":
+    lambda: bool(int(os.getenv("ENABLE_ACLAPI", '1'))),
 }
 
 # end-env-vars-definition

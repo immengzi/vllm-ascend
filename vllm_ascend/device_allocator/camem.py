@@ -65,6 +65,7 @@ except ImportError as e:
     logger.warning(
         "Failed to import vllm_ascend_C:%s. Sleep mode will be disabled. ", e)
     init_module = None
+    init_module_aclapi = None
     python_create_and_map = None
     python_unmap_and_release = None
     lib_name = None
@@ -131,6 +132,12 @@ class CaMemAllocator:
     1. Multiple NPU workers to share identical weight tensors (SHA256-based deduplication)
     2. Reduced CPU memory usage when multiple models have overlapping weights
     3. Faster sleep/wake cycles by avoiding redundant memory allocation
+    
+    **Direct ACL API Mode:**
+    When ENABLE_ACLAPI environment variable is set to 1, the allocator uses
+    CANN's native aclrtMalloc/aclrtFree APIs instead of aclrtMallocPhysical/
+    aclrtMapMem. This bypasses the memory mapping mechanism and directly
+    allocates/free device memory.
     
     Why it needs to be a singleton?
     When allocated tensors are garbage collected, PyTorch will call
@@ -317,6 +324,7 @@ class CaMemAllocator:
             for ptr, data in self.pointer_to_data.items():
                 if tags is None or data.tag in tags:
                     handle = data.handle
+                    
                     create_and_map(handle)
                     
                     if data.use_shared_pool and data.sha256_hash and self._shared_pool:

@@ -18,6 +18,14 @@
 # Provides memory management utilities for sleep mode and shared CPU memory pool.
 #
 
+# Direct ACL API allocator (ENABLE_ACLAPI)
+from vllm_ascend.device_allocator.acl_direct_allocator import (
+    ENABLE_ACLAPI,
+    ACLDirectAllocator,
+    maybe_init_acl_direct_allocator,
+)
+
+# CaMem allocator (sleep mode)
 from vllm_ascend.device_allocator.camem import (
     AllocationData,
     CaMemAllocator,
@@ -38,7 +46,12 @@ from vllm_ascend.device_allocator.shared_cpu_pool_multiprocess import (
 )
 
 __all__ = [
-    # CaMem allocator
+    # Environment flags
+    "ENABLE_ACLAPI",
+    # Direct ACL API allocator
+    "ACLDirectAllocator",
+    "maybe_init_acl_direct_allocator",
+    # CaMem allocator (sleep mode)
     "AllocationData",
     "CaMemAllocator",
     "create_and_map",

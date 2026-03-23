@@ -15,6 +15,29 @@
 # This file is a part of the vllm-ascend project.
 #
 
+# Initialize ACL direct allocator early if ENABLE_ACLAPI is set.
+# This must be done before any NPU memory allocations.
+from vllm_ascend.device_allocator.acl_direct_allocator import (
+    ENABLE_ACLAPI,
+    maybe_init_acl_direct_allocator,
+)
+
+# Try to initialize the ACL direct allocator.
+# If ENABLE_ACLAPI=1 (default), this will change the NPU memory allocator
+# to use direct CANN API (aclrtMalloc/aclrtFree) instead of NPUCachingAllocator.
+_acl_allocator_enabled = maybe_init_acl_direct_allocator()
+
+# Log the current allocator status for clarity
+if _acl_allocator_enabled:
+    import logging
+    logging.info("vllm-ascend: Using ACL direct allocator (aclrtMalloc/aclrtFree)")
+elif not ENABLE_ACLAPI:
+    import logging
+    logging.info("vllm-ascend: Using default NPUCachingAllocator (ENABLE_ACLAPI=0)")
+else:
+    # ENABLE_ACLAPI=1 but initialization failed, warning already logged
+    pass
+
 
 def register():
     """Register the NPU platform."""

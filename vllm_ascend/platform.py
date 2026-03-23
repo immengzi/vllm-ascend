@@ -28,6 +28,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.utils import refresh_block_size
+from vllm_ascend.device_allocator.acl_direct_allocator import maybe_init_acl_direct_allocator
 
 # isort: off
 from vllm_ascend.utils import (ASCEND_QUANTIZATION_METHOD,
@@ -124,6 +125,10 @@ class NPUPlatform(Platform):
     def pre_register_and_update(cls,
                                 parser: Optional[FlexibleArgumentParser] = None
                                 ) -> None:
+        # Initialize ACL direct allocator if ENABLE_ACLAPI is set.
+        # This must be done before any NPU memory allocations.
+        maybe_init_acl_direct_allocator()
+        
         # Adapt the global patch here.
         from vllm_ascend.utils import adapt_patch
         adapt_patch(is_global_patch=True)

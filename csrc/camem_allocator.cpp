@@ -32,6 +32,10 @@ extern "C" {
 static PyObject* g_python_malloc_callback = nullptr;
 static PyObject* g_python_free_callback = nullptr;
 
+// Global references for direct ACL API allocator (aclrtMalloc/aclrtFree)
+static PyObject* g_aclapi_malloc_callback = nullptr;
+static PyObject* g_aclapi_free_callback = nullptr;
+
 
 // ---------------------------------------------------------------------------
 // Helper functions:
@@ -122,7 +126,7 @@ PyObject* create_tuple_from_c_integers(unsigned long long a,
 }
 
 // ---------------------------------------------------------------------------
-// Our exported C functions that call Python:
+// Our exported C functions that call Python (original version with aclrtMallocPhysical):
 
 __attribute__ ((visibility("default"))) void* my_malloc(ssize_t size, int device, aclrtStream stream) {
   ensure_context(device);
@@ -249,6 +253,87 @@ __attribute__ ((visibility("default"))) void my_free(void* ptr, ssize_t size, in
 }
 
 // ---------------------------------------------------------------------------
+// Direct ACL API allocator functions (using aclrtMalloc/aclrtFree):
+
+__attribute__ ((visibility("default"))) void* my_malloc_aclapi(ssize_t size, int device, aclrtStream stream) {
+  ensure_context(device);
+
+  // Directly allocate memory using aclrtMalloc
+  void* d_mem = nullptr;
+  // ACL_MEM_MALLOC_HUGE_FIRST = 0
+  aclError error_code = aclrtMalloc(&d_mem, size, ACL_MEM_MALLOC_HUGE_FIRST);
+  
+  if (error_code != 0) {
+    if (error_code == ACL_ERROR_RT_MEMORY_ALLOCATION) {
+      throw std::runtime_error("aclrtMalloc failed with acl error code: " + 
+                              std::to_string(error_code) + "(OOM: Out of Memory, allocation failed) " + 
+                              __FILE__ + ":" + std::to_string(__LINE__));
+    } else {
+      throw std::runtime_error("aclrtMalloc failed with acl error code: " +
+                              std::to_string(error_code) + " " + __FILE__ + ":" + std::to_string(__LINE__));
+    }
+  }
+
+  if (!g_aclapi_malloc_callback) {
+    throw std::runtime_error("my_malloc_aclapi ERROR: g_aclapi_malloc_callback not set." +
+                            std::string(" ") + __FILE__ + ":" + std::to_string(__LINE__));
+  }
+
+  // Acquire GIL (not in stable ABI officially, but often works)
+  PyGILState_STATE gstate = PyGILState_Ensure();
+
+  // For direct ACL API, we pass (device, size, ptr, 0) - last field is unused
+  PyObject* arg_tuple = create_tuple_from_c_integers(
+      (unsigned long long)device, (unsigned long long)size,
+      (unsigned long long)d_mem, 0);
+
+  // Call g_aclapi_malloc_callback
+  PyObject* py_result =
+      PyObject_CallFunctionObjArgs(g_aclapi_malloc_callback, arg_tuple, NULL);
+  Py_DECREF(arg_tuple);
+
+  if (!py_result) {
+    PyErr_Print();
+    PyGILState_Release(gstate);
+    return nullptr;
+  }
+
+  PyGILState_Release(gstate);
+
+  return d_mem;
+}
+
+__attribute__ ((visibility("default"))) void my_free_aclapi(void* ptr, ssize_t size, int device, aclrtStream stream) {
+  if (!g_aclapi_free_callback) {
+    throw std::runtime_error("my_free_aclapi ERROR: g_aclapi_free_callback not set." +
+                            std::string(" ") + __FILE__ + ":" + std::to_string(__LINE__));
+  }
+
+  // Acquire GIL (not in stable ABI officially, but often works)
+  PyGILState_STATE gstate = PyGILState_Ensure();
+
+  PyObject* py_ptr =
+      PyLong_FromUnsignedLongLong(reinterpret_cast<unsigned long long>(ptr));
+
+  // Call g_aclapi_free_callback
+  PyObject* py_result =
+      PyObject_CallFunctionObjArgs(g_aclapi_free_callback, py_ptr, NULL);
+
+  if (py_result) {
+    Py_DECREF(py_result);
+  }
+
+  PyGILState_Release(gstate);
+
+  // Free memory using aclrtFree
+  aclError error_code = aclrtFree(ptr);
+  if (error_code != 0) {
+    throw std::runtime_error("aclrtFree failed with acl error code: " +
+                            std::to_string(error_code) + " " + __FILE__ + ":" + std::to_string(__LINE__));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Python extension boilerplate:
 
 // Python-exposed function: init_module(python_malloc, python_free)
@@ -270,6 +355,27 @@ static PyObject* py_init_module(PyObject* self, PyObject* args) {
   // outside of this module.
   g_python_malloc_callback = malloc_callback;
   g_python_free_callback = free_callback;
+
+  Py_RETURN_NONE;
+}
+
+// Python-exposed function: init_module_aclapi(python_malloc, python_free)
+static PyObject* py_init_module_aclapi(PyObject* self, PyObject* args) {
+  PyObject* malloc_callback = nullptr;
+  PyObject* free_callback = nullptr;
+
+  if (!PyArg_ParseTuple(args, "OO", &malloc_callback, &free_callback)) {
+    return nullptr;
+  }
+
+  if (!PyCallable_Check(malloc_callback) || !PyCallable_Check(free_callback)) {
+    PyErr_SetString(PyExc_TypeError, "Both arguments must be callables");
+    return nullptr;
+  }
+
+  // Save the Python callables for direct ACL API allocator
+  g_aclapi_malloc_callback = malloc_callback;
+  g_aclapi_free_callback = free_callback;
 
   Py_RETURN_NONE;
 }
@@ -325,6 +431,8 @@ static PyObject* python_create_and_map(PyObject* self, PyObject* args) {
 static PyMethodDef module_methods[] = {
     {"init_module", (PyCFunction)py_init_module, METH_VARARGS,
      "Initialize module with python_malloc and python_free callables."},
+    {"init_module_aclapi", (PyCFunction)py_init_module_aclapi, METH_VARARGS,
+     "Initialize module with python_malloc and python_free callables for direct ACL API allocator."},
     {"python_create_and_map", (PyCFunction)python_create_and_map, METH_VARARGS,
      "Create and map memory on the device."},
     {"python_unmap_and_release", (PyCFunction)python_unmap_and_release,

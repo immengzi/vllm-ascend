@@ -19,8 +19,8 @@ import pytest
 import torch
 
 from tests.ut.base import PytestBase
-from vllm_ascend.device_allocator.camem import (AllocationData, CaMemAllocator,
-                                                create_and_map,
+from vllm_ascend.device_allocator.camem import (ENABLE_ACLAPI, AllocationData,
+                                                CaMemAllocator, create_and_map,
                                                 find_loaded_library,
                                                 get_pluggable_allocator,
                                                 unmap_and_release)
@@ -68,11 +68,12 @@ class TestCaMem(PytestBase):
             mock_release.assert_called_once_with(*handle)
 
     @patch("vllm_ascend.device_allocator.camem.init_module")
+    @patch("vllm_ascend.device_allocator.camem.init_module_aclapi")
     @patch(
         "vllm_ascend.device_allocator.camem.torch.npu.memory.NPUPluggableAllocator"
     )
     def test_get_pluggable_allocator(self, mock_allocator_class,
-                                     mock_init_module):
+                                     mock_init_module_aclapi, mock_init_module):
         mock_allocator_instance = MagicMock()
         mock_allocator_class.return_value = mock_allocator_instance
 
@@ -81,9 +82,18 @@ class TestCaMem(PytestBase):
             free_fn(123)
 
         mock_init_module.side_effect = side_effect_malloc_and_free
+        mock_init_module_aclapi.side_effect = side_effect_malloc_and_free
 
         allocator = get_pluggable_allocator(dummy_malloc, dummy_free)
-        mock_init_module.assert_called_once_with(dummy_malloc, dummy_free)
+        
+        # Check which init function was called based on ENABLE_ACLAPI
+        if ENABLE_ACLAPI:
+            mock_init_module_aclapi.assert_called_once_with(dummy_malloc, dummy_free)
+            mock_init_module.assert_not_called()
+        else:
+            mock_init_module.assert_called_once_with(dummy_malloc, dummy_free)
+            mock_init_module_aclapi.assert_not_called()
+        
         assert allocator == mock_allocator_instance
 
     def test_singleton_behavior(self):
