@@ -414,7 +414,7 @@ class CrossProcessSharedPool:
         """
         释放对共享内存块的引用
         
-        注意：实际的共享内存只有在所有进程都释放后才会清理
+        当引用计数降到 0 时，会立即清理共享内存资源
         """
         with self._acquire_lock():
             metadata = self._load_metadata()
@@ -431,17 +431,45 @@ class CrossProcessSharedPool:
             # 减少引用计数
             block_info.ref_count -= 1
             
-            if block_info.ref_count <= 0:
-                # 标记为可回收（实际清理由 cleanup 处理）
+            should_cleanup = block_info.ref_count <= 0
+            
+            if should_cleanup:
+                # 立即清理共享内存资源
+                shm_name = block_info.shm_name
+                
+                # 关闭本地缓存的引用
+                if shm_name in self._local_cache:
+                    try:
+                        self._local_cache[shm_name].close()
+                    except Exception:
+                        pass
+                    del self._local_cache[shm_name]
+                
+                # 删除共享内存段
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    shm.close()
+                    shm.unlink()
+                    logger.debug("Unlinked shared memory: %s", shm_name)
+                except FileNotFoundError:
+                    pass  # 已被其他进程清理
+                except Exception as e:
+                    logger.warning("Failed to unlink shared memory %s: %s", shm_name, e)
+                
+                # 从元数据中移除
+                del metadata[sha256_hash]
+                
                 logger.debug(
-                    "Block %s... eligible for cleanup (ref_count=%d)",
+                    "Cleaned up block %s... (ref_count=%d)",
                     sha256_hash[:16], block_info.ref_count
                 )
+            else:
+                # 更新元数据
+                metadata[sha256_hash] = block_info
             
-            metadata[sha256_hash] = block_info
             self._save_metadata(metadata)
             
-            return block_info.ref_count <= 0
+            return should_cleanup
     
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
