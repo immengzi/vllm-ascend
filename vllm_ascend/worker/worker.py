@@ -335,6 +335,15 @@ class NPUWorker(WorkerBase):
         available_kv_cache_memory = int(
             total_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            # Reserve headroom for shmem dynamic pool expansion at runtime.
+            # shmem expands in chunks of ~384MB (256MB * 1.5x factor);
+            # 512MB gives comfortable room for one expansion plus alignment.
+            SHMEM_HEADROOM = 512 * 1024 * 1024  # 512 MB
+            available_kv_cache_memory -= SHMEM_HEADROOM
+            logger.info(
+                "SHMEM enabled: reserved %d MB headroom for pool expansion",
+                SHMEM_HEADROOM // (1024 * 1024))
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
         logger.info(
             f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
