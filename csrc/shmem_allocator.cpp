@@ -202,14 +202,40 @@ static void ensure_shmem_initialized()
     aclshmem_enable_dynamic_expansion(true);
 
     // Determine initial pool size.
-    int64_t local_mem_size = 2LL * 1024 * 1024 * 1024; // 2 GiB
+    //
+    // Default: 2 MiB (one NPU large page).  Override via SHMEM_INITIAL_POOL_SIZE
+    // (bytes).  A minimal initial pool avoids competing with model loading and
+    // KV cache allocation for device memory; the dynamic expansion path
+    // (expand_pool → aclrtMalloc) handles growth on demand at runtime.
+    //
+    // The value is clamped to ACLSHMEM_MAX_LOCAL_SIZE (40 GiB) which is the hard
+    // device limit for symmetric SHMEM memory.
+    //
+    // NOTE: ACLSHMEM_MAX_LOCAL_SIZE is a macro defined in shmem_common_types.h;
+    //       do NOT redeclare it as a local variable (macro expansion would corrupt syntax).
+    static const int64_t kShmemMaxLocalSize =
+        static_cast<int64_t>(ACLSHMEM_MAX_LOCAL_SIZE);  // 40 GiB hard cap
+    int64_t local_mem_size = 2LL * 1024 * 1024;  // 2 MiB default
+
     const char *env_size = std::getenv("SHMEM_INITIAL_POOL_SIZE");
     if (env_size != nullptr) {
         try {
-            local_mem_size = std::stoll(env_size);
+            int64_t requested = std::stoll(env_size);
+            if (requested <= 0) {
+                std::cerr << "[shmem_allocator] SHMEM_INITIAL_POOL_SIZE must be > 0, "
+                             "using 2 MiB default.\n";
+            } else {
+                local_mem_size = std::min(requested, kShmemMaxLocalSize);
+                if (local_mem_size != requested) {
+                    std::cerr << "[shmem_allocator] SHMEM_INITIAL_POOL_SIZE clamped from "
+                              << requested / (1024*1024) << " MiB to "
+                              << local_mem_size / (1024*1024)
+                              << " MiB (ACLSHMEM_MAX_LOCAL_SIZE limit).\n";
+                }
+            }
         } catch (...) {
             std::cerr << "[shmem_allocator] Invalid SHMEM_INITIAL_POOL_SIZE, "
-                         "using 2 GiB default.\n";
+                         "using 2 MiB default.\n";
         }
     }
 
