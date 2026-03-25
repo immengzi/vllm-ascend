@@ -337,9 +337,9 @@ class NPUWorker(WorkerBase):
             peak_memory)
         if envs_ascend.ENABLE_SHMEM and shmem_available:
             # Reserve headroom for shmem dynamic pool expansion at runtime.
-            # shmem expands in chunks of ~384MB (256MB * 1.5x factor);
-            # 512MB gives comfortable room for one expansion plus alignment.
-            SHMEM_HEADROOM = 512 * 1024 * 1024  # 512 MB
+            # shmem needs ~1.07GB single allocations; 2GB covers that plus
+            # alignment and fragmentation overhead.
+            SHMEM_HEADROOM = 2 * 1024 * 1024 * 1024  # 2 GB
             available_kv_cache_memory -= SHMEM_HEADROOM
             logger.info(
                 "SHMEM enabled: reserved %d MB headroom for pool expansion",
