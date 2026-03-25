@@ -24,12 +24,16 @@ def random_sample(
     with npu_stream_switch(global_stream()):
         q = torch.empty_like(probs)
         if len(generators) != probs.shape[0]:
-            q.exponential_()
+            # Use uniform + inverse CDF instead of exponential_()
+            # which is buggy on Ascend NPU: Exp(1) = -log(U(0,1))
+            q.uniform_()
         if generators:
             # TODO(woosuk): This can be slow because we handle each request
             # one by one. Optimize this.
             for i, generator in generators.items():
-                q[i].exponential_(generator=generator)
+                q[i].uniform_(generator=generator)
+        q.clamp_(min=torch.finfo(q.dtype).tiny)
+        q = -torch.log(q)
     torch.npu.current_stream().wait_stream(global_stream())
     return probs.div_(q).argmax(dim=-1).view(-1)
 
@@ -51,12 +55,15 @@ class AscendSampler(Sampler):
         with torch.npu.stream(global_stream()):
             global_stream().wait_stream(torch.npu.current_stream())
             q = torch.empty((b_s, head_dim), device="npu", dtype=torch.float32)
-            # Goes to async exponential with AI-CPU exponential or default exponential.
+            # Use uniform + inverse CDF instead of exponential_()
+            # which is buggy on Ascend NPU: Exp(1) = -log(U(0,1))
             if len(generators) != q.shape[0]:
-                q.exponential_()
+                q.uniform_()
             if generators:
                 for i, generator in generators.items():
-                    q[i].exponential_(generator=generator)
+                    q[i].uniform_(generator=generator)
+            q.clamp_(min=torch.finfo(q.dtype).tiny)
+            q = -torch.log(q)
             self.async_exponential_event.record()
         self.set_q_event(q, self.async_exponential_event)
 
