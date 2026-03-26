@@ -147,7 +147,7 @@ option(ENABLE_SHMEM "Build the SHMEM-backed NPU pluggable allocator" OFF)
 
 if(ENABLE_SHMEM)
   set(SHMEM_HOME_PATH "$ENV{SHMEM_HOME_PATH}" CACHE PATH
-      "Parent of the shmem/ install directory (set by source install/set_env.sh)")
+      "SHMEM source root or install root (set by source install/set_env.sh)")
   if(NOT SHMEM_HOME_PATH)
     set(SHMEM_HOME_PATH "/usr/local/Ascend/shmem/latest")
     message(STATUS "SHMEM_HOME_PATH not set, using default: ${SHMEM_HOME_PATH}")
@@ -155,14 +155,39 @@ if(ENABLE_SHMEM)
     message(STATUS "SHMEM_HOME_PATH: ${SHMEM_HOME_PATH}")
   endif()
 
-  # Actual library root: one level below SHMEM_HOME_PATH
-  set(_SHMEM_ROOT "${SHMEM_HOME_PATH}/shmem")
+  find_path(SHMEM_INCLUDE_DIR
+      NAMES shmem.h
+      HINTS
+      ${SHMEM_HOME_PATH}
+      ${SHMEM_HOME_PATH}/shmem
+      PATH_SUFFIXES include
+      NO_DEFAULT_PATH)
+  find_library(SHMEM_LIBRARY
+      NAMES shmem
+      HINTS
+      ${SHMEM_HOME_PATH}
+      ${SHMEM_HOME_PATH}/shmem
+      PATH_SUFFIXES lib
+      NO_DEFAULT_PATH)
+
+  if(NOT SHMEM_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "Cannot find shmem.h under SHMEM_HOME_PATH=${SHMEM_HOME_PATH}. "
+        "Expected either <root>/include/shmem.h or <root>/shmem/include/shmem.h")
+  endif()
+  if(NOT SHMEM_LIBRARY)
+    message(FATAL_ERROR
+        "Cannot find libshmem under SHMEM_HOME_PATH=${SHMEM_HOME_PATH}. "
+        "Expected either <root>/lib or <root>/shmem/lib")
+  endif()
+
+  get_filename_component(SHMEM_LIBRARY_DIR ${SHMEM_LIBRARY} DIRECTORY)
 
   pybind11_add_module(shmem_allocator
       ${CMAKE_CURRENT_SOURCE_DIR}/csrc/shmem_allocator.cpp)
 
   target_include_directories(shmem_allocator PRIVATE
-      ${_SHMEM_ROOT}/include
+      ${SHMEM_INCLUDE_DIR}
       ${pybind11_INCLUDE_DIRS}
       ${PYTHON_INCLUDE_PATH}
       ${TORCH_INCLUDE_DIRS}
@@ -173,22 +198,23 @@ if(ENABLE_SHMEM)
       ${TORCH_LIBRARY_DIRS}
       ${TORCH_NPU_PATH}/lib/
       ${ASCEND_HOME_PATH}/lib64
-      ${_SHMEM_ROOT}/lib)
+      ${SHMEM_LIBRARY_DIR})
 
   target_link_libraries(shmem_allocator PUBLIC
       ${TORCH_LIBRARIES}
       torch_npu
       ascendcl
-      shmem)
+      ${SHMEM_LIBRARY})
 
   # Embed RPATH so the .so finds libshmem.so and its bootstrap plugins at
   # runtime without requiring LD_LIBRARY_PATH to be set.
   set_target_properties(shmem_allocator PROPERTIES
-      INSTALL_RPATH "$ORIGIN:${_SHMEM_ROOT}/lib"
+      INSTALL_RPATH "$ORIGIN:${SHMEM_LIBRARY_DIR}"
       BUILD_WITH_INSTALL_RPATH TRUE)
 
   install(TARGETS shmem_allocator DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
-  message(STATUS "SHMEM allocator module enabled (root: ${_SHMEM_ROOT})")
+  message(STATUS "SHMEM allocator module enabled "
+      "(include: ${SHMEM_INCLUDE_DIR}, lib: ${SHMEM_LIBRARY})")
 endif()
 # ---------------------------------------------------------------------------
 
