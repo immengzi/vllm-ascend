@@ -104,32 +104,49 @@ static_assert(sizeof(DeviceStats) == 952,
 } // namespace shmem_npu_compat
 
 // ── Per-allocation byte tracking (outside extern "C") ────────────────────────
-// Track the bytes currently held by live my_malloc allocations and the
-// lifetime peak so that memory_stats()["allocated_bytes.all.peak"] reports the
-// true high-water mark seen during profile_run(), not just the post-cleanup
-// current value.
+// Match torch_npu DeviceStats semantics:
+//   allocated_bytes = allocator-visible bytes (rounded allocation size)
+//   requested_bytes = client-requested tensor bytes
 //
-// Both SHMEM-pool allocations (aclshmem_malloc) and fallback device allocations
-// (aclrtMalloc) are counted here, matching the set of pointers returned to
-// PyTorch by my_malloc / taken back by my_free.
+// determine_available_memory() relies on allocated_bytes.all.peak, so using the
+// rounded allocator footprint here avoids overestimating available KV memory.
 
-static std::atomic<int64_t> g_alloc_cur_bytes{0};   // net live bytes
-static std::atomic<int64_t> g_alloc_peak_bytes{0};  // high-water mark
+static std::atomic<int64_t> g_alloc_cur_bytes{0};
+static std::atomic<int64_t> g_alloc_peak_bytes{0};
+static std::atomic<int64_t> g_requested_cur_bytes{0};
+static std::atomic<int64_t> g_requested_peak_bytes{0};
+
+static void track_peak(std::atomic<int64_t> &peak, int64_t current) noexcept
+{
+    int64_t observed_peak = peak.load(std::memory_order_relaxed);
+    while (current > observed_peak &&
+           !peak.compare_exchange_weak(observed_peak, current,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+    }
+}
 
 static void alloc_track_add(int64_t size) noexcept
 {
     int64_t cur = g_alloc_cur_bytes.fetch_add(size, std::memory_order_relaxed) + size;
-    // CAS loop to update peak atomically.
-    int64_t pk = g_alloc_peak_bytes.load(std::memory_order_relaxed);
-    while (cur > pk &&
-           !g_alloc_peak_bytes.compare_exchange_weak(pk, cur,
-               std::memory_order_relaxed, std::memory_order_relaxed)) {
-    }
+    track_peak(g_alloc_peak_bytes, cur);
 }
 
 static void alloc_track_sub(int64_t size) noexcept
 {
     g_alloc_cur_bytes.fetch_sub(size, std::memory_order_relaxed);
+}
+
+static void requested_track_add(int64_t size) noexcept
+{
+    int64_t cur =
+        g_requested_cur_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+    track_peak(g_requested_peak_bytes, cur);
+}
+
+static void requested_track_sub(int64_t size) noexcept
+{
+    g_requested_cur_bytes.fetch_sub(size, std::memory_order_relaxed);
 }
 
 // ── Module state shared by the Python shim and allocator callbacks ───────────
@@ -728,20 +745,29 @@ static bool shmem_is_initialized_flag() noexcept;  // defined after extern "C"
 // getDeviceStats: returns SHMEM pool statistics mapped to DeviceStats format.
 // The AGGREGATE slot (index 0) is filled; SMALL_POOL/LARGE_POOL remain zero.
 //
-// allocated_bytes tracks actual tensor bytes handed to PyTorch (current + peak).
-// reserved_bytes  tracks the total SHMEM pool capacity as seen by the driver,
-//                 which is used by determine_available_memory() to exclude the
-//                 pool's internal slack from the non-torch-allocation estimate.
+// allocated_bytes tracks allocator-visible bytes (rounded allocation size).
+// requested_bytes tracks client-requested tensor bytes before allocator rounding.
+// reserved_bytes tracks the total SHMEM pool capacity as seen by the driver,
+//                which is used by determine_available_memory() to exclude the
+//                pool's internal slack from the non-torch-allocation estimate.
 static shmem_npu_compat::DeviceStats shmem_get_device_stats_impl(int /*device*/)
 {
     shmem_npu_compat::DeviceStats stats{};
     int64_t cur  = g_alloc_cur_bytes.load(std::memory_order_relaxed);
     int64_t peak = g_alloc_peak_bytes.load(std::memory_order_relaxed);
     int64_t cached = g_cached_cur_bytes.load(std::memory_order_relaxed);
-    // allocated_bytes: tensor bytes actively held by live allocations.
+    int64_t requested_cur =
+        g_requested_cur_bytes.load(std::memory_order_relaxed);
+    int64_t requested_peak =
+        g_requested_peak_bytes.load(std::memory_order_relaxed);
+    // allocated_bytes: allocator-visible bytes of active blocks.
     stats.allocated_bytes[0].current   = cur;
     stats.allocated_bytes[0].peak      = peak;
     stats.allocated_bytes[0].allocated = peak;  // lifetime high-water
+    // requested_bytes: tensor-requested bytes before allocator rounding.
+    stats.requested_bytes[0].current   = requested_cur;
+    stats.requested_bytes[0].peak      = requested_peak;
+    stats.requested_bytes[0].allocated = requested_peak;
     stats.active_bytes[0].current = cur + cached;
     stats.active_bytes[0].peak =
         std::max<int64_t>(peak, cur + g_cached_peak_bytes.load(std::memory_order_relaxed));
@@ -762,8 +788,11 @@ static shmem_npu_compat::DeviceStats shmem_get_device_stats_impl(int /*device*/)
 // resetPeakStats: reset the peak counter to the current live allocation level.
 static void shmem_reset_peak_stats_impl(int /*device*/)
 {
-    int64_t cur = g_alloc_cur_bytes.load(std::memory_order_relaxed);
-    g_alloc_peak_bytes.store(cur, std::memory_order_relaxed);
+    g_alloc_peak_bytes.store(g_alloc_cur_bytes.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+    g_requested_peak_bytes.store(
+        g_requested_cur_bytes.load(std::memory_order_relaxed),
+        std::memory_order_relaxed);
 }
 
 static void shmem_reset_impl(bool /*check_error*/)
@@ -932,6 +961,7 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         }
         if (fb != nullptr) {
             alloc_track_add(size);
+            requested_track_add(size);
         }
         return fb;
     }
@@ -947,12 +977,14 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         reclaim_ready_deferred_for_stream_locked(stream_key, g_reclaim_budget);
         if (void *cached =
                 try_pop_local_cached_block_locked(alloc_size, stream_key, requested_size)) {
-            alloc_track_add(size);
+            alloc_track_add(static_cast<int64_t>(alloc_size));
+            requested_track_add(size);
             return cached;
         }
         if (void *cached =
                 try_pop_global_cached_block_locked(alloc_size, stream_key, requested_size)) {
-            alloc_track_add(size);
+            alloc_track_add(static_cast<int64_t>(alloc_size));
+            requested_track_add(size);
             return cached;
         }
     }
@@ -970,7 +1002,8 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
             next_generation(),
             {}
         };
-        alloc_track_add(size);
+        alloc_track_add(static_cast<int64_t>(alloc_size));
+        requested_track_add(size);
         return ptr;
     }
 
@@ -979,7 +1012,8 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         reclaim_ready_deferred_global_locked(std::max(1, g_reclaim_budget * 4));
         if (void *cached = try_pop_global_cached_block_locked(
                 alloc_size, stream_key, requested_size)) {
-            alloc_track_add(size);
+            alloc_track_add(static_cast<int64_t>(alloc_size));
+            requested_track_add(size);
             return cached;
         }
         collect_trimmed_global_blocks_locked(alloc_size, global_blocks_to_free);
@@ -999,7 +1033,8 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
             next_generation(),
             {}
         };
-        alloc_track_add(size);
+        alloc_track_add(static_cast<int64_t>(alloc_size));
+        requested_track_add(size);
         return ptr;
     }
 
@@ -1022,7 +1057,8 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
             next_generation(),
             {}
         };
-        alloc_track_add(size);
+        alloc_track_add(static_cast<int64_t>(alloc_size));
+        requested_track_add(size);
         return ptr;
     }
 
@@ -1044,6 +1080,7 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
             {}
         };
         alloc_track_add(size);
+        requested_track_add(size);
     }
     return fb;
 }
@@ -1062,6 +1099,7 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
     bool cache_globally_after_sync = false;
     uint64_t sync_generation = 0;
     size_t tracked_size = static_cast<size_t>(size);
+    size_t tracked_alloc_size = static_cast<size_t>(size);
     std::vector<PhysicalBlock> trimmed_global_blocks;
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
@@ -1081,6 +1119,7 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
             return;
         }
         tracked_size = meta.requested_size > 0 ? meta.requested_size : tracked_size;
+        tracked_alloc_size = meta.alloc_size > 0 ? meta.alloc_size : tracked_alloc_size;
 
         if (meta.extra_streams.empty()) {
             cache_block_local_locked(meta);
@@ -1140,7 +1179,8 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
     free_blocks(trimmed_global_blocks);
 
     if (cache_locally || defer_free) {
-        alloc_track_sub(static_cast<int64_t>(tracked_size));
+        alloc_track_sub(static_cast<int64_t>(tracked_alloc_size));
+        requested_track_sub(static_cast<int64_t>(tracked_size));
         return;
     }
 
@@ -1166,7 +1206,8 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         free_blocks(post_sync_trimmed_blocks);
     }
 
-    alloc_track_sub(static_cast<int64_t>(tracked_size));
+    alloc_track_sub(static_cast<int64_t>(tracked_alloc_size));
+    requested_track_sub(static_cast<int64_t>(tracked_size));
 }
 
 // ---------------------------------------------------------------------------
