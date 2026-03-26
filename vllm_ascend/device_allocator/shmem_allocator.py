@@ -241,7 +241,7 @@ class ShmemAllocator:
     # ------------------------------------------------------------------ #
 
     def _register_stats_callbacks(self, alloc) -> None:
-        """Register getDeviceStats / resetPeakStats C++ callbacks.
+        """Register C++ callbacks needed by NPUPluggableAllocator.
 
         NPUPluggableAllocator::getDeviceStats() in torch_npu has a missing
         return statement when no callback is registered.  On aarch64 this
@@ -255,9 +255,11 @@ class ShmemAllocator:
         C++ call, so we must register a proper C++ function pointer via
         set_get_device_stats_fn / set_reset_peak_status_fn.
 
-        shmem_allocator.cpython-*.so exports two address-getter functions with
-        C linkage that return the addresses of the C++ stat callback stubs.
-        We load those addresses with ctypes and hand them to the allocator.
+        The native module also exports recordStream / eraseStream hooks so the
+        allocator can defer frees until every subscribed stream reaches a
+        completion event. That restores the stream-ordering semantics normally
+        provided by torch_npu's caching allocator without synchronizing every
+        free call on the host.
         """
         import ctypes
 
@@ -266,17 +268,23 @@ class ShmemAllocator:
 
             so.shmem_get_device_stats_fn_addr.restype = ctypes.c_uint64
             so.shmem_reset_peak_stats_fn_addr.restype = ctypes.c_uint64
+            so.shmem_record_stream_fn_addr.restype = ctypes.c_uint64
+            so.shmem_erase_stream_fn_addr.restype = ctypes.c_uint64
 
             get_stats_addr = int(so.shmem_get_device_stats_fn_addr())
             reset_addr = int(so.shmem_reset_peak_stats_fn_addr())
+            record_stream_addr = int(so.shmem_record_stream_fn_addr())
+            erase_stream_addr = int(so.shmem_erase_stream_fn_addr())
 
             cpp_alloc = alloc.allocator()
             cpp_alloc.set_get_device_stats_fn(get_stats_addr)
             cpp_alloc.set_reset_peak_status_fn(reset_addr)
+            cpp_alloc.set_record_stream_fn(record_stream_addr)
+            cpp_alloc.set_erase_stream_fn(erase_stream_addr)
 
             logger.info(
-                "SHMEM: registered getDeviceStats / resetPeakStats C++ "
-                "callbacks with NPUPluggableAllocator."
+                "SHMEM: registered stats and stream-lifecycle callbacks "
+                "with NPUPluggableAllocator."
             )
         except Exception as e:
             logger.error(

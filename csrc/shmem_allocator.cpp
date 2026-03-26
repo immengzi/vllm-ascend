@@ -43,14 +43,21 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/types.h>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 // ── SHMEM public API (C++ header, cannot be inside extern "C") ──────────────
+#include "acl/acl.h"
 #include "shmem.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
 
 // ── DeviceStats layout mirror ─────────────────────────────────────────────────
 // Mirrors c10_npu::NPUCachingAllocator::DeviceStats from torch_npu 2.8.0.
@@ -124,8 +131,157 @@ static void alloc_track_sub(int64_t size) noexcept
     g_alloc_cur_bytes.fetch_sub(size, std::memory_order_relaxed);
 }
 
+// ── Module state shared by the Python shim and allocator callbacks ───────────
+static std::mutex g_shmem_mutex;
+static bool g_shmem_initialized = false;
+static std::mutex g_ptrs_mutex;
+static std::unordered_set<void *> g_live_ptrs;
+static std::unordered_set<void *> g_shmem_ptrs;
+
+// ── Stream-aware deferred freeing ────────────────────────────────────────────
+// changeCurrentAllocator bypasses torch_npu's caching allocator. To preserve
+// correct stream ordering, we defer the real free until every stream that
+// touched the pointer has reached a recorded event.
+
+struct DeferredFreeEntry {
+    void *ptr = nullptr;
+    ssize_t size = 0;
+    bool is_shmem = false;
+    std::vector<aclrtEvent> events;
+};
+
+static std::deque<DeferredFreeEntry> g_deferred_frees;
+static std::vector<aclrtEvent> g_event_pool;
+static std::unordered_map<void *, std::unordered_set<uintptr_t>> g_ptr_streams;
+
+static aclrtEvent acquire_event_locked()
+{
+    if (!g_event_pool.empty()) {
+        aclrtEvent ev = g_event_pool.back();
+        g_event_pool.pop_back();
+        return ev;
+    }
+
+    aclrtEvent ev = nullptr;
+    const aclError err =
+        aclrtCreateEventWithFlag(&ev, ACL_EVENT_CAPTURE_STREAM_PROGRESS);
+    if (err != ACL_ERROR_NONE) {
+        std::cerr << "[shmem_allocator] aclrtCreateEventWithFlag failed: "
+                  << err << "\n";
+        return nullptr;
+    }
+    return ev;
+}
+
+static void release_event_locked(aclrtEvent ev)
+{
+    if (ev != nullptr) {
+        g_event_pool.push_back(ev);
+    }
+}
+
+static void free_now(const DeferredFreeEntry &entry)
+{
+    if (entry.is_shmem) {
+        aclshmem_free(entry.ptr);
+    } else {
+        aclrtFree(entry.ptr);
+    }
+    alloc_track_sub(entry.size);
+}
+
+static void reclaim_ready_deferred_frees_locked(
+    std::vector<DeferredFreeEntry> &ready_entries)
+{
+    for (auto it = g_deferred_frees.begin(); it != g_deferred_frees.end();) {
+        bool all_ready = true;
+        for (aclrtEvent ev : it->events) {
+            aclrtEventRecordedStatus status =
+                ACL_EVENT_RECORDED_STATUS_NOT_READY;
+            const aclError err = aclrtQueryEventStatus(ev, &status);
+            if (err != ACL_ERROR_NONE ||
+                status != ACL_EVENT_RECORDED_STATUS_COMPLETE) {
+                all_ready = false;
+                break;
+            }
+        }
+
+        if (!all_ready) {
+            ++it;
+            continue;
+        }
+
+        for (aclrtEvent ev : it->events) {
+            release_event_locked(ev);
+        }
+        ready_entries.push_back(std::move(*it));
+        it = g_deferred_frees.erase(it);
+    }
+}
+
+static void drain_deferred_frees_locked(
+    std::vector<DeferredFreeEntry> &entries_to_free)
+{
+    entries_to_free.clear();
+    entries_to_free.insert(entries_to_free.end(),
+                           std::make_move_iterator(g_deferred_frees.begin()),
+                           std::make_move_iterator(g_deferred_frees.end()));
+    g_deferred_frees.clear();
+}
+
+static std::vector<aclrtEvent> destroy_event_pool_locked()
+{
+    std::vector<aclrtEvent> events_to_destroy;
+    events_to_destroy.swap(g_event_pool);
+    return events_to_destroy;
+}
+
+static uintptr_t to_stream_key(aclrtStream stream) noexcept
+{
+    return reinterpret_cast<uintptr_t>(stream);
+}
+
+static void record_stream_impl(void *ptr, c10_npu::NPUStream stream)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+    const uintptr_t stream_key = to_stream_key(stream.stream());
+    if (stream_key == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+    if (!g_live_ptrs.count(ptr)) {
+        return;
+    }
+    g_ptr_streams[ptr].insert(stream_key);
+}
+
+static void erase_stream_impl(void *ptr, c10_npu::NPUStream stream)
+{
+    if (ptr == nullptr) {
+        return;
+    }
+    const uintptr_t stream_key = to_stream_key(stream.stream());
+
+    std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+    if (!g_live_ptrs.count(ptr)) {
+        return;
+    }
+    auto it = g_ptr_streams.find(ptr);
+    if (it == g_ptr_streams.end()) {
+        return;
+    }
+    if (stream_key != 0) {
+        it->second.erase(stream_key);
+    }
+    if (it->second.empty()) {
+        g_ptr_streams.erase(it);
+    }
+}
+
 // ── Stats callbacks (C++ linkage, outside extern "C") ────────────────────────
-// g_shmem_initialized lives inside extern "C"; access it via this accessor.
 static bool shmem_is_initialized_flag() noexcept;  // defined after extern "C"
 
 // getDeviceStats: returns SHMEM pool statistics mapped to DeviceStats format.
@@ -170,20 +326,6 @@ extern "C" {
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-
-#include <sys/types.h>
-#include "acl/acl.h"
-
-// ---------------------------------------------------------------------------
-// Module-level state
-
-static std::mutex      g_shmem_mutex;
-static bool            g_shmem_initialized = false;
-
-// Pointers obtained from aclshmem_malloc are recorded here so that
-// my_free can route them back through aclshmem_free instead of aclrtFree.
-static std::mutex                  g_ptrs_mutex;
-static std::unordered_set<void *>  g_shmem_ptrs;
 
 // ---------------------------------------------------------------------------
 // Internal helper: initialise the SHMEM pool (idempotent, thread-safe).
@@ -287,6 +429,15 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         return nullptr;
     }
 
+    std::vector<DeferredFreeEntry> ready_entries;
+    {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        reclaim_ready_deferred_frees_locked(ready_entries);
+    }
+    for (const auto &entry : ready_entries) {
+        free_now(entry);
+    }
+
     try {
         ensure_shmem_initialized();
     } catch (const std::exception &e) {
@@ -294,6 +445,10 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
                   << ", falling back to aclrtMalloc\n";
         void *fb = nullptr;
         aclrtMalloc(&fb, static_cast<size_t>(size), ACL_MEM_MALLOC_HUGE_FIRST);
+        if (fb != nullptr) {
+            std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+            g_live_ptrs.insert(fb);
+        }
         if (fb != nullptr) {
             alloc_track_add(size);
         }
@@ -304,6 +459,7 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
     if (ptr != nullptr) {
         {
             std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+            g_live_ptrs.insert(ptr);
             g_shmem_ptrs.insert(ptr);
         }
         alloc_track_add(size);
@@ -316,6 +472,10 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
     void *fb = nullptr;
     aclrtMalloc(&fb, static_cast<size_t>(size), ACL_MEM_MALLOC_HUGE_FIRST);
     if (fb != nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+            g_live_ptrs.insert(fb);
+        }
         alloc_track_add(size);
     }
     return fb;
@@ -328,14 +488,86 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         return;
     }
 
+    std::vector<DeferredFreeEntry> ready_entries;
+    std::vector<uintptr_t> sync_stream_keys;
+    std::vector<aclrtEvent> destroy_events;
     bool is_shmem = false;
+    bool defer_free = false;
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        reclaim_ready_deferred_frees_locked(ready_entries);
+
         auto it = g_shmem_ptrs.find(ptr);
         if (it != g_shmem_ptrs.end()) {
             is_shmem = true;
             g_shmem_ptrs.erase(it);
         }
+        g_live_ptrs.erase(ptr);
+
+        std::unordered_set<uintptr_t> stream_keys;
+        if (stream != nullptr) {
+            stream_keys.insert(to_stream_key(stream));
+        }
+        auto streams_it = g_ptr_streams.find(ptr);
+        if (streams_it != g_ptr_streams.end()) {
+            stream_keys.insert(streams_it->second.begin(),
+                               streams_it->second.end());
+            g_ptr_streams.erase(streams_it);
+        }
+
+        if (!stream_keys.empty()) {
+            sync_stream_keys.assign(stream_keys.begin(), stream_keys.end());
+            DeferredFreeEntry entry;
+            entry.ptr = ptr;
+            entry.size = size;
+            entry.is_shmem = is_shmem;
+            entry.events.reserve(stream_keys.size());
+
+            bool event_record_failed = false;
+            for (uintptr_t stream_key : stream_keys) {
+                aclrtEvent ev = acquire_event_locked();
+                if (ev == nullptr) {
+                    event_record_failed = true;
+                    break;
+                }
+                const aclError err =
+                    aclrtRecordEvent(ev,
+                                     reinterpret_cast<aclrtStream>(stream_key));
+                if (err != ACL_ERROR_NONE) {
+                    std::cerr << "[shmem_allocator] aclrtRecordEvent failed: "
+                              << err
+                              << ", falling back to synchronous free\n";
+                    destroy_events.push_back(ev);
+                    event_record_failed = true;
+                    break;
+                }
+                entry.events.push_back(ev);
+            }
+
+            if (!event_record_failed && !entry.events.empty()) {
+                g_deferred_frees.push_back(std::move(entry));
+                defer_free = true;
+            } else {
+                for (aclrtEvent ev : entry.events) {
+                    destroy_events.push_back(ev);
+                }
+            }
+        }
+    }
+
+    for (const auto &entry : ready_entries) {
+        free_now(entry);
+    }
+
+    if (defer_free) {
+        return;
+    }
+
+    for (uintptr_t stream_key : sync_stream_keys) {
+        aclrtSynchronizeStream(reinterpret_cast<aclrtStream>(stream_key));
+    }
+    for (aclrtEvent ev : destroy_events) {
+        aclrtDestroyEvent(ev);
     }
 
     if (is_shmem) {
@@ -364,16 +596,33 @@ static PyObject *py_shmem_finalize(PyObject * /*self*/, PyObject * /*args*/)
 {
     std::lock_guard<std::mutex> lock(g_shmem_mutex);
     if (g_shmem_initialized) {
+        std::vector<DeferredFreeEntry> deferred_entries;
+        std::vector<aclrtEvent> pooled_events;
+        {
+            std::lock_guard<std::mutex> plock(g_ptrs_mutex);
+            drain_deferred_frees_locked(deferred_entries);
+            pooled_events = destroy_event_pool_locked();
+            g_ptr_streams.clear();
+            g_live_ptrs.clear();
+            g_shmem_ptrs.clear();
+        }
+        for (auto &entry : deferred_entries) {
+            for (aclrtEvent ev : entry.events) {
+                aclrtSynchronizeEvent(ev);
+                aclrtDestroyEvent(ev);
+            }
+            free_now(entry);
+        }
+        for (aclrtEvent ev : pooled_events) {
+            aclrtDestroyEvent(ev);
+        }
+
         int ret = aclshmem_finalize();
         if (ret != ACLSHMEM_SUCCESS) {
             std::cerr << "[shmem_allocator] aclshmem_finalize returned "
                       << ret << "\n";
         }
         g_shmem_initialized = false;
-        {
-            std::lock_guard<std::mutex> plock(g_ptrs_mutex);
-            g_shmem_ptrs.clear();
-        }
         std::cout << "[shmem_allocator] SHMEM pool finalized.\n";
     }
     Py_RETURN_NONE;
@@ -445,7 +694,7 @@ PyMODINIT_FUNC PyInit_shmem_allocator(void)
 
 // ── Post-extern-"C" definitions ───────────────────────────────────────────────
 
-// Accessor for g_shmem_initialized (defined in extern "C" above).
+// Accessor for g_shmem_initialized.
 static bool shmem_is_initialized_flag() noexcept
 {
     return g_shmem_initialized;
@@ -466,6 +715,18 @@ __attribute__((visibility("default")))
 uint64_t shmem_reset_peak_stats_fn_addr(void)
 {
     return reinterpret_cast<uint64_t>(&shmem_reset_peak_stats_impl);
+}
+
+__attribute__((visibility("default")))
+uint64_t shmem_record_stream_fn_addr(void)
+{
+    return reinterpret_cast<uint64_t>(&record_stream_impl);
+}
+
+__attribute__((visibility("default")))
+uint64_t shmem_erase_stream_fn_addr(void)
+{
+    return reinterpret_cast<uint64_t>(&erase_stream_impl);
 }
 
 } // extern "C" (address getters)
