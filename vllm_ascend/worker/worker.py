@@ -19,6 +19,7 @@
 
 import copy
 import gc
+import os
 from types import NoneType
 from typing import Optional
 
@@ -318,6 +319,16 @@ class NPUWorker(WorkerBase):
         available_kv_cache_memory = int(
             total_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
+        if envs_ascend.ENABLE_SHMEM and shmem_available:
+            runtime_headroom_mb = int(
+                os.getenv("SHMEM_RUNTIME_HEADROOM_MB", "1024"))
+            runtime_headroom_bytes = runtime_headroom_mb * 1024 * 1024
+            if runtime_headroom_bytes > 0:
+                available_kv_cache_memory -= runtime_headroom_bytes
+                logger.info(
+                    "SHMEM runtime headroom applied: %d bytes",
+                    runtime_headroom_bytes,
+                )
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
         logger.info(
             f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
