@@ -268,22 +268,25 @@ class ShmemAllocator:
 
             so.shmem_get_device_stats_fn_addr.restype = ctypes.c_uint64
             so.shmem_reset_peak_stats_fn_addr.restype = ctypes.c_uint64
+            so.shmem_reset_fn_addr.restype = ctypes.c_uint64
             so.shmem_record_stream_fn_addr.restype = ctypes.c_uint64
             so.shmem_erase_stream_fn_addr.restype = ctypes.c_uint64
 
             get_stats_addr = int(so.shmem_get_device_stats_fn_addr())
             reset_addr = int(so.shmem_reset_peak_stats_fn_addr())
+            reset_fn_addr = int(so.shmem_reset_fn_addr())
             record_stream_addr = int(so.shmem_record_stream_fn_addr())
             erase_stream_addr = int(so.shmem_erase_stream_fn_addr())
 
             cpp_alloc = alloc.allocator()
             cpp_alloc.set_get_device_stats_fn(get_stats_addr)
             cpp_alloc.set_reset_peak_status_fn(reset_addr)
+            cpp_alloc.set_reset_fn(reset_fn_addr)
             cpp_alloc.set_record_stream_fn(record_stream_addr)
             cpp_alloc.set_erase_stream_fn(erase_stream_addr)
 
             logger.info(
-                "SHMEM: registered stats and stream-lifecycle callbacks "
+                "SHMEM: registered stats, reset, and stream-lifecycle callbacks "
                 "with NPUPluggableAllocator."
             )
         except Exception as e:

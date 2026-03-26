@@ -39,6 +39,7 @@
  */
 
 // ── C++ standard headers (must precede extern "C") ──────────────────────────
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -132,27 +133,131 @@ static void alloc_track_sub(int64_t size) noexcept
 }
 
 // ── Module state shared by the Python shim and allocator callbacks ───────────
-static std::mutex g_shmem_mutex;
-static bool g_shmem_initialized = false;
-static std::mutex g_ptrs_mutex;
-static std::unordered_set<void *> g_live_ptrs;
-static std::unordered_set<void *> g_shmem_ptrs;
+enum class BlockState : uint8_t {
+    ACTIVE,
+    CACHED_LOCAL,
+    CACHED_GLOBAL,
+    DEFERRED,
+};
 
-// ── Stream-aware deferred freeing ────────────────────────────────────────────
-// changeCurrentAllocator bypasses torch_npu's caching allocator. To preserve
-// correct stream ordering, we defer the real free until every stream that
-// touched the pointer has reached a recorded event.
+struct BlockMeta {
+    void *ptr = nullptr;
+    size_t alloc_size = 0;
+    size_t requested_size = 0;
+    uintptr_t alloc_stream_key = 0;
+    bool is_shmem = false;
+    BlockState state = BlockState::ACTIVE;
+    uint64_t generation = 0;
+    std::unordered_set<uintptr_t> extra_streams;
+};
+
+struct CachedBlockRef {
+    void *ptr = nullptr;
+    uint64_t generation = 0;
+};
 
 struct DeferredFreeEntry {
     void *ptr = nullptr;
-    ssize_t size = 0;
     bool is_shmem = false;
+    uintptr_t home_stream_key = 0;
+    uint64_t generation = 0;
     std::vector<aclrtEvent> events;
 };
 
-static std::deque<DeferredFreeEntry> g_deferred_frees;
+struct PhysicalBlock {
+    void *ptr = nullptr;
+    bool is_shmem = false;
+};
+
+static std::mutex g_shmem_mutex;
+static bool g_shmem_initialized = false;
+static std::mutex g_ptrs_mutex;
+static std::unordered_map<void *, BlockMeta> g_blocks;
+static std::unordered_map<uintptr_t,
+                          std::unordered_map<size_t, std::vector<CachedBlockRef>>>
+    g_stream_local_bins;
+static std::unordered_map<size_t, std::vector<CachedBlockRef>> g_global_bins;
+static std::unordered_map<uintptr_t, std::deque<DeferredFreeEntry>>
+    g_deferred_by_stream;
 static std::vector<aclrtEvent> g_event_pool;
-static std::unordered_map<void *, std::unordered_set<uintptr_t>> g_ptr_streams;
+static std::atomic<int64_t> g_cached_cur_bytes{0};
+static std::atomic<int64_t> g_cached_peak_bytes{0};
+static std::atomic<uint64_t> g_next_generation{1};
+static int64_t g_cache_limit_bytes = 1024LL * 1024 * 1024;  // 1 GiB
+static int g_reclaim_budget = 8;
+
+static void cached_track_add(size_t size) noexcept
+{
+    const int64_t delta = static_cast<int64_t>(size);
+    int64_t cur = g_cached_cur_bytes.fetch_add(delta, std::memory_order_relaxed) + delta;
+    int64_t pk = g_cached_peak_bytes.load(std::memory_order_relaxed);
+    while (cur > pk &&
+           !g_cached_peak_bytes.compare_exchange_weak(pk, cur,
+               std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+static void cached_track_sub(size_t size) noexcept
+{
+    g_cached_cur_bytes.fetch_sub(static_cast<int64_t>(size),
+                                 std::memory_order_relaxed);
+}
+
+static size_t round_up(size_t size, size_t align)
+{
+    return ((size + align - 1) / align) * align;
+}
+
+static size_t round_size_class(size_t size)
+{
+    constexpr size_t kMinBlockSize = 512;
+    constexpr size_t kSmallThreshold = 1ULL << 20;   // 1 MiB
+    constexpr size_t kMediumThreshold = 16ULL << 20; // 16 MiB
+    constexpr size_t kMediumAlign = 2ULL << 20;      // 2 MiB
+    constexpr size_t kLargeAlign = 16ULL << 20;      // 16 MiB
+
+    if (size <= kMinBlockSize) {
+        return kMinBlockSize;
+    }
+    if (size <= kSmallThreshold) {
+        return round_up(size, kMinBlockSize);
+    }
+    if (size <= kMediumThreshold) {
+        return round_up(size, kMediumAlign);
+    }
+    return round_up(size, kLargeAlign);
+}
+
+static int64_t parse_env_i64(const char *name, int64_t default_value,
+                             int64_t min_value = 1)
+{
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    try {
+        int64_t value = std::stoll(raw);
+        if (value < min_value) {
+            return default_value;
+        }
+        return value;
+    } catch (...) {
+        return default_value;
+    }
+}
+
+static void load_runtime_config()
+{
+    g_cache_limit_bytes =
+        parse_env_i64("SHMEM_CACHE_LIMIT_MB", 1024, 1) * 1024LL * 1024LL;
+    g_reclaim_budget = static_cast<int>(
+        parse_env_i64("SHMEM_RECLAIM_BUDGET", 8, 1));
+}
+
+// ── Stream-aware deferred freeing with local/global caches ───────────────────
+// changeCurrentAllocator bypasses torch_npu's caching allocator. To recover a
+// similar fast path, we keep freed blocks in a stream-local cache and only use
+// event-based deferred reclamation for blocks that have actually crossed streams.
 
 static aclrtEvent acquire_event_locked()
 {
@@ -180,53 +285,48 @@ static void release_event_locked(aclrtEvent ev)
     }
 }
 
-static void free_now(const DeferredFreeEntry &entry)
+static void free_storage(const PhysicalBlock &block)
 {
-    if (entry.is_shmem) {
-        aclshmem_free(entry.ptr);
-    } else {
-        aclrtFree(entry.ptr);
+    if (block.ptr == nullptr) {
+        return;
     }
-    alloc_track_sub(entry.size);
+    if (block.is_shmem) {
+        aclshmem_free(block.ptr);
+    } else {
+        aclrtFree(block.ptr);
+    }
 }
 
-static void reclaim_ready_deferred_frees_locked(
-    std::vector<DeferredFreeEntry> &ready_entries)
+static void erase_empty_bins_locked()
 {
-    for (auto it = g_deferred_frees.begin(); it != g_deferred_frees.end();) {
-        bool all_ready = true;
-        for (aclrtEvent ev : it->events) {
-            aclrtEventRecordedStatus status =
-                ACL_EVENT_RECORDED_STATUS_NOT_READY;
-            const aclError err = aclrtQueryEventStatus(ev, &status);
-            if (err != ACL_ERROR_NONE ||
-                status != ACL_EVENT_RECORDED_STATUS_COMPLETE) {
-                all_ready = false;
-                break;
+    for (auto it = g_stream_local_bins.begin(); it != g_stream_local_bins.end();) {
+        for (auto inner = it->second.begin(); inner != it->second.end();) {
+            if (inner->second.empty()) {
+                inner = it->second.erase(inner);
+            } else {
+                ++inner;
             }
         }
-
-        if (!all_ready) {
+        if (it->second.empty()) {
+            it = g_stream_local_bins.erase(it);
+        } else {
             ++it;
-            continue;
         }
-
-        for (aclrtEvent ev : it->events) {
-            release_event_locked(ev);
-        }
-        ready_entries.push_back(std::move(*it));
-        it = g_deferred_frees.erase(it);
     }
-}
-
-static void drain_deferred_frees_locked(
-    std::vector<DeferredFreeEntry> &entries_to_free)
-{
-    entries_to_free.clear();
-    entries_to_free.insert(entries_to_free.end(),
-                           std::make_move_iterator(g_deferred_frees.begin()),
-                           std::make_move_iterator(g_deferred_frees.end()));
-    g_deferred_frees.clear();
+    for (auto it = g_global_bins.begin(); it != g_global_bins.end();) {
+        if (it->second.empty()) {
+            it = g_global_bins.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = g_deferred_by_stream.begin(); it != g_deferred_by_stream.end();) {
+        if (it->second.empty()) {
+            it = g_deferred_by_stream.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 static std::vector<aclrtEvent> destroy_event_pool_locked()
@@ -241,6 +341,263 @@ static uintptr_t to_stream_key(aclrtStream stream) noexcept
     return reinterpret_cast<uintptr_t>(stream);
 }
 
+static uint64_t next_generation() noexcept
+{
+    return g_next_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void mark_block_active_locked(BlockMeta &meta,
+                                     uintptr_t stream_key,
+                                     size_t requested_size)
+{
+    cached_track_sub(meta.alloc_size);
+    meta.alloc_stream_key = stream_key;
+    meta.requested_size = requested_size;
+    meta.state = BlockState::ACTIVE;
+    meta.generation = next_generation();
+    meta.extra_streams.clear();
+}
+
+static void cache_block_local_locked(BlockMeta &meta)
+{
+    meta.state = BlockState::CACHED_LOCAL;
+    meta.requested_size = 0;
+    meta.extra_streams.clear();
+    g_stream_local_bins[meta.alloc_stream_key][meta.alloc_size].push_back(
+        {meta.ptr, meta.generation});
+    cached_track_add(meta.alloc_size);
+}
+
+static void cache_block_global_locked(BlockMeta &meta)
+{
+    meta.state = BlockState::CACHED_GLOBAL;
+    meta.requested_size = 0;
+    meta.extra_streams.clear();
+    g_global_bins[meta.alloc_size].push_back({meta.ptr, meta.generation});
+    cached_track_add(meta.alloc_size);
+}
+
+static void *try_pop_local_cached_block_locked(size_t alloc_size,
+                                               uintptr_t stream_key,
+                                               size_t requested_size)
+{
+    auto stream_it = g_stream_local_bins.find(stream_key);
+    if (stream_it == g_stream_local_bins.end()) {
+        return nullptr;
+    }
+    auto bin_it = stream_it->second.find(alloc_size);
+    if (bin_it == stream_it->second.end()) {
+        return nullptr;
+    }
+    auto &bin = bin_it->second;
+    while (!bin.empty()) {
+        CachedBlockRef ref = bin.back();
+        bin.pop_back();
+        auto meta_it = g_blocks.find(ref.ptr);
+        if (meta_it == g_blocks.end()) {
+            continue;
+        }
+        BlockMeta &meta = meta_it->second;
+        if (meta.generation != ref.generation ||
+            meta.state != BlockState::CACHED_LOCAL ||
+            meta.alloc_size != alloc_size) {
+            continue;
+        }
+        mark_block_active_locked(meta, stream_key, requested_size);
+        return meta.ptr;
+    }
+    erase_empty_bins_locked();
+    return nullptr;
+}
+
+static void *try_pop_global_cached_block_locked(size_t alloc_size,
+                                                uintptr_t stream_key,
+                                                size_t requested_size)
+{
+    auto bin_it = g_global_bins.find(alloc_size);
+    if (bin_it == g_global_bins.end()) {
+        return nullptr;
+    }
+    auto &bin = bin_it->second;
+    while (!bin.empty()) {
+        CachedBlockRef ref = bin.back();
+        bin.pop_back();
+        auto meta_it = g_blocks.find(ref.ptr);
+        if (meta_it == g_blocks.end()) {
+            continue;
+        }
+        BlockMeta &meta = meta_it->second;
+        if (meta.generation != ref.generation ||
+            meta.state != BlockState::CACHED_GLOBAL ||
+            meta.alloc_size != alloc_size) {
+            continue;
+        }
+        mark_block_active_locked(meta, stream_key, requested_size);
+        return meta.ptr;
+    }
+    erase_empty_bins_locked();
+    return nullptr;
+}
+
+static void trim_global_cache_locked(size_t target_bytes)
+{
+    if (target_bytes == 0) {
+        return;
+    }
+    for (auto &bucket : g_global_bins) {
+        auto &bin = bucket.second;
+        while (!bin.empty() && target_bytes > 0) {
+            CachedBlockRef ref = bin.back();
+            bin.pop_back();
+            auto meta_it = g_blocks.find(ref.ptr);
+            if (meta_it == g_blocks.end()) {
+                continue;
+            }
+            BlockMeta meta = meta_it->second;
+            if (meta.generation != ref.generation ||
+                meta.state != BlockState::CACHED_GLOBAL) {
+                continue;
+            }
+            cached_track_sub(meta.alloc_size);
+            free_storage({meta.ptr, meta.is_shmem});
+            target_bytes =
+                (target_bytes > meta.alloc_size) ? target_bytes - meta.alloc_size : 0;
+            g_blocks.erase(meta_it);
+        }
+    }
+    erase_empty_bins_locked();
+}
+
+static void trim_local_cache_locked(size_t target_bytes)
+{
+    if (target_bytes == 0) {
+        return;
+    }
+    for (auto &stream_bins : g_stream_local_bins) {
+        for (auto &bucket : stream_bins.second) {
+            auto &bin = bucket.second;
+            while (!bin.empty() && target_bytes > 0) {
+                CachedBlockRef ref = bin.back();
+                bin.pop_back();
+                auto meta_it = g_blocks.find(ref.ptr);
+                if (meta_it == g_blocks.end()) {
+                    continue;
+                }
+                BlockMeta meta = meta_it->second;
+                if (meta.generation != ref.generation ||
+                    meta.state != BlockState::CACHED_LOCAL) {
+                    continue;
+                }
+                cached_track_sub(meta.alloc_size);
+                free_storage({meta.ptr, meta.is_shmem});
+                target_bytes =
+                    (target_bytes > meta.alloc_size) ? target_bytes - meta.alloc_size : 0;
+                g_blocks.erase(meta_it);
+            }
+        }
+    }
+    erase_empty_bins_locked();
+}
+
+static void enforce_cache_limit_locked()
+{
+    int64_t cached = g_cached_cur_bytes.load(std::memory_order_relaxed);
+    if (cached <= g_cache_limit_bytes) {
+        return;
+    }
+    trim_global_cache_locked(static_cast<size_t>(cached - g_cache_limit_bytes));
+    cached = g_cached_cur_bytes.load(std::memory_order_relaxed);
+    if (cached > g_cache_limit_bytes) {
+        trim_local_cache_locked(static_cast<size_t>(cached - g_cache_limit_bytes));
+    }
+}
+
+static void reclaim_ready_deferred_queue_locked(
+    std::deque<DeferredFreeEntry> &queue, int &budget)
+{
+    while (budget > 0 && !queue.empty()) {
+        DeferredFreeEntry &entry = queue.front();
+        bool all_ready = true;
+        for (aclrtEvent ev : entry.events) {
+            aclrtEventRecordedStatus status =
+                ACL_EVENT_RECORDED_STATUS_NOT_READY;
+            const aclError err = aclrtQueryEventStatus(ev, &status);
+            if (err != ACL_ERROR_NONE ||
+                status != ACL_EVENT_RECORDED_STATUS_COMPLETE) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (!all_ready) {
+            break;
+        }
+
+        for (aclrtEvent ev : entry.events) {
+            release_event_locked(ev);
+        }
+        auto meta_it = g_blocks.find(entry.ptr);
+        if (meta_it != g_blocks.end()) {
+            BlockMeta &meta = meta_it->second;
+            if (meta.generation == entry.generation &&
+                meta.state == BlockState::DEFERRED) {
+                cache_block_global_locked(meta);
+            }
+        }
+        queue.pop_front();
+        --budget;
+    }
+}
+
+static void reclaim_ready_deferred_for_stream_locked(uintptr_t stream_key,
+                                                     int budget)
+{
+    auto it = g_deferred_by_stream.find(stream_key);
+    if (it == g_deferred_by_stream.end()) {
+        return;
+    }
+    reclaim_ready_deferred_queue_locked(it->second, budget);
+    erase_empty_bins_locked();
+}
+
+static void reclaim_ready_deferred_global_locked(int budget)
+{
+    for (auto &queue : g_deferred_by_stream) {
+        if (budget <= 0) {
+            break;
+        }
+        reclaim_ready_deferred_queue_locked(queue.second, budget);
+    }
+    erase_empty_bins_locked();
+}
+
+static void drain_releasable_blocks_locked(
+    std::vector<PhysicalBlock> &blocks_to_free,
+    std::vector<DeferredFreeEntry> &deferred_entries)
+{
+    deferred_entries.clear();
+    for (auto &queue : g_deferred_by_stream) {
+        while (!queue.second.empty()) {
+            deferred_entries.push_back(std::move(queue.second.front()));
+            queue.second.pop_front();
+        }
+    }
+    g_deferred_by_stream.clear();
+
+    for (auto it = g_blocks.begin(); it != g_blocks.end();) {
+        if (it->second.state == BlockState::CACHED_LOCAL ||
+            it->second.state == BlockState::CACHED_GLOBAL ||
+            it->second.state == BlockState::DEFERRED) {
+            blocks_to_free.push_back({it->second.ptr, it->second.is_shmem});
+            it = g_blocks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    g_stream_local_bins.clear();
+    g_global_bins.clear();
+    g_cached_cur_bytes.store(0, std::memory_order_relaxed);
+}
+
 static void record_stream_impl(void *ptr, c10_npu::NPUStream stream)
 {
     if (ptr == nullptr) {
@@ -252,10 +609,16 @@ static void record_stream_impl(void *ptr, c10_npu::NPUStream stream)
     }
 
     std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-    if (!g_live_ptrs.count(ptr)) {
+    auto it = g_blocks.find(ptr);
+    if (it == g_blocks.end()) {
         return;
     }
-    g_ptr_streams[ptr].insert(stream_key);
+    BlockMeta &meta = it->second;
+    if (meta.state != BlockState::ACTIVE ||
+        stream_key == meta.alloc_stream_key) {
+        return;
+    }
+    meta.extra_streams.insert(stream_key);
 }
 
 static void erase_stream_impl(void *ptr, c10_npu::NPUStream stream)
@@ -266,19 +629,15 @@ static void erase_stream_impl(void *ptr, c10_npu::NPUStream stream)
     const uintptr_t stream_key = to_stream_key(stream.stream());
 
     std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-    if (!g_live_ptrs.count(ptr)) {
+    auto it = g_blocks.find(ptr);
+    if (it == g_blocks.end()) {
         return;
     }
-    auto it = g_ptr_streams.find(ptr);
-    if (it == g_ptr_streams.end()) {
+    BlockMeta &meta = it->second;
+    if (meta.state != BlockState::ACTIVE || stream_key == 0) {
         return;
     }
-    if (stream_key != 0) {
-        it->second.erase(stream_key);
-    }
-    if (it->second.empty()) {
-        g_ptr_streams.erase(it);
-    }
+    meta.extra_streams.erase(stream_key);
 }
 
 // ── Stats callbacks (C++ linkage, outside extern "C") ────────────────────────
@@ -296,10 +655,14 @@ static shmem_npu_compat::DeviceStats shmem_get_device_stats_impl(int /*device*/)
     shmem_npu_compat::DeviceStats stats{};
     int64_t cur  = g_alloc_cur_bytes.load(std::memory_order_relaxed);
     int64_t peak = g_alloc_peak_bytes.load(std::memory_order_relaxed);
+    int64_t cached = g_cached_cur_bytes.load(std::memory_order_relaxed);
     // allocated_bytes: tensor bytes actively held by live allocations.
     stats.allocated_bytes[0].current   = cur;
     stats.allocated_bytes[0].peak      = peak;
     stats.allocated_bytes[0].allocated = peak;  // lifetime high-water
+    stats.active_bytes[0].current = cur + cached;
+    stats.active_bytes[0].peak =
+        std::max<int64_t>(peak, cur + g_cached_peak_bytes.load(std::memory_order_relaxed));
     if (shmem_is_initialized_flag()) {
         uint64_t total = 0, used = 0, avail = 0;
         aclshmem_get_memory_stats(&total, &used, &avail);
@@ -321,6 +684,33 @@ static void shmem_reset_peak_stats_impl(int /*device*/)
     g_alloc_peak_bytes.store(cur, std::memory_order_relaxed);
 }
 
+static void shmem_reset_impl(bool /*check_error*/)
+{
+    std::vector<PhysicalBlock> blocks_to_free;
+    std::vector<DeferredFreeEntry> deferred_entries;
+    std::vector<aclrtEvent> pooled_events;
+    {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        reclaim_ready_deferred_global_locked(std::max(1, g_reclaim_budget * 8));
+        drain_releasable_blocks_locked(blocks_to_free, deferred_entries);
+        pooled_events = destroy_event_pool_locked();
+        erase_empty_bins_locked();
+    }
+
+    for (auto &entry : deferred_entries) {
+        for (aclrtEvent ev : entry.events) {
+            aclrtSynchronizeEvent(ev);
+            aclrtDestroyEvent(ev);
+        }
+    }
+    for (aclrtEvent ev : pooled_events) {
+        aclrtDestroyEvent(ev);
+    }
+    for (const PhysicalBlock &block : blocks_to_free) {
+        free_storage(block);
+    }
+}
+
 // ── Everything else can live inside extern "C" ──────────────────────────────
 extern "C" {
 
@@ -340,15 +730,17 @@ static void ensure_shmem_initialized()
         return;
     }
 
+    load_runtime_config();
+
     // Dynamic expansion must be enabled BEFORE aclshmemx_init_attr.
     aclshmem_enable_dynamic_expansion(true);
 
     // Determine initial pool size.
     //
-    // Default: 2 MiB (one NPU large page).  Override via SHMEM_INITIAL_POOL_SIZE
-    // (bytes).  A minimal initial pool avoids competing with model loading and
-    // KV cache allocation for device memory; the dynamic expansion path
-    // (expand_pool → aclrtMalloc) handles growth on demand at runtime.
+    // Default: 1 GiB. Override via SHMEM_INITIAL_POOL_SIZE (bytes).
+    // A moderate initial pool reduces dynamic expansion churn on the first
+    // model/profile/KV-cache allocations while still leaving room for the
+    // rest of the runtime memory budget.
     //
     // The value is clamped to ACLSHMEM_MAX_LOCAL_SIZE (40 GiB) which is the hard
     // device limit for symmetric SHMEM memory.
@@ -357,7 +749,7 @@ static void ensure_shmem_initialized()
     //       do NOT redeclare it as a local variable (macro expansion would corrupt syntax).
     static const int64_t kShmemMaxLocalSize =
         static_cast<int64_t>(ACLSHMEM_MAX_LOCAL_SIZE);  // 40 GiB hard cap
-    int64_t local_mem_size = 2LL * 1024 * 1024;  // 2 MiB default
+    int64_t local_mem_size = 1LL * 1024 * 1024 * 1024;  // 1 GiB default
 
     const char *env_size = std::getenv("SHMEM_INITIAL_POOL_SIZE");
     if (env_size != nullptr) {
@@ -365,7 +757,7 @@ static void ensure_shmem_initialized()
             int64_t requested = std::stoll(env_size);
             if (requested <= 0) {
                 std::cerr << "[shmem_allocator] SHMEM_INITIAL_POOL_SIZE must be > 0, "
-                             "using 2 MiB default.\n";
+                             "using 1 GiB default.\n";
             } else {
                 local_mem_size = std::min(requested, kShmemMaxLocalSize);
                 if (local_mem_size != requested) {
@@ -377,7 +769,7 @@ static void ensure_shmem_initialized()
             }
         } catch (...) {
             std::cerr << "[shmem_allocator] Invalid SHMEM_INITIAL_POOL_SIZE, "
-                         "using 2 MiB default.\n";
+                         "using 1 GiB default.\n";
         }
     }
 
@@ -429,15 +821,6 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         return nullptr;
     }
 
-    std::vector<DeferredFreeEntry> ready_entries;
-    {
-        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-        reclaim_ready_deferred_frees_locked(ready_entries);
-    }
-    for (const auto &entry : ready_entries) {
-        free_now(entry);
-    }
-
     try {
         ensure_shmem_initialized();
     } catch (const std::exception &e) {
@@ -447,7 +830,16 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         aclrtMalloc(&fb, static_cast<size_t>(size), ACL_MEM_MALLOC_HUGE_FIRST);
         if (fb != nullptr) {
             std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-            g_live_ptrs.insert(fb);
+            g_blocks[fb] = BlockMeta{
+                fb,
+                static_cast<size_t>(size),
+                static_cast<size_t>(size),
+                to_stream_key(stream),
+                false,
+                BlockState::ACTIVE,
+                next_generation(),
+                {}
+            };
         }
         if (fb != nullptr) {
             alloc_track_add(size);
@@ -455,27 +847,83 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
         return fb;
     }
 
-    void *ptr = aclshmem_malloc(static_cast<size_t>(size));
-    if (ptr != nullptr) {
-        {
-            std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-            g_live_ptrs.insert(ptr);
-            g_shmem_ptrs.insert(ptr);
+    const size_t requested_size = static_cast<size_t>(size);
+    const size_t alloc_size = round_size_class(requested_size);
+    const uintptr_t stream_key = to_stream_key(stream);
+
+    {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        reclaim_ready_deferred_for_stream_locked(stream_key, g_reclaim_budget);
+        if (void *cached =
+                try_pop_local_cached_block_locked(alloc_size, stream_key, requested_size)) {
+            alloc_track_add(size);
+            return cached;
         }
+        if (void *cached =
+                try_pop_global_cached_block_locked(alloc_size, stream_key, requested_size)) {
+            alloc_track_add(size);
+            return cached;
+        }
+    }
+
+    void *ptr = aclshmem_malloc(alloc_size);
+    if (ptr != nullptr) {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        g_blocks[ptr] = BlockMeta{
+            ptr,
+            alloc_size,
+            requested_size,
+            stream_key,
+            true,
+            BlockState::ACTIVE,
+            next_generation(),
+            {}
+        };
         alloc_track_add(size);
         return ptr;
     }
 
-    // SHMEM pool exhausted even after dynamic expansion; fall back.
+    {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        reclaim_ready_deferred_global_locked(std::max(1, g_reclaim_budget * 4));
+        trim_global_cache_locked(alloc_size);
+        enforce_cache_limit_locked();
+    }
+
+    ptr = aclshmem_malloc(alloc_size);
+    if (ptr != nullptr) {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        g_blocks[ptr] = BlockMeta{
+            ptr,
+            alloc_size,
+            requested_size,
+            stream_key,
+            true,
+            BlockState::ACTIVE,
+            next_generation(),
+            {}
+        };
+        alloc_track_add(size);
+        return ptr;
+    }
+
+    // SHMEM pool exhausted even after cache reclaim and dynamic expansion.
     std::cerr << "[shmem_allocator] my_malloc: aclshmem_malloc failed for "
                  "size=" << size << ", falling back to aclrtMalloc\n";
     void *fb = nullptr;
-    aclrtMalloc(&fb, static_cast<size_t>(size), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(&fb, requested_size, ACL_MEM_MALLOC_HUGE_FIRST);
     if (fb != nullptr) {
-        {
-            std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-            g_live_ptrs.insert(fb);
-        }
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        g_blocks[fb] = BlockMeta{
+            fb,
+            requested_size,
+            requested_size,
+            stream_key,
+            false,
+            BlockState::ACTIVE,
+            next_generation(),
+            {}
+        };
         alloc_track_add(size);
     }
     return fb;
@@ -488,39 +936,46 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         return;
     }
 
-    std::vector<DeferredFreeEntry> ready_entries;
     std::vector<uintptr_t> sync_stream_keys;
     std::vector<aclrtEvent> destroy_events;
-    bool is_shmem = false;
+    bool cache_locally = false;
     bool defer_free = false;
+    bool cache_globally_after_sync = false;
+    uint64_t sync_generation = 0;
+    size_t tracked_size = static_cast<size_t>(size);
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-        reclaim_ready_deferred_frees_locked(ready_entries);
+        reclaim_ready_deferred_for_stream_locked(to_stream_key(stream),
+                                                 g_reclaim_budget);
 
-        auto it = g_shmem_ptrs.find(ptr);
-        if (it != g_shmem_ptrs.end()) {
-            is_shmem = true;
-            g_shmem_ptrs.erase(it);
+        auto it = g_blocks.find(ptr);
+        if (it == g_blocks.end()) {
+            std::cerr << "[shmem_allocator] my_free: unknown pointer " << ptr
+                      << ", ignoring to avoid mismatched backend free.\n";
+            return;
         }
-        g_live_ptrs.erase(ptr);
+        BlockMeta &meta = it->second;
+        if (meta.state != BlockState::ACTIVE) {
+            std::cerr << "[shmem_allocator] my_free: pointer " << ptr
+                      << " is not active, skipping duplicate free.\n";
+            return;
+        }
+        tracked_size = meta.requested_size > 0 ? meta.requested_size : tracked_size;
 
-        std::unordered_set<uintptr_t> stream_keys;
-        if (stream != nullptr) {
-            stream_keys.insert(to_stream_key(stream));
-        }
-        auto streams_it = g_ptr_streams.find(ptr);
-        if (streams_it != g_ptr_streams.end()) {
-            stream_keys.insert(streams_it->second.begin(),
-                               streams_it->second.end());
-            g_ptr_streams.erase(streams_it);
-        }
-
-        if (!stream_keys.empty()) {
+        if (meta.extra_streams.empty()) {
+            cache_block_local_locked(meta);
+            cache_locally = true;
+        } else {
+            std::unordered_set<uintptr_t> stream_keys(meta.extra_streams.begin(),
+                                                      meta.extra_streams.end());
+            stream_keys.insert(meta.alloc_stream_key);
             sync_stream_keys.assign(stream_keys.begin(), stream_keys.end());
+
             DeferredFreeEntry entry;
             entry.ptr = ptr;
-            entry.size = size;
-            entry.is_shmem = is_shmem;
+            entry.is_shmem = meta.is_shmem;
+            entry.home_stream_key = meta.alloc_stream_key;
+            entry.generation = meta.generation;
             entry.events.reserve(stream_keys.size());
 
             bool event_record_failed = false;
@@ -536,7 +991,7 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
                 if (err != ACL_ERROR_NONE) {
                     std::cerr << "[shmem_allocator] aclrtRecordEvent failed: "
                               << err
-                              << ", falling back to synchronous free\n";
+                              << ", falling back to synchronized global cache\n";
                     destroy_events.push_back(ev);
                     event_record_failed = true;
                     break;
@@ -545,21 +1000,26 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
             }
 
             if (!event_record_failed && !entry.events.empty()) {
-                g_deferred_frees.push_back(std::move(entry));
+                meta.state = BlockState::DEFERRED;
+                meta.requested_size = 0;
+                g_deferred_by_stream[meta.alloc_stream_key].push_back(std::move(entry));
                 defer_free = true;
             } else {
                 for (aclrtEvent ev : entry.events) {
                     destroy_events.push_back(ev);
                 }
+                meta.state = BlockState::DEFERRED;
+                meta.requested_size = 0;
+                meta.extra_streams.clear();
+                cache_globally_after_sync = true;
+                sync_generation = meta.generation;
             }
         }
+        enforce_cache_limit_locked();
     }
 
-    for (const auto &entry : ready_entries) {
-        free_now(entry);
-    }
-
-    if (defer_free) {
+    if (cache_locally || defer_free) {
+        alloc_track_sub(static_cast<int64_t>(tracked_size));
         return;
     }
 
@@ -570,12 +1030,18 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
         aclrtDestroyEvent(ev);
     }
 
-    if (is_shmem) {
-        aclshmem_free(ptr);
-    } else {
-        aclrtFree(ptr);
+    if (cache_globally_after_sync) {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        auto it = g_blocks.find(ptr);
+        if (it != g_blocks.end() &&
+            it->second.generation == sync_generation &&
+            it->second.state == BlockState::DEFERRED) {
+            cache_block_global_locked(it->second);
+            enforce_cache_limit_locked();
+        }
     }
-    alloc_track_sub(size);
+
+    alloc_track_sub(static_cast<int64_t>(tracked_size));
 }
 
 // ---------------------------------------------------------------------------
@@ -596,25 +1062,16 @@ static PyObject *py_shmem_finalize(PyObject * /*self*/, PyObject * /*args*/)
 {
     std::lock_guard<std::mutex> lock(g_shmem_mutex);
     if (g_shmem_initialized) {
-        std::vector<DeferredFreeEntry> deferred_entries;
-        std::vector<aclrtEvent> pooled_events;
+        shmem_reset_impl(false);
         {
             std::lock_guard<std::mutex> plock(g_ptrs_mutex);
-            drain_deferred_frees_locked(deferred_entries);
-            pooled_events = destroy_event_pool_locked();
-            g_ptr_streams.clear();
-            g_live_ptrs.clear();
-            g_shmem_ptrs.clear();
-        }
-        for (auto &entry : deferred_entries) {
-            for (aclrtEvent ev : entry.events) {
-                aclrtSynchronizeEvent(ev);
-                aclrtDestroyEvent(ev);
+            for (const auto &pair : g_blocks) {
+                if (pair.second.state == BlockState::ACTIVE) {
+                    std::cerr << "[shmem_allocator] finalize called with live block "
+                              << pair.first << "; clearing bookkeeping only.\n";
+                }
             }
-            free_now(entry);
-        }
-        for (aclrtEvent ev : pooled_events) {
-            aclrtDestroyEvent(ev);
+            g_blocks.clear();
         }
 
         int ret = aclshmem_finalize();
@@ -715,6 +1172,12 @@ __attribute__((visibility("default")))
 uint64_t shmem_reset_peak_stats_fn_addr(void)
 {
     return reinterpret_cast<uint64_t>(&shmem_reset_peak_stats_impl);
+}
+
+__attribute__((visibility("default")))
+uint64_t shmem_reset_fn_addr(void)
+{
+    return reinterpret_cast<uint64_t>(&shmem_reset_impl);
 }
 
 __attribute__((visibility("default")))
