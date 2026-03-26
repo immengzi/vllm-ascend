@@ -364,6 +364,37 @@ static void erase_empty_bins_locked()
     }
 }
 
+static void prune_empty_local_bin_locked(uintptr_t stream_key, size_t alloc_size)
+{
+    auto stream_it = g_stream_local_bins.find(stream_key);
+    if (stream_it == g_stream_local_bins.end()) {
+        return;
+    }
+    auto bin_it = stream_it->second.find(alloc_size);
+    if (bin_it != stream_it->second.end() && bin_it->second.empty()) {
+        stream_it->second.erase(bin_it);
+    }
+    if (stream_it->second.empty()) {
+        g_stream_local_bins.erase(stream_it);
+    }
+}
+
+static void prune_empty_global_bin_locked(size_t alloc_size)
+{
+    auto bin_it = g_global_bins.find(alloc_size);
+    if (bin_it != g_global_bins.end() && bin_it->second.empty()) {
+        g_global_bins.erase(bin_it);
+    }
+}
+
+static void prune_empty_deferred_queue_locked(uintptr_t stream_key)
+{
+    auto queue_it = g_deferred_by_stream.find(stream_key);
+    if (queue_it != g_deferred_by_stream.end() && queue_it->second.empty()) {
+        g_deferred_by_stream.erase(queue_it);
+    }
+}
+
 static std::vector<aclrtEvent> destroy_event_pool_locked()
 {
     std::vector<aclrtEvent> events_to_destroy;
@@ -441,7 +472,7 @@ static void *try_pop_local_cached_block_locked(size_t alloc_size,
         mark_block_active_locked(meta, stream_key, requested_size);
         return meta.ptr;
     }
-    erase_empty_bins_locked();
+    prune_empty_local_bin_locked(stream_key, alloc_size);
     return nullptr;
 }
 
@@ -470,7 +501,7 @@ static void *try_pop_global_cached_block_locked(size_t alloc_size,
         mark_block_active_locked(meta, stream_key, requested_size);
         return meta.ptr;
     }
-    erase_empty_bins_locked();
+    prune_empty_global_bin_locked(alloc_size);
     return nullptr;
 }
 
@@ -602,7 +633,7 @@ static void reclaim_ready_deferred_for_stream_locked(uintptr_t stream_key,
         return;
     }
     reclaim_ready_deferred_queue_locked(it->second, budget);
-    erase_empty_bins_locked();
+    prune_empty_deferred_queue_locked(stream_key);
 }
 
 static void reclaim_ready_deferred_global_locked(int budget)
