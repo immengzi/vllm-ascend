@@ -169,6 +169,11 @@ struct PhysicalBlock {
     bool is_shmem = false;
 };
 
+struct StreamSyncedBlock {
+    PhysicalBlock block;
+    uintptr_t stream_key = 0;
+};
+
 static std::mutex g_shmem_mutex;
 static bool g_shmem_initialized = false;
 static std::mutex g_ptrs_mutex;
@@ -294,6 +299,36 @@ static void free_storage(const PhysicalBlock &block)
         aclshmem_free(block.ptr);
     } else {
         aclrtFree(block.ptr);
+    }
+}
+
+static void free_blocks(const std::vector<PhysicalBlock> &blocks)
+{
+    for (const PhysicalBlock &block : blocks) {
+        free_storage(block);
+    }
+}
+
+static void sync_streams_and_free_blocks(
+    const std::vector<StreamSyncedBlock> &blocks)
+{
+    std::unordered_set<uintptr_t> synced_streams;
+    synced_streams.reserve(blocks.size());
+
+    for (const StreamSyncedBlock &entry : blocks) {
+        if (!synced_streams.insert(entry.stream_key).second) {
+            continue;
+        }
+        const aclError err =
+            aclrtSynchronizeStream(reinterpret_cast<aclrtStream>(entry.stream_key));
+        if (err != ACL_ERROR_NONE) {
+            std::cerr << "[shmem_allocator] aclrtSynchronizeStream failed: "
+                      << err << "\n";
+        }
+    }
+
+    for (const StreamSyncedBlock &entry : blocks) {
+        free_storage(entry.block);
     }
 }
 
@@ -439,11 +474,13 @@ static void *try_pop_global_cached_block_locked(size_t alloc_size,
     return nullptr;
 }
 
-static void trim_global_cache_locked(size_t target_bytes)
+static size_t collect_trimmed_global_blocks_locked(
+    size_t target_bytes, std::vector<PhysicalBlock> &blocks_to_free)
 {
     if (target_bytes == 0) {
-        return;
+        return 0;
     }
+    size_t released_bytes = 0;
     for (auto &bucket : g_global_bins) {
         auto &bin = bucket.second;
         while (!bin.empty() && target_bytes > 0) {
@@ -459,20 +496,24 @@ static void trim_global_cache_locked(size_t target_bytes)
                 continue;
             }
             cached_track_sub(meta.alloc_size);
-            free_storage({meta.ptr, meta.is_shmem});
+            blocks_to_free.push_back({meta.ptr, meta.is_shmem});
             target_bytes =
                 (target_bytes > meta.alloc_size) ? target_bytes - meta.alloc_size : 0;
+            released_bytes += meta.alloc_size;
             g_blocks.erase(meta_it);
         }
     }
     erase_empty_bins_locked();
+    return released_bytes;
 }
 
-static void trim_local_cache_locked(size_t target_bytes)
+static size_t collect_trimmed_local_blocks_locked(
+    size_t target_bytes, std::vector<StreamSyncedBlock> &blocks_to_free)
 {
     if (target_bytes == 0) {
-        return;
+        return 0;
     }
+    size_t released_bytes = 0;
     for (auto &stream_bins : g_stream_local_bins) {
         for (auto &bucket : stream_bins.second) {
             auto &bin = bucket.second;
@@ -489,34 +530,37 @@ static void trim_local_cache_locked(size_t target_bytes)
                     continue;
                 }
                 cached_track_sub(meta.alloc_size);
-                free_storage({meta.ptr, meta.is_shmem});
+                blocks_to_free.push_back(
+                    {{meta.ptr, meta.is_shmem}, meta.alloc_stream_key});
                 target_bytes =
                     (target_bytes > meta.alloc_size) ? target_bytes - meta.alloc_size : 0;
+                released_bytes += meta.alloc_size;
                 g_blocks.erase(meta_it);
             }
         }
     }
     erase_empty_bins_locked();
+    return released_bytes;
 }
 
-static void enforce_cache_limit_locked()
+static void enforce_cache_limit_locked(
+    std::vector<PhysicalBlock> &blocks_to_free)
 {
     int64_t cached = g_cached_cur_bytes.load(std::memory_order_relaxed);
     if (cached <= g_cache_limit_bytes) {
         return;
     }
-    trim_global_cache_locked(static_cast<size_t>(cached - g_cache_limit_bytes));
-    cached = g_cached_cur_bytes.load(std::memory_order_relaxed);
-    if (cached > g_cache_limit_bytes) {
-        trim_local_cache_locked(static_cast<size_t>(cached - g_cache_limit_bytes));
-    }
+    collect_trimmed_global_blocks_locked(
+        static_cast<size_t>(cached - g_cache_limit_bytes), blocks_to_free);
 }
 
 static void reclaim_ready_deferred_queue_locked(
     std::deque<DeferredFreeEntry> &queue, int &budget)
 {
-    while (budget > 0 && !queue.empty()) {
-        DeferredFreeEntry &entry = queue.front();
+    size_t scan_limit = queue.size();
+    while (budget > 0 && scan_limit > 0 && !queue.empty()) {
+        DeferredFreeEntry entry = std::move(queue.front());
+        queue.pop_front();
         bool all_ready = true;
         for (aclrtEvent ev : entry.events) {
             aclrtEventRecordedStatus status =
@@ -529,7 +573,9 @@ static void reclaim_ready_deferred_queue_locked(
             }
         }
         if (!all_ready) {
-            break;
+            queue.push_back(std::move(entry));
+            --scan_limit;
+            continue;
         }
 
         for (aclrtEvent ev : entry.events) {
@@ -543,8 +589,8 @@ static void reclaim_ready_deferred_queue_locked(
                 cache_block_global_locked(meta);
             }
         }
-        queue.pop_front();
         --budget;
+        --scan_limit;
     }
 }
 
@@ -571,7 +617,8 @@ static void reclaim_ready_deferred_global_locked(int budget)
 }
 
 static void drain_releasable_blocks_locked(
-    std::vector<PhysicalBlock> &blocks_to_free,
+    std::vector<PhysicalBlock> &global_blocks_to_free,
+    std::vector<StreamSyncedBlock> &local_blocks_to_free,
     std::vector<DeferredFreeEntry> &deferred_entries)
 {
     deferred_entries.clear();
@@ -584,10 +631,14 @@ static void drain_releasable_blocks_locked(
     g_deferred_by_stream.clear();
 
     for (auto it = g_blocks.begin(); it != g_blocks.end();) {
-        if (it->second.state == BlockState::CACHED_LOCAL ||
-            it->second.state == BlockState::CACHED_GLOBAL ||
-            it->second.state == BlockState::DEFERRED) {
-            blocks_to_free.push_back({it->second.ptr, it->second.is_shmem});
+        if (it->second.state == BlockState::CACHED_LOCAL) {
+            local_blocks_to_free.push_back(
+                {{it->second.ptr, it->second.is_shmem}, it->second.alloc_stream_key});
+            it = g_blocks.erase(it);
+        } else if (it->second.state == BlockState::CACHED_GLOBAL) {
+            global_blocks_to_free.push_back({it->second.ptr, it->second.is_shmem});
+            it = g_blocks.erase(it);
+        } else if (it->second.state == BlockState::DEFERRED) {
             it = g_blocks.erase(it);
         } else {
             ++it;
@@ -686,29 +737,31 @@ static void shmem_reset_peak_stats_impl(int /*device*/)
 
 static void shmem_reset_impl(bool /*check_error*/)
 {
-    std::vector<PhysicalBlock> blocks_to_free;
+    std::vector<PhysicalBlock> global_blocks_to_free;
+    std::vector<StreamSyncedBlock> local_blocks_to_free;
     std::vector<DeferredFreeEntry> deferred_entries;
     std::vector<aclrtEvent> pooled_events;
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
         reclaim_ready_deferred_global_locked(std::max(1, g_reclaim_budget * 8));
-        drain_releasable_blocks_locked(blocks_to_free, deferred_entries);
+        drain_releasable_blocks_locked(
+            global_blocks_to_free, local_blocks_to_free, deferred_entries);
         pooled_events = destroy_event_pool_locked();
         erase_empty_bins_locked();
     }
 
+    sync_streams_and_free_blocks(local_blocks_to_free);
     for (auto &entry : deferred_entries) {
         for (aclrtEvent ev : entry.events) {
             aclrtSynchronizeEvent(ev);
             aclrtDestroyEvent(ev);
         }
+        free_storage({entry.ptr, entry.is_shmem});
     }
     for (aclrtEvent ev : pooled_events) {
         aclrtDestroyEvent(ev);
     }
-    for (const PhysicalBlock &block : blocks_to_free) {
-        free_storage(block);
-    }
+    free_blocks(global_blocks_to_free);
 }
 
 // ── Everything else can live inside extern "C" ──────────────────────────────
@@ -749,6 +802,7 @@ static void ensure_shmem_initialized()
     //       do NOT redeclare it as a local variable (macro expansion would corrupt syntax).
     static const int64_t kShmemMaxLocalSize =
         static_cast<int64_t>(ACLSHMEM_MAX_LOCAL_SIZE);  // 40 GiB hard cap
+    constexpr int64_t kLargePageSize = 2LL * 1024 * 1024;  // 2 MiB
     int64_t local_mem_size = 1LL * 1024 * 1024 * 1024;  // 1 GiB default
 
     const char *env_size = std::getenv("SHMEM_INITIAL_POOL_SIZE");
@@ -772,6 +826,10 @@ static void ensure_shmem_initialized()
                          "using 1 GiB default.\n";
         }
     }
+    local_mem_size =
+        std::min(round_up(static_cast<size_t>(local_mem_size),
+                          static_cast<size_t>(kLargePageSize)),
+                 static_cast<size_t>(kShmemMaxLocalSize));
 
     // Bootstrap with UniqueID mode, single PE (n_pes = 1).
     aclshmemx_uniqueid_t  uid{};
@@ -850,6 +908,8 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
     const size_t requested_size = static_cast<size_t>(size);
     const size_t alloc_size = round_size_class(requested_size);
     const uintptr_t stream_key = to_stream_key(stream);
+    std::vector<PhysicalBlock> global_blocks_to_free;
+    std::vector<StreamSyncedBlock> local_blocks_to_free;
 
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
@@ -886,9 +946,37 @@ void *my_malloc(ssize_t size, int device, aclrtStream stream)
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
         reclaim_ready_deferred_global_locked(std::max(1, g_reclaim_budget * 4));
-        trim_global_cache_locked(alloc_size);
-        enforce_cache_limit_locked();
+        if (void *cached = try_pop_global_cached_block_locked(
+                alloc_size, stream_key, requested_size)) {
+            alloc_track_add(size);
+            return cached;
+        }
+        collect_trimmed_global_blocks_locked(alloc_size, global_blocks_to_free);
     }
+    free_blocks(global_blocks_to_free);
+
+    ptr = aclshmem_malloc(alloc_size);
+    if (ptr != nullptr) {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        g_blocks[ptr] = BlockMeta{
+            ptr,
+            alloc_size,
+            requested_size,
+            stream_key,
+            true,
+            BlockState::ACTIVE,
+            next_generation(),
+            {}
+        };
+        alloc_track_add(size);
+        return ptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+        collect_trimmed_local_blocks_locked(alloc_size, local_blocks_to_free);
+    }
+    sync_streams_and_free_blocks(local_blocks_to_free);
 
     ptr = aclshmem_malloc(alloc_size);
     if (ptr != nullptr) {
@@ -943,6 +1031,7 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
     bool cache_globally_after_sync = false;
     uint64_t sync_generation = 0;
     size_t tracked_size = static_cast<size_t>(size);
+    std::vector<PhysicalBlock> trimmed_global_blocks;
     {
         std::lock_guard<std::mutex> lock(g_ptrs_mutex);
         reclaim_ready_deferred_for_stream_locked(to_stream_key(stream),
@@ -1015,8 +1104,9 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
                 sync_generation = meta.generation;
             }
         }
-        enforce_cache_limit_locked();
+        enforce_cache_limit_locked(trimmed_global_blocks);
     }
+    free_blocks(trimmed_global_blocks);
 
     if (cache_locally || defer_free) {
         alloc_track_sub(static_cast<int64_t>(tracked_size));
@@ -1031,14 +1121,18 @@ void my_free(void *ptr, ssize_t size, int device, aclrtStream stream)
     }
 
     if (cache_globally_after_sync) {
-        std::lock_guard<std::mutex> lock(g_ptrs_mutex);
-        auto it = g_blocks.find(ptr);
-        if (it != g_blocks.end() &&
-            it->second.generation == sync_generation &&
-            it->second.state == BlockState::DEFERRED) {
-            cache_block_global_locked(it->second);
-            enforce_cache_limit_locked();
+        std::vector<PhysicalBlock> post_sync_trimmed_blocks;
+        {
+            std::lock_guard<std::mutex> lock(g_ptrs_mutex);
+            auto it = g_blocks.find(ptr);
+            if (it != g_blocks.end() &&
+                it->second.generation == sync_generation &&
+                it->second.state == BlockState::DEFERRED) {
+                cache_block_global_locked(it->second);
+                enforce_cache_limit_locked(post_sync_trimmed_blocks);
+            }
         }
+        free_blocks(post_sync_trimmed_blocks);
     }
 
     alloc_track_sub(static_cast<int64_t>(tracked_size));
