@@ -321,7 +321,7 @@ class NPUWorker(WorkerBase):
             peak_memory)
         if envs_ascend.ENABLE_SHMEM and shmem_available:
             runtime_headroom_mb = int(
-                os.getenv("SHMEM_RUNTIME_HEADROOM_MB", "1024"))
+                os.getenv("SHMEM_RUNTIME_HEADROOM_MB", "0"))
             runtime_headroom_bytes = runtime_headroom_mb * 1024 * 1024
             if runtime_headroom_bytes > 0:
                 available_kv_cache_memory -= runtime_headroom_bytes
