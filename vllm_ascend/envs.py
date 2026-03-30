@@ -114,16 +114,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
-    # Whether to anbale balance scheduling
+    # Whether to enable balance scheduling.
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
     # Whether to build the SHMEM-backed NPU pluggable allocator.
-    # Set to "1" to enable; requires SHMEM_HOME_PATH to also be set.
+    # Set to "1" to enable; requires SHMEM_HOME_PATH to also
+    # be set.
     "ENABLE_SHMEM": lambda: bool(int(os.getenv("ENABLE_SHMEM", "0"))),
     # Parent directory of the installed SHMEM library, i.e. the directory
     # that contains the shmem/ sub-directory with include/ and lib/ inside.
     # This is the value exported by `source install/set_env.sh` in the shmem
     # source tree (e.g. /root/shmem/install), or /usr/local/Ascend/shmem/latest
-    # for a binary-package install. Only used when ENABLE_SHMEM=1.
+    # for a binary-package install.
+    # Only used when ENABLE_SHMEM=1.
     "SHMEM_HOME_PATH": lambda: os.getenv("SHMEM_HOME_PATH", None),
 }
 
