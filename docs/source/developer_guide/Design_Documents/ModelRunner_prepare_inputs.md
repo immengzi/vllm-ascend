@@ -217,19 +217,19 @@ Scheduled token of each request: `{'0': 1, '1': 1, '2': 3}`
 1. `request indices`: `[0, 1, 2, 2, 2]`
 2. `token positions`: `[3, 2, 5, 6, 7]`
 
-Current **Token IDs table**:
+      Current **Token IDs table**:
 
-```shell
-| T_0_0 | T_0_1 | T_0_2 | T_0_3 |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |
-| T_1_0 | T_1_1 | T_1_2 |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |
-| T_2_0 | T_2_1 | T_3_2 | T_3_3 | T_3_4 | T_3_5 | T_3_6 | T_3_7 |   ?   |   ?   |   ?   |   ?   |
-|   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |
-......
-......
-......
-```
+      ```shell
+      | T_0_0 | T_0_1 | T_0_2 | T_0_3 |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |
+      | T_1_0 | T_1_1 | T_1_2 |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |
+      | T_2_0 | T_2_1 | T_3_2 | T_3_3 | T_3_4 | T_3_5 | T_3_6 | T_3_7 |   ?   |   ?   |   ?   |   ?   |
+      |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |   ?   |
+      ......
+      ......
+      ......
+      ```
 
-**Note**: **T_0_3**, **T_1_2** are new Token IDs of **request_0** and **request_1** respectively. They are sampled from the output of the model.
+      **Note**: **T_0_3**, **T_1_2** are new Token IDs of **request_0** and **request_1** respectively. They are sampled from the output of the model.
 
 3. `token indices`: `[3, 14, 29, 30, 31]`
 4. `Input IDs`: `[T_0_3, T_1_2, T_3_5, T_3_6, T_3_7]`
@@ -281,6 +281,6 @@ Scheduled token count: `[1, 1, 3]`
 
 ## At last
 
-If you understand step_1 and step_2, you will know all the following steps.
+If you understand step 1 and step 2, you will know all the following steps.
 
 Hope this document helps you better understand how vLLM prepares inputs for model forwarding. If you have any good ideas, you are welcome to contribute to us.
