@@ -128,7 +128,7 @@ sed -i 's|ports.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
 apt-get update -y && apt-get install -y gcc g++ cmake libnuma-dev wget git curl jq
 # Or using yum
 # yum update -y && yum install -y gcc g++ cmake numactl-devel wget git curl jq
-# Config pip mirror
+# Config pip mirror,only versions 0.11.0 and earlier are supported, if using a version later than 0.11.0, do not execute this command
 pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 ```
 
