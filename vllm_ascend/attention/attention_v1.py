@@ -299,8 +299,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 self.model_config.dtype, self.model_config.hf_text_config.sliding_window
             )
 
-        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        query_start_loc = common_attn_metadata.query_start_loc
+        if query_start_loc is None:
+            # Fall back to the legacy host-to-device path outside capture.
+            query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -328,20 +330,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         common_attn_metadata: AscendCommonAttentionMetadata,
         attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,
     ):
-        if attn_state in (
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.ChunkedPrefill,
-            AscendAttentionState.SpecDecoding,
-        ):
-            attn_metadata = self.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
-        else:
-            raise NotImplementedError(
-                "Currently we only support building dummy metadata for DecodeOnly and ChunkedPrefill state"
-            )
-
+        attn_metadata = self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
         attn_metadata.attn_state = attn_state
         return attn_metadata
 
