@@ -47,6 +47,12 @@ class PrefillGraphKey:
     num_tokens: int
 
 
+@dataclass
+class LAPSPrefillGraphState:
+    desc: BatchExecutionDescriptor
+    input_buffers: AscendInputBuffers
+
+
 class ModelAclGraphManager(ModelCudaGraphManager):
     """ACL Model Cuda Graph Manager for Ascend NPUs."""
 
@@ -67,6 +73,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.model_runner = model_runner
         self.capture_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
         self.laps_prefill_descs: dict[PrefillGraphKey, BatchExecutionDescriptor] = {}
+        self.laps_prefill_states: dict[BatchExecutionDescriptor, LAPSPrefillGraphState] = {}
         self._next_laps_prefill_request: tuple[int, int, int] | None = None
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
@@ -109,6 +116,25 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             reverse=True,
         )
 
+    def _get_or_create_laps_prefill_state(
+        self,
+        desc: BatchExecutionDescriptor,
+    ) -> LAPSPrefillGraphState:
+        state = self.laps_prefill_states.get(desc)
+        if state is not None:
+            return state
+        assert desc.num_reqs is not None
+        state = LAPSPrefillGraphState(
+            desc=desc,
+            input_buffers=AscendInputBuffers(
+                max_num_reqs=desc.num_reqs,
+                max_num_tokens=desc.num_tokens,
+                device=self.device,
+            ),
+        )
+        self.laps_prefill_states[desc] = state
+        return state
+
     def _use_laps_prefill_graph(self) -> bool:
         if not envs.VLLM_ASCEND_LAPS_SCHEDULING:
             return False
@@ -124,6 +150,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
     def supports_laps_prefill_graph(self) -> bool:
         return self._use_laps_prefill_graph() and bool(self.laps_prefill_descs)
+
+    def is_laps_prefill_desc(self, desc: BatchExecutionDescriptor) -> bool:
+        return self._is_laps_prefill_desc(desc)
 
     def set_next_laps_prefill_request(
         self,
@@ -154,6 +183,63 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if desc is None or desc not in self.graphs:
             return None
         return desc
+
+    def materialize_laps_prefill_input_batch(
+        self,
+        desc: BatchExecutionDescriptor,
+        input_batch: AscendInputBatch,
+    ) -> AscendInputBatch:
+        state = self._get_or_create_laps_prefill_state(desc)
+        input_buffers = state.input_buffers
+
+        num_tokens = input_batch.num_tokens
+        num_reqs = input_batch.num_reqs
+        num_reqs_after_padding = input_batch.num_reqs_after_padding
+
+        input_buffers.input_ids[:num_tokens].copy_(input_batch.input_ids[:num_tokens])
+        input_buffers.positions[:num_tokens].copy_(input_batch.positions[:num_tokens])
+        input_buffers.seq_lens[:num_reqs_after_padding].copy_(
+            input_batch.seq_lens[:num_reqs_after_padding]
+        )
+        input_buffers.seq_lens_cpu[:num_reqs_after_padding].copy_(
+            torch.as_tensor(
+                input_batch.seq_lens_np[:num_reqs_after_padding],
+                dtype=torch.int32,
+            )
+        )
+        input_buffers.query_start_loc[: num_reqs_after_padding + 1].copy_(
+            input_batch.query_start_loc[: num_reqs_after_padding + 1]
+        )
+
+        query_start_loc_np = input_batch.query_start_loc_np[: num_reqs_after_padding + 1].copy()
+        seq_lens_np = input_batch.seq_lens_np[:num_reqs_after_padding].copy()
+        input_buffers.seq_lens_np[:num_reqs_after_padding] = seq_lens_np
+
+        return AscendInputBatch(
+            req_ids=input_batch.req_ids,
+            num_reqs=num_reqs,
+            num_reqs_after_padding=num_reqs_after_padding,
+            idx_mapping=input_batch.idx_mapping,
+            idx_mapping_np=input_batch.idx_mapping_np,
+            expanded_idx_mapping=input_batch.expanded_idx_mapping,
+            expanded_local_pos=input_batch.expanded_local_pos,
+            num_scheduled_tokens=input_batch.num_scheduled_tokens,
+            num_tokens=num_tokens,
+            num_tokens_after_padding=input_batch.num_tokens_after_padding,
+            num_draft_tokens=input_batch.num_draft_tokens,
+            query_start_loc=input_buffers.query_start_loc[: num_reqs_after_padding + 1],
+            query_start_loc_np=query_start_loc_np,
+            seq_lens=input_buffers.seq_lens[:num_reqs_after_padding],
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            input_ids=input_buffers.input_ids[:num_tokens],
+            positions=input_buffers.positions[:num_tokens],
+            logits_indices=input_batch.logits_indices,
+            cu_num_logits=input_batch.cu_num_logits,
+            cu_num_logits_np=input_batch.cu_num_logits_np,
+            has_structured_output_reqs=input_batch.has_structured_output_reqs,
+            seq_lens_np=input_buffers.seq_lens_np[:num_reqs_after_padding],
+            attn_state=input_batch.attn_state,
+        )
 
     def dispatch(
         self,
@@ -240,11 +326,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 and desc.cg_mode == CUDAGraphMode.FULL
                 and self._is_laps_prefill_desc(desc)
             )
+            capture_input_buffers = input_buffers
+            if use_laps_prefill_graph:
+                capture_input_buffers = self._get_or_create_laps_prefill_state(desc).input_buffers
             input_batch, attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
                 num_tokens,
                 model_state,
-                input_buffers,
+                capture_input_buffers,
                 block_tables,
                 attn_groups,
                 kv_cache_config,

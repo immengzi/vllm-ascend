@@ -350,6 +350,11 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
         )
+        if self.cudagraph_manager.is_laps_prefill_desc(batch_desc):
+            self.input_batch = self.cudagraph_manager.materialize_laps_prefill_input_batch(
+                batch_desc,
+                self.input_batch,
+            )
         return self.input_batch
 
     def postprocess(
