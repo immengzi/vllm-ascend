@@ -102,6 +102,89 @@ class AscendInputBatch(InputBatch):
         input_batch.attn_state = AscendAttentionState.DecodeOnly
         return cls(**asdict(input_batch), seq_lens_np=seq_lens_np)
 
+    @classmethod
+    def make_prefill_dummy(
+        cls,
+        num_tokens: int,
+        num_reqs_after_padding: int,
+        input_buffers: AscendInputBuffers,
+    ) -> "AscendInputBatch":
+        """Build a padded pure-prefill dummy batch for full-graph capture.
+
+        The upstream dummy batch generator spreads tokens across all requests,
+        which collapses small FULL capture shapes into decode-only metadata
+        when `num_tokens == num_reqs`. For the LAPS prefill capture path we
+        intentionally keep fewer active requests and pad the remaining request
+        slots so that capture uses real prefill-shaped attention metadata.
+        """
+        assert 0 < num_tokens <= input_buffers.max_num_tokens
+        assert 0 < num_reqs_after_padding <= input_buffers.max_num_reqs
+        device = input_buffers.device
+
+        if num_tokens == 1:
+            num_reqs = 1
+        else:
+            num_reqs = min(num_reqs_after_padding, max(1, num_tokens // 2))
+
+        req_ids = [f"prefill_req_{i}" for i in range(num_reqs)]
+        idx_mapping_np = np.arange(num_reqs, dtype=np.int32)
+        idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+        expanded_idx_mapping = idx_mapping
+        expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+
+        num_scheduled_tokens = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
+        num_scheduled_tokens[-1] += num_tokens % num_reqs
+        assert int(num_scheduled_tokens.sum()) == num_tokens
+
+        input_buffers.seq_lens[:num_reqs] = torch.from_numpy(num_scheduled_tokens).to(device=device)
+        input_buffers.seq_lens[num_reqs:num_reqs_after_padding] = 0
+        input_buffers.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        input_buffers.seq_lens_np[num_reqs:num_reqs_after_padding] = 0
+        seq_lens = input_buffers.seq_lens[:num_reqs_after_padding]
+        seq_lens_np = input_buffers.seq_lens_np[:num_reqs_after_padding]
+
+        query_start_loc_np = np.empty(num_reqs_after_padding + 1, dtype=np.int32)
+        query_start_loc_np[0] = 0
+        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
+        query_start_loc_np[num_reqs + 1 :] = num_tokens
+        input_buffers.query_start_loc[: num_reqs_after_padding + 1] = torch.from_numpy(query_start_loc_np).to(
+            device=device
+        )
+        query_start_loc = input_buffers.query_start_loc[: num_reqs_after_padding + 1]
+
+        input_ids = input_buffers.input_ids[:num_tokens].zero_()
+        positions = input_buffers.positions[:num_tokens].zero_()
+
+        logits_indices = query_start_loc[1 : num_reqs + 1] - 1
+        cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
+        cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+
+        return cls(
+            req_ids=req_ids,
+            num_reqs=num_reqs,
+            num_reqs_after_padding=num_reqs_after_padding,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_idx_mapping=expanded_idx_mapping,
+            expanded_local_pos=expanded_local_pos,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_tokens=num_tokens,
+            num_tokens_after_padding=num_tokens,
+            num_draft_tokens=0,
+            query_start_loc=query_start_loc,
+            query_start_loc_np=query_start_loc_np,
+            seq_lens=seq_lens,
+            dcp_local_seq_lens=None,
+            input_ids=input_ids,
+            positions=positions,
+            logits_indices=logits_indices,
+            cu_num_logits=cu_num_logits,
+            cu_num_logits_np=cu_num_logits_np,
+            has_structured_output_reqs=False,
+            seq_lens_np=seq_lens_np,
+            attn_state=AscendAttentionState.PrefillNoCache,
+        )
+
 
 @triton.jit
 def _post_update_kernel(

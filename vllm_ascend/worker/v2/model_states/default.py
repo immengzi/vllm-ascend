@@ -43,10 +43,16 @@ class AscendModelState(DefaultModelState):
         for_capture: bool = False,
     ) -> dict[str, Any]:
         """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
+        graph_pad_size = -1
+        num_input_tokens = input_batch.num_tokens
+        attn_state = input_batch.attn_state
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
+            num_input_tokens = input_batch.num_tokens_after_padding
+            if for_capture:
+                graph_pad_size = input_batch.num_reqs_after_padding
         else:
             # For piecewise cudagraphs and eager, use unpadded sizes.
             num_reqs = input_batch.num_reqs
@@ -68,6 +74,8 @@ class AscendModelState(DefaultModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
-            attn_state=input_batch.attn_state,
+            attn_state=attn_state,
+            graph_pad_size=graph_pad_size,
+            num_input_tokens=num_input_tokens,
         )
         return attn_metadata
