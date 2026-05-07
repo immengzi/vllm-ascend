@@ -135,6 +135,55 @@ class NPUModelRunner(GPUModelRunner):
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
 
+    def _should_hint_laps_prefill_graph(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> bool:
+        if not self.cudagraph_manager.supports_laps_prefill_graph():
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        if scheduler_output.scheduled_encoder_inputs:
+            return False
+        if self.supports_mm_inputs:
+            return False
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        if num_reqs <= 1:
+            return False
+        num_tokens = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        if max_query_len <= 1 or num_tokens <= num_reqs:
+            return False
+        return True
+
+    @torch.inference_mode()
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors=None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+    ):
+        hint_laps_prefill = (
+            not dummy_run and self._should_hint_laps_prefill_graph(scheduler_output)
+        )
+        if hint_laps_prefill:
+            self.cudagraph_manager.set_next_laps_prefill_request(
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                max(scheduler_output.num_scheduled_tokens.values()),
+            )
+        try:
+            return super().execute_model(
+                scheduler_output,
+                intermediate_tensors,
+                dummy_run=dummy_run,
+                skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+            )
+        finally:
+            if hint_laps_prefill:
+                self.cudagraph_manager.clear_next_laps_prefill_request()
+
     def prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,

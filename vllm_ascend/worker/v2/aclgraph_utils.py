@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -40,6 +41,12 @@ from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_grap
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
 
+@dataclass(frozen=True)
+class PrefillGraphKey:
+    num_reqs: int
+    num_tokens: int
+
+
 class ModelAclGraphManager(ModelCudaGraphManager):
     """ACL Model Cuda Graph Manager for Ascend NPUs."""
 
@@ -59,8 +66,48 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.model_runner = model_runner
         self.capture_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
+        self.laps_prefill_descs: dict[PrefillGraphKey, BatchExecutionDescriptor] = {}
+        self._next_laps_prefill_request: tuple[int, int, int] | None = None
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+        self._install_laps_prefill_capture_descs()
+
+    def _laps_prefill_capture_batch_sizes(self, num_tokens: int) -> list[int]:
+        max_num_reqs = min(self.max_num_reqs, max(1, num_tokens // 2))
+        batch_sizes = {1, max_num_reqs}
+        batch_size = 1
+        while batch_size <= max_num_reqs:
+            batch_sizes.add(batch_size)
+            batch_size *= 2
+        return sorted(batch_sizes)
+
+    def _install_laps_prefill_capture_descs(self) -> None:
+        if not self._use_laps_prefill_graph():
+            return
+        full_descs = self._capture_descs.get(CUDAGraphMode.FULL)
+        if not full_descs:
+            return
+
+        existing_descs = set(full_descs)
+        new_descs: list[BatchExecutionDescriptor] = []
+        for desc in list(full_descs):
+            for num_reqs in self._laps_prefill_capture_batch_sizes(desc.num_tokens):
+                key = PrefillGraphKey(num_reqs=num_reqs, num_tokens=desc.num_tokens)
+                laps_desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=desc.num_tokens,
+                    num_reqs=num_reqs,
+                )
+                self.laps_prefill_descs[key] = laps_desc
+                if laps_desc not in existing_descs:
+                    existing_descs.add(laps_desc)
+                    new_descs.append(laps_desc)
+
+        full_descs.extend(new_descs)
+        full_descs.sort(
+            key=lambda d: (d.num_tokens, d.num_reqs or 0),
+            reverse=True,
+        )
 
     def _use_laps_prefill_graph(self) -> bool:
         if not envs.VLLM_ASCEND_LAPS_SCHEDULING:
@@ -74,6 +121,64 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.model_runner.use_dcp:
             return False
         return True
+
+    def supports_laps_prefill_graph(self) -> bool:
+        return self._use_laps_prefill_graph() and bool(self.laps_prefill_descs)
+
+    def set_next_laps_prefill_request(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_query_len: int,
+    ) -> None:
+        self._next_laps_prefill_request = (num_reqs, num_tokens, max_query_len)
+
+    def clear_next_laps_prefill_request(self) -> None:
+        self._next_laps_prefill_request = None
+
+    def _is_laps_prefill_desc(self, desc: BatchExecutionDescriptor) -> bool:
+        if desc.num_reqs is None:
+            return False
+        key = PrefillGraphKey(num_reqs=desc.num_reqs, num_tokens=desc.num_tokens)
+        return self.laps_prefill_descs.get(key) == desc
+
+    def dispatch_laps_prefill(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_query_len: int,
+    ) -> BatchExecutionDescriptor | None:
+        del max_query_len
+        key = PrefillGraphKey(num_reqs=num_reqs, num_tokens=num_tokens)
+        desc = self.laps_prefill_descs.get(key)
+        if desc is None or desc not in self.graphs:
+            return None
+        return desc
+
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+    ) -> BatchExecutionDescriptor:
+        if self._next_laps_prefill_request is not None:
+            hinted_num_reqs, hinted_num_tokens, hinted_max_query_len = (
+                self._next_laps_prefill_request
+            )
+            if hinted_num_reqs == num_reqs and hinted_num_tokens == num_tokens:
+                desc = self.dispatch_laps_prefill(
+                    num_reqs,
+                    num_tokens,
+                    hinted_max_query_len,
+                )
+                if desc is not None:
+                    return desc
+                return BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.NONE,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                )
+        return super().dispatch(num_reqs, num_tokens, uniform_token_count)
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
@@ -131,7 +236,9 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 else None
             )
             use_laps_prefill_graph = (
-                self._use_laps_prefill_graph() and desc.cg_mode == CUDAGraphMode.FULL
+                self._use_laps_prefill_graph()
+                and desc.cg_mode == CUDAGraphMode.FULL
+                and self._is_laps_prefill_desc(desc)
             )
             input_batch, attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
