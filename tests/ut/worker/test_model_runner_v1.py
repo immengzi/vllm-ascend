@@ -1,8 +1,9 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
@@ -21,8 +22,14 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.is_kv_consumer = False
         runner.vllm_config = MagicMock()
         runner.vllm_config.kv_transfer_config = None
+        runner.speculative_config = None
         runner.model_config = MagicMock()
+        runner.model_config.is_encoder_decoder = False
         runner.model_config.use_mla = True
+        runner.compilation_config = MagicMock()
+        runner.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+        runner.pcp_size = 1
+        runner.dcp_size = 1
         backend = MagicMock()
         backend.get_kv_cache_shape.side_effect = lambda num_blocks, block_size, num_kv_heads, head_size: (
             2,
@@ -83,6 +90,26 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_ASCEND_LAPS_SCHEDULING", True)
+    def test_use_laps_prefill_graph_enabled_for_supported_full_graph_path(self):
+        runner = self._build_runner()
+
+        self.assertTrue(runner._use_laps_prefill_graph())
+
+    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_ASCEND_LAPS_SCHEDULING", True)
+    def test_use_laps_prefill_graph_disabled_for_spec_decode(self):
+        runner = self._build_runner()
+        runner.speculative_config = MagicMock()
+
+        self.assertFalse(runner._use_laps_prefill_graph())
+
+    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_ASCEND_LAPS_SCHEDULING", True)
+    def test_use_laps_prefill_graph_disabled_for_non_full_graph(self):
+        runner = self._build_runner()
+        runner.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+        self.assertFalse(runner._use_laps_prefill_graph())
 
 
 if __name__ == "__main__":

@@ -111,6 +111,33 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.builder.build(1, common_attn_metadata, mock_model)
 
+    @patch('vllm_ascend.attention.attention_v1.AscendMetadata')
+    def test_build_reuses_device_query_start_loc(self, mock_ascend_metadata):
+        device_query_start_loc = torch.tensor([0, 2, 5, 9])
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=device_query_start_loc,
+            query_start_loc_cpu=torch.tensor([0, 2, 5, 9]),
+            seq_lens_cpu=torch.tensor([4, 5, 6]),
+            num_reqs=3,
+            num_actual_tokens=15,
+            max_query_len=6,
+            decode_token_per_req=torch.tensor([1, 1, 1]),
+            block_table_tensor=torch.zeros((10, 10)),
+            slot_mapping=torch.tensor(range(20)),
+            actual_seq_lengths_q=torch.tensor([0, 1, 2]),
+            positions=torch.tensor([10, 10]),
+            attn_state=AscendAttentionState.ChunkedPrefill,
+            num_computed_tokens_cpu=None,
+            seq_lens=None,
+            max_seq_len=6)
+
+        self.builder.build(1, common_attn_metadata, MagicMock())
+
+        self.assertIs(
+            mock_ascend_metadata.call_args.kwargs["query_start_loc"],
+            device_query_start_loc,
+        )
+
 
 class TestAscendAttentionBackendImpl(TestBase):
 

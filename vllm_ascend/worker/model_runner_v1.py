@@ -90,7 +90,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder, AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
 # yapf conflicts with isort for this block
@@ -468,6 +468,19 @@ class NPUModelRunner(GPUModelRunner):
             and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
             and not self.model_config.enforce_eager
         )
+
+    def _use_laps_prefill_graph(self) -> bool:
+        if not envs.VLLM_ASCEND_LAPS_SCHEDULING:
+            return False
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.FULL:
+            return False
+        if self.speculative_config is not None:
+            return False
+        if self.model_config.is_encoder_decoder:
+            return False
+        if self.use_cp:
+            return False
+        return True
 
     def _skip_all_reduce_across_dp_group(self, is_draft_model=False) -> bool:
         """
@@ -2158,7 +2171,19 @@ class NPUModelRunner(GPUModelRunner):
                     num_decode_draft_tokens_cpu=self.num_decode_draft_tokens.cpu[:num_reqs_padded],
                 )
 
-            if for_cudagraph_capture:
+            if (
+                for_cudagraph_capture
+                and self._use_laps_prefill_graph()
+                and isinstance(builder, AscendAttentionMetadataBuilder)
+            ):
+                if hasattr(builder, "build_for_graph_capture"):
+                    attn_metadata_i = builder.build_for_graph_capture(
+                        common_attn_metadata,
+                        attn_state=self.attn_state,
+                    )
+                else:
+                    attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
+            elif for_cudagraph_capture:
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
                 attn_metadata_i = builder.build(
