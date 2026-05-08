@@ -39,6 +39,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
+from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 
 
@@ -54,6 +55,8 @@ class LAPSPrefillGraphState:
     input_buffers: AscendInputBuffers
     query_start_loc_np: np.ndarray
     logits_indices: torch.Tensor
+    slot_mappings: torch.Tensor
+    slot_mappings_by_layer: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             ),
             query_start_loc_np=np.zeros(desc.num_reqs + 1, dtype=np.int32),
             logits_indices=torch.zeros(desc.num_reqs, dtype=torch.int32, device=self.device),
+            slot_mappings=torch.zeros(
+                len(self.vllm_config.kv_cache_config.kv_cache_groups),
+                desc.num_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            ),
         )
         self.laps_prefill_states[desc] = state
         return state
@@ -289,6 +298,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         input_batch.logits_indices = state.logits_indices[: input_batch.logits_indices.shape[0]]
         input_batch.replay_num_reqs = plan.target_num_reqs
         input_batch.replay_num_tokens = plan.target_num_tokens
+        input_batch.replay_desc = desc
         input_batch.replay_max_query_len = int(
             np.max(state.input_buffers.seq_lens_np[: plan.target_num_reqs])
         )
@@ -360,10 +370,29 @@ class ModelAclGraphManager(ModelCudaGraphManager):
 
     def prepare_laps_prefill_replay_slot_mappings(
         self,
-        slot_mappings: torch.Tensor,
+        desc: BatchExecutionDescriptor,
+        block_tables: AscendBlockTables,
+        input_batch: AscendInputBatch,
         kv_cache_config: KVCacheConfig,
     ) -> dict[str, torch.Tensor]:
-        return build_slot_mappings_by_layer(slot_mappings, kv_cache_config)
+        state = self._get_or_create_laps_prefill_state(desc)
+        slot_mappings = block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.replay_query_start_loc
+            if input_batch.replay_query_start_loc is not None
+            else input_batch.query_start_loc,
+            input_batch.positions,
+            num_tokens_padded=input_batch.replay_num_tokens
+            if input_batch.replay_num_tokens is not None
+            else input_batch.num_tokens_after_padding,
+            out=state.slot_mappings,
+        )
+        if state.slot_mappings_by_layer is None:
+            state.slot_mappings_by_layer = build_slot_mappings_by_layer(
+                state.slot_mappings,
+                kv_cache_config,
+            )
+        return state.slot_mappings_by_layer
 
     def capture(
         self,
