@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
@@ -9,6 +10,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.v2.aclgraph_utils import (
+    LAPSPrefillGraphState,
     ModelAclGraphManager,
     PrefillGraphKey,
     prepare_inputs_to_capture,
@@ -45,12 +47,24 @@ class TestAclGraphUtilsV2(unittest.TestCase):
             max_num_tokens=16,
             device=torch.device("cpu"),
         )
+        slot_mappings = torch.full((1, 16), -7, dtype=torch.int32)
+        laps_prefill_state = LAPSPrefillGraphState(
+            desc=BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=4,
+                num_reqs=4,
+            ),
+            input_buffers=buffers,
+            query_start_loc_np=np.zeros(5, dtype=np.int32),
+            logits_indices=torch.zeros(4, dtype=torch.int32),
+            slot_mappings=slot_mappings,
+        )
         block_tables = MagicMock()
         block_tables.cp_size = 1
         block_tables.get_dummy_block_tables.return_value = (torch.zeros((4, 1), dtype=torch.int32),)
-        block_tables.get_dummy_slot_mappings.return_value = torch.zeros((1, 4), dtype=torch.int32)
         attn_groups = [[MagicMock()]]
         kv_cache_config = MagicMock()
+        kv_cache_config.kv_cache_groups = [SimpleNamespace(layer_names=["layer0"])]
 
         model_state = MagicMock()
         model_state.prepare_attn.return_value = {"layer0": "metadata"}
@@ -64,12 +78,16 @@ class TestAclGraphUtilsV2(unittest.TestCase):
             attn_groups=attn_groups,
             kv_cache_config=kv_cache_config,
             use_laps_prefill_graph=True,
+            laps_prefill_state=laps_prefill_state,
         )
 
         self.assertIsInstance(input_batch, AscendInputBatch)
         self.assertEqual(input_batch.attn_state, AscendAttentionState.PrefillNoCache)
         self.assertEqual(attn_metadata, {"layer0": "metadata"})
         self.assertIn("layer0", slot_mappings)
+        self.assertIs(slot_mappings["layer0"], laps_prefill_state.slot_mappings[0])
+        self.assertTrue(torch.all(laps_prefill_state.slot_mappings == -1))
+        block_tables.get_dummy_slot_mappings.assert_not_called()
 
         call_args = model_state.prepare_attn.call_args
         self.assertIs(call_args.args[0], input_batch)
