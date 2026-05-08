@@ -27,6 +27,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -387,6 +388,29 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             else input_batch.num_tokens_after_padding,
             out=state.slot_mappings,
         )
+        del slot_mappings
+        return self._get_or_create_laps_prefill_slot_mappings_by_layer(
+            state,
+            kv_cache_config,
+        )
+
+    def prepare_laps_prefill_capture_slot_mappings(
+        self,
+        desc: BatchExecutionDescriptor,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, torch.Tensor]:
+        state = self._get_or_create_laps_prefill_state(desc)
+        state.slot_mappings.fill_(PAD_SLOT_ID)
+        return self._get_or_create_laps_prefill_slot_mappings_by_layer(
+            state,
+            kv_cache_config,
+        )
+
+    def _get_or_create_laps_prefill_slot_mappings_by_layer(
+        self,
+        state: LAPSPrefillGraphState,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, torch.Tensor]:
         if state.slot_mappings_by_layer is None:
             state.slot_mappings_by_layer = build_slot_mappings_by_layer(
                 state.slot_mappings,
@@ -426,8 +450,10 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 and self._is_laps_prefill_desc(desc)
             )
             capture_input_buffers = input_buffers
+            laps_prefill_state = None
             if use_laps_prefill_graph:
-                capture_input_buffers = self._get_or_create_laps_prefill_state(desc).input_buffers
+                laps_prefill_state = self._get_or_create_laps_prefill_state(desc)
+                capture_input_buffers = laps_prefill_state.input_buffers
             input_batch, attn_metadata, slot_mappings = prepare_inputs_to_capture(
                 num_reqs,
                 num_tokens,
@@ -437,6 +463,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 use_laps_prefill_graph=use_laps_prefill_graph,
+                laps_prefill_state=laps_prefill_state,
             )
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
@@ -511,9 +538,11 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     use_laps_prefill_graph: bool = False,
+    laps_prefill_state: LAPSPrefillGraphState | None = None,
 ) -> tuple[InputBatch, dict[str, Any], dict[str, torch.Tensor]]:
     if use_laps_prefill_graph:
         assert isinstance(input_buffers, AscendInputBuffers)
+        assert laps_prefill_state is not None
         input_batch = AscendInputBatch.make_prefill_dummy(
             num_tokens,
             num_reqs_after_padding=num_reqs,
@@ -523,10 +552,20 @@ def prepare_inputs_to_capture(
         input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
 
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
-    slot_mappings_by_layer = build_slot_mappings_by_layer(
-        slot_mappings, kv_cache_config
-    )
+    if use_laps_prefill_graph:
+        slot_mappings = laps_prefill_state.slot_mappings[:, :num_tokens]
+        laps_prefill_state.slot_mappings.fill_(PAD_SLOT_ID)
+        if laps_prefill_state.slot_mappings_by_layer is None:
+            laps_prefill_state.slot_mappings_by_layer = build_slot_mappings_by_layer(
+                laps_prefill_state.slot_mappings,
+                kv_cache_config,
+            )
+        slot_mappings_by_layer = laps_prefill_state.slot_mappings_by_layer
+    else:
+        slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+        slot_mappings_by_layer = build_slot_mappings_by_layer(
+            slot_mappings, kv_cache_config
+        )
 
     if block_tables.cp_size > 1:
         prepare_dcp_local_seq_lens(
