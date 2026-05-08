@@ -129,6 +129,58 @@ class TestAclGraphUtilsV2(unittest.TestCase):
         self.assertEqual(materialized.replay_query_start_loc_np.tolist(), [0, 2, 4, 4, 8])
         self.assertEqual(materialized.replay_seq_lens_np.tolist(), [2, 2, 0, 4])
 
+    def test_prepare_laps_prefill_replay_slot_mappings_uses_graph_owned_buffer(self):
+        vllm_config = MagicMock()
+        vllm_config.scheduler_config.max_num_seqs = 8
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.compilation_config.cudagraph_capture_sizes = [8]
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+        vllm_config.kv_cache_config.kv_cache_groups = [SimpleNamespace(layer_names=["layer0"])]
+        model_runner = SimpleNamespace(
+            speculative_config=None,
+            model_config=SimpleNamespace(is_encoder_decoder=False),
+            use_dcp=False,
+        )
+
+        with unittest.mock.patch(
+            "vllm_ascend.worker.v2.aclgraph_utils.envs.VLLM_ASCEND_LAPS_SCHEDULING",
+            True,
+        ):
+            manager = ModelAclGraphManager(
+                vllm_config=vllm_config,
+                device=torch.device("cpu"),
+                cudagraph_mode=CUDAGraphMode.FULL,
+                decode_query_len=1,
+                model_runner=model_runner,
+            )
+
+        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=4, num_tokens=8)]
+        state = manager._get_or_create_laps_prefill_state(desc)
+        input_batch = MagicMock()
+        input_batch.idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
+        input_batch.replay_query_start_loc = torch.tensor([0, 2, 4, 4, 8], dtype=torch.int32)
+        input_batch.query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+        input_batch.positions = torch.tensor([10, 11, 12, 13, 0, 0, 0, 0], dtype=torch.int64)
+        input_batch.replay_num_tokens = 8
+        input_batch.num_tokens_after_padding = 8
+
+        block_tables = MagicMock()
+        block_tables.compute_slot_mappings.return_value = state.slot_mappings[:, :8]
+
+        slot_mappings_by_layer = manager.prepare_laps_prefill_replay_slot_mappings(
+            desc,
+            block_tables,
+            input_batch,
+            vllm_config.kv_cache_config,
+        )
+
+        block_tables.compute_slot_mappings.assert_called_once()
+        self.assertIs(
+            block_tables.compute_slot_mappings.call_args.kwargs["out"],
+            state.slot_mappings,
+        )
+        self.assertIs(slot_mappings_by_layer["layer0"], state.slot_mappings[0])
+
     def test_dispatch_laps_prefill_can_pick_padded_target_shape(self):
         vllm_config = MagicMock()
         vllm_config.scheduler_config.max_num_seqs = 8

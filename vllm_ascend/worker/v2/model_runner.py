@@ -37,6 +37,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import set_weight_prefetch_method
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
+from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.sample.sampler import AscendSampler
 from vllm_ascend.worker.v2.spec_decode import init_speculator
@@ -364,12 +365,19 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         block_tables, slot_mappings = super().prepare_attn(input_batch)
         if input_batch.replay_num_reqs is not None:
+            assert isinstance(self.block_tables, AscendBlockTables)
+            assert input_batch.replay_desc is not None
             input_batch.slot_mappings = (
                 self.cudagraph_manager.prepare_laps_prefill_replay_slot_mappings(
-                    slot_mappings,
+                    input_batch.replay_desc,
+                    self.block_tables,
+                    input_batch,
                     self.kv_cache_config,
                 )
             )
+            slot_mappings = self.cudagraph_manager._get_or_create_laps_prefill_state(
+                input_batch.replay_desc
+            ).slot_mappings[:, : input_batch.replay_num_tokens]
         else:
             input_batch.slot_mappings = build_slot_mappings_by_layer(
                 slot_mappings,

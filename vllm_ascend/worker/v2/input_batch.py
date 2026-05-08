@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 
@@ -81,6 +82,7 @@ class AscendInputBatch(InputBatch):
     replay_query_start_loc_np: np.ndarray | None = None
     replay_seq_lens: torch.Tensor | None = None
     replay_seq_lens_np: np.ndarray | None = None
+    replay_desc: BatchExecutionDescriptor | None = None
     attn_metadata: dict[str, Any] | None = None
     slot_mappings: dict[str, torch.Tensor] | None = None
 
