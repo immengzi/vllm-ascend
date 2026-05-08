@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -51,6 +52,18 @@ class PrefillGraphKey:
 class LAPSPrefillGraphState:
     desc: BatchExecutionDescriptor
     input_buffers: AscendInputBuffers
+    query_start_loc_np: np.ndarray
+    logits_indices: torch.Tensor
+
+
+@dataclass(frozen=True)
+class LAPSPrefillReplayPlan:
+    desc: BatchExecutionDescriptor
+    num_reqs: int
+    num_tokens: int
+    target_num_reqs: int
+    target_num_tokens: int
+    right_align: bool = False
 
 
 class ModelAclGraphManager(ModelCudaGraphManager):
@@ -131,6 +144,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 max_num_tokens=desc.num_tokens,
                 device=self.device,
             ),
+            query_start_loc_np=np.zeros(desc.num_reqs + 1, dtype=np.int32),
+            logits_indices=torch.zeros(desc.num_reqs, dtype=torch.int32, device=self.device),
         )
         self.laps_prefill_states[desc] = state
         return state
@@ -178,68 +193,116 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         max_query_len: int,
     ) -> BatchExecutionDescriptor | None:
         del max_query_len
-        key = PrefillGraphKey(num_reqs=num_reqs, num_tokens=num_tokens)
-        desc = self.laps_prefill_descs.get(key)
-        if desc is None or desc not in self.graphs:
-            return None
-        return desc
+        best_desc = None
+        best_key = None
+        for key, desc in self.laps_prefill_descs.items():
+            if desc not in self.graphs:
+                continue
+            if key.num_reqs < num_reqs or key.num_tokens < num_tokens:
+                continue
+            if best_key is None or (key.num_tokens, key.num_reqs) < (
+                best_key.num_tokens,
+                best_key.num_reqs,
+            ):
+                best_key = key
+                best_desc = desc
+        return best_desc
 
-    def materialize_laps_prefill_input_batch(
+    def _build_laps_prefill_replay_plan(
+        self,
+        desc: BatchExecutionDescriptor,
+        input_batch: AscendInputBatch,
+    ) -> LAPSPrefillReplayPlan:
+        assert desc.num_reqs is not None
+        return LAPSPrefillReplayPlan(
+            desc=desc,
+            num_reqs=input_batch.num_reqs,
+            num_tokens=input_batch.num_tokens,
+            target_num_reqs=desc.num_reqs,
+            target_num_tokens=desc.num_tokens,
+            right_align=False,
+        )
+
+    def _update_laps_prefill_replay_inputs(
+        self,
+        state: LAPSPrefillGraphState,
+        plan: LAPSPrefillReplayPlan,
+        input_batch: AscendInputBatch,
+    ) -> None:
+        input_buffers = state.input_buffers
+
+        input_buffers.input_ids[: plan.target_num_tokens].zero_()
+        input_buffers.positions[: plan.target_num_tokens].zero_()
+        input_buffers.input_ids[: plan.num_tokens].copy_(input_batch.input_ids[: plan.num_tokens])
+        input_buffers.positions[: plan.num_tokens].copy_(input_batch.positions[: plan.num_tokens])
+
+        query_start_loc_np = state.query_start_loc_np
+        query_start_loc_np[0] = 0
+        np.cumsum(
+            input_batch.num_scheduled_tokens,
+            out=query_start_loc_np[1 : plan.num_reqs + 1],
+        )
+        if plan.target_num_reqs > plan.num_reqs:
+            query_start_loc_np[plan.num_reqs + 1 : plan.target_num_reqs] = plan.num_tokens
+        query_start_loc_np[plan.target_num_reqs] = plan.target_num_tokens
+        input_buffers.query_start_loc[: plan.target_num_reqs + 1].copy_(
+            torch.from_numpy(query_start_loc_np[: plan.target_num_reqs + 1]).to(
+                device=self.device
+            )
+        )
+
+        replay_seq_lens_np = input_buffers.seq_lens_np
+        replay_seq_lens_np[:plan.target_num_reqs] = np.diff(
+            query_start_loc_np[: plan.target_num_reqs + 1]
+        )
+        input_buffers.seq_lens[: plan.target_num_reqs].copy_(
+            torch.as_tensor(
+                replay_seq_lens_np[:plan.target_num_reqs],
+                dtype=torch.int32,
+                device=self.device,
+            )
+        )
+        input_buffers.seq_lens_cpu[: plan.target_num_reqs].copy_(
+            torch.as_tensor(
+                replay_seq_lens_np[:plan.target_num_reqs],
+                dtype=torch.int32,
+            )
+        )
+
+        state.logits_indices[: input_batch.logits_indices.shape[0]].copy_(
+            input_batch.logits_indices
+        )
+
+    def prepare_laps_prefill_replay_input_batch(
         self,
         desc: BatchExecutionDescriptor,
         input_batch: AscendInputBatch,
     ) -> AscendInputBatch:
         state = self._get_or_create_laps_prefill_state(desc)
-        input_buffers = state.input_buffers
+        plan = self._build_laps_prefill_replay_plan(desc, input_batch)
+        self._update_laps_prefill_replay_inputs(state, plan, input_batch)
 
-        num_tokens = input_batch.num_tokens
-        num_reqs = input_batch.num_reqs
-        num_reqs_after_padding = input_batch.num_reqs_after_padding
-
-        input_buffers.input_ids[:num_tokens].copy_(input_batch.input_ids[:num_tokens])
-        input_buffers.positions[:num_tokens].copy_(input_batch.positions[:num_tokens])
-        input_buffers.seq_lens[:num_reqs_after_padding].copy_(
-            input_batch.seq_lens[:num_reqs_after_padding]
+        input_batch.num_reqs_after_padding = plan.target_num_reqs
+        input_batch.num_tokens_after_padding = plan.target_num_tokens
+        input_batch.input_ids = state.input_buffers.input_ids[: plan.target_num_tokens]
+        input_batch.positions = state.input_buffers.positions[: plan.target_num_tokens]
+        input_batch.logits_indices = state.logits_indices[: input_batch.logits_indices.shape[0]]
+        input_batch.replay_num_reqs = plan.target_num_reqs
+        input_batch.replay_num_tokens = plan.target_num_tokens
+        input_batch.replay_max_query_len = int(
+            np.max(state.input_buffers.seq_lens_np[: plan.target_num_reqs])
         )
-        input_buffers.seq_lens_cpu[:num_reqs_after_padding].copy_(
-            torch.as_tensor(
-                input_batch.seq_lens_np[:num_reqs_after_padding],
-                dtype=torch.int32,
-            )
-        )
-        input_buffers.query_start_loc[: num_reqs_after_padding + 1].copy_(
-            input_batch.query_start_loc[: num_reqs_after_padding + 1]
-        )
-
-        query_start_loc_np = input_batch.query_start_loc_np[: num_reqs_after_padding + 1].copy()
-        seq_lens_np = input_batch.seq_lens_np[:num_reqs_after_padding].copy()
-        input_buffers.seq_lens_np[:num_reqs_after_padding] = seq_lens_np
-
-        return AscendInputBatch(
-            req_ids=input_batch.req_ids,
-            num_reqs=num_reqs,
-            num_reqs_after_padding=num_reqs_after_padding,
-            idx_mapping=input_batch.idx_mapping,
-            idx_mapping_np=input_batch.idx_mapping_np,
-            expanded_idx_mapping=input_batch.expanded_idx_mapping,
-            expanded_local_pos=input_batch.expanded_local_pos,
-            num_scheduled_tokens=input_batch.num_scheduled_tokens,
-            num_tokens=num_tokens,
-            num_tokens_after_padding=input_batch.num_tokens_after_padding,
-            num_draft_tokens=input_batch.num_draft_tokens,
-            query_start_loc=input_buffers.query_start_loc[: num_reqs_after_padding + 1],
-            query_start_loc_np=query_start_loc_np,
-            seq_lens=input_buffers.seq_lens[:num_reqs_after_padding],
-            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
-            input_ids=input_buffers.input_ids[:num_tokens],
-            positions=input_buffers.positions[:num_tokens],
-            logits_indices=input_batch.logits_indices,
-            cu_num_logits=input_batch.cu_num_logits,
-            cu_num_logits_np=input_batch.cu_num_logits_np,
-            has_structured_output_reqs=input_batch.has_structured_output_reqs,
-            seq_lens_np=input_buffers.seq_lens_np[:num_reqs_after_padding],
-            attn_state=input_batch.attn_state,
-        )
+        input_batch.replay_query_start_loc = state.input_buffers.query_start_loc[
+            : plan.target_num_reqs + 1
+        ]
+        input_batch.replay_query_start_loc_np = state.query_start_loc_np[
+            : plan.target_num_reqs + 1
+        ].copy()
+        input_batch.replay_seq_lens = state.input_buffers.seq_lens[: plan.target_num_reqs]
+        input_batch.replay_seq_lens_np = state.input_buffers.seq_lens_np[
+            : plan.target_num_reqs
+        ]
+        return input_batch
 
     def dispatch(
         self,
@@ -272,7 +335,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         logger.info_once(f"run_fullgraph with num_tokens={num_tokens}")
         ret = super().run_fullgraph(desc)
 
-        positions = self.model_runner.input_buffers.positions[:num_tokens]
+        positions = self.model_runner.input_batch.positions[:num_tokens]
         num_tokens_across_dp = torch.full([self.model_runner.dp_size], num_tokens, device=self.device)
         with set_forward_context(
             self.model_runner.input_batch.attn_metadata,
@@ -294,6 +357,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 positions.shape[0],
             )
         return ret
+
+    def prepare_laps_prefill_replay_slot_mappings(
+        self,
+        slot_mappings: torch.Tensor,
+        kv_cache_config: KVCacheConfig,
+    ) -> dict[str, torch.Tensor]:
+        return build_slot_mappings_by_layer(slot_mappings, kv_cache_config)
 
     def capture(
         self,

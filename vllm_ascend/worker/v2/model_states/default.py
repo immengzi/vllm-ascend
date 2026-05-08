@@ -46,36 +46,59 @@ class AscendModelState(DefaultModelState):
         graph_pad_size = -1
         num_input_tokens = input_batch.num_tokens
         attn_state = input_batch.attn_state
+        replay_num_reqs = input_batch.replay_num_reqs
+        replay_num_tokens = input_batch.replay_num_tokens
+        replay_query_start_loc = input_batch.replay_query_start_loc
+        replay_query_start_loc_np = input_batch.replay_query_start_loc_np
+        replay_seq_lens = input_batch.replay_seq_lens
+        replay_seq_lens_np = input_batch.replay_seq_lens_np
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
-            num_reqs = input_batch.num_reqs_after_padding
-            num_tokens = input_batch.num_tokens_after_padding
-            num_input_tokens = input_batch.num_tokens_after_padding
+            num_reqs = replay_num_reqs or input_batch.num_reqs_after_padding
+            num_tokens = replay_num_tokens or input_batch.num_tokens_after_padding
+            num_input_tokens = replay_num_tokens or input_batch.num_tokens_after_padding
             if for_capture:
                 graph_pad_size = input_batch.num_reqs_after_padding
         else:
             # For piecewise cudagraphs and eager, use unpadded sizes.
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
-        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
+        query_start_loc = (
+            replay_query_start_loc
+            if replay_query_start_loc is not None
+            else input_batch.query_start_loc
+        )
+        query_start_loc_np = (
+            replay_query_start_loc_np
+            if replay_query_start_loc_np is not None
+            else input_batch.query_start_loc_np
+        )
+        seq_lens = replay_seq_lens if replay_seq_lens is not None else input_batch.seq_lens
+        seq_lens_np = replay_seq_lens_np if replay_seq_lens_np is not None else input_batch.seq_lens_np
+        query_start_loc_cpu = torch.from_numpy(query_start_loc_np)
+        max_query_len = (
+            input_batch.replay_max_query_len
+            if input_batch.replay_max_query_len is not None
+            else input_batch.num_scheduled_tokens.max().item()
+        )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
-            query_start_loc_gpu=input_batch.query_start_loc,
+            query_start_loc_gpu=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
-            seq_lens=input_batch.seq_lens,
+            seq_lens=seq_lens,
             max_seq_len=self.max_model_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             # extra attributes for ascend npus.
-            seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_np=seq_lens_np,
             attn_state=attn_state,
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
         )
+        input_batch.attn_metadata = attn_metadata
         return attn_metadata

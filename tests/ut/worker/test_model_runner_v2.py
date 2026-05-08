@@ -43,18 +43,18 @@ def test_laps_prefill_capture_descs_are_installed(monkeypatch):
     assert PrefillGraphKey(num_reqs=2, num_tokens=4) in manager.laps_prefill_descs
 
 
-def test_dispatch_laps_prefill_requires_exact_graph_hit(monkeypatch):
+def test_dispatch_laps_prefill_can_select_padded_target_shape(monkeypatch):
     monkeypatch.setattr(
         "vllm_ascend.worker.v2.aclgraph_utils.envs.VLLM_ASCEND_LAPS_SCHEDULING",
         True,
     )
-    manager = _make_manager(max_num_seqs=8, capture_sizes=[4])
-    desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=2, num_tokens=4)]
+    manager = _make_manager(max_num_seqs=8, capture_sizes=[8])
+    desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=2, num_tokens=8)]
 
-    assert manager.dispatch_laps_prefill(2, 4, 2) is None
+    assert manager.dispatch_laps_prefill(2, 6, 4) is None
     manager.graphs[desc] = MagicMock()
-    assert manager.dispatch_laps_prefill(2, 4, 2) == desc
-    assert manager.dispatch_laps_prefill(1, 4, 4) is None
+    assert manager.dispatch_laps_prefill(2, 6, 4) == desc
+    assert manager.dispatch_laps_prefill(3, 6, 4) is None
 
 
 def test_dispatch_falls_back_to_none_when_laps_prefill_hint_misses(monkeypatch):

@@ -23,6 +23,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import (
     combine_sampled_and_draft_tokens,
@@ -351,11 +352,30 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=attn_state,
         )
         if self.cudagraph_manager.is_laps_prefill_desc(batch_desc):
-            self.input_batch = self.cudagraph_manager.materialize_laps_prefill_input_batch(
+            self.input_batch = self.cudagraph_manager.prepare_laps_prefill_replay_input_batch(
                 batch_desc,
                 self.input_batch,
             )
         return self.input_batch
+
+    def prepare_attn(
+        self,
+        input_batch: AscendInputBatch,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        block_tables, slot_mappings = super().prepare_attn(input_batch)
+        if input_batch.replay_num_reqs is not None:
+            input_batch.slot_mappings = (
+                self.cudagraph_manager.prepare_laps_prefill_replay_slot_mappings(
+                    slot_mappings,
+                    self.kv_cache_config,
+                )
+            )
+        else:
+            input_batch.slot_mappings = build_slot_mappings_by_layer(
+                slot_mappings,
+                self.kv_cache_config,
+            )
+        return block_tables, slot_mappings
 
     def postprocess(
         self,
