@@ -5,6 +5,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager, PrefillGraphKey
+from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
@@ -101,3 +102,101 @@ def test_model_runner_execute_model_sets_and_clears_laps_hint(monkeypatch):
     assert result == "ok"
     assert captured["hint"] == (2, 4, 2)
     runner.cudagraph_manager.clear_next_laps_prefill_request.assert_called_once()
+
+
+def test_prepare_attn_replay_asserts_persistent_block_tables(monkeypatch):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.kv_cache_config = MagicMock()
+    runner.block_tables = AscendBlockTables.__new__(AscendBlockTables)
+    runner.block_tables.input_block_tables = [
+        torch.zeros((4, 2), dtype=torch.int32),
+    ]
+    runner.cudagraph_manager = MagicMock()
+    state = MagicMock()
+    state.slot_mappings = torch.zeros((1, 8), dtype=torch.int32)
+    runner.cudagraph_manager._get_or_create_laps_prefill_state.return_value = state
+    runner.cudagraph_manager.prepare_laps_prefill_replay_slot_mappings.return_value = {
+        "layer0": state.slot_mappings[0]
+    }
+
+    input_batch = MagicMock()
+    input_batch.replay_num_reqs = 4
+    input_batch.replay_num_tokens = 8
+    input_batch.replay_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=8,
+        num_reqs=4,
+    )
+
+    persistent_view = runner.block_tables.input_block_tables[0][:4]
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.model_runner.GPUModelRunner.prepare_attn",
+        lambda self, input_batch_arg: ((persistent_view,), torch.zeros((1, 8), dtype=torch.int32)),
+    )
+
+    block_tables, slot_mappings = NPUModelRunner.prepare_attn(runner, input_batch)
+
+    assert block_tables[0].data_ptr() == runner.block_tables.input_block_tables[0].data_ptr()
+    assert block_tables[0].shape[0] == 4
+    assert slot_mappings.data_ptr() == state.slot_mappings.data_ptr()
+
+
+def test_prepare_attn_replay_rejects_non_persistent_block_tables(monkeypatch):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.kv_cache_config = MagicMock()
+    runner.block_tables = AscendBlockTables.__new__(AscendBlockTables)
+    runner.block_tables.input_block_tables = [
+        torch.zeros((4, 2), dtype=torch.int32),
+    ]
+    runner.cudagraph_manager = MagicMock()
+
+    input_batch = MagicMock()
+    input_batch.replay_num_reqs = 4
+    input_batch.replay_num_tokens = 8
+    input_batch.replay_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=8,
+        num_reqs=4,
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.model_runner.GPUModelRunner.prepare_attn",
+        lambda self, input_batch_arg: ((torch.zeros((4, 2), dtype=torch.int32),), torch.zeros((1, 8), dtype=torch.int32)),
+    )
+
+    try:
+        NPUModelRunner.prepare_attn(runner, input_batch)
+    except AssertionError as exc:
+        assert "persistent input_block_tables" in str(exc)
+    else:
+        raise AssertionError("expected replay block_tables address assertion to fire")
+
+
+def test_prepare_attn_replay_rejects_wrong_padded_block_table_shape(monkeypatch):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.kv_cache_config = MagicMock()
+    runner.block_tables = AscendBlockTables.__new__(AscendBlockTables)
+    persistent = torch.zeros((4, 2), dtype=torch.int32)
+    runner.block_tables.input_block_tables = [persistent]
+    runner.cudagraph_manager = MagicMock()
+
+    input_batch = MagicMock()
+    input_batch.replay_num_reqs = 4
+    input_batch.replay_num_tokens = 8
+    input_batch.replay_desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=8,
+        num_reqs=4,
+    )
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.model_runner.GPUModelRunner.prepare_attn",
+        lambda self, input_batch_arg: ((persistent[:2],), torch.zeros((1, 8), dtype=torch.int32)),
+    )
+
+    try:
+        NPUModelRunner.prepare_attn(runner, input_batch)
+    except AssertionError as exc:
+        assert "rows must match the padded target request shape" in str(exc)
+    else:
+        raise AssertionError("expected replay block_tables shape assertion to fire")

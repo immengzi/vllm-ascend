@@ -367,6 +367,20 @@ class NPUModelRunner(GPUModelRunner):
         if input_batch.replay_num_reqs is not None:
             assert isinstance(self.block_tables, AscendBlockTables)
             assert input_batch.replay_desc is not None
+            assert input_batch.replay_num_tokens is not None
+            assert len(block_tables) == len(self.block_tables.input_block_tables)
+            for replay_block_table, persistent_block_table in zip(
+                block_tables,
+                self.block_tables.input_block_tables,
+            ):
+                assert replay_block_table.data_ptr() == persistent_block_table.data_ptr(), (
+                    "LAPS prefill replay expects block_tables to reuse the "
+                    "persistent input_block_tables buffers captured by the graph."
+                )
+                assert replay_block_table.shape[0] == input_batch.replay_num_reqs, (
+                    "LAPS prefill replay block_tables rows must match the padded "
+                    "target request shape."
+                )
             input_batch.slot_mappings = (
                 self.cudagraph_manager.prepare_laps_prefill_replay_slot_mappings(
                     input_batch.replay_desc,
