@@ -17,6 +17,7 @@
 # This file is a part of the vllm-ascend project.
 #
 from dataclasses import asdict, dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -72,6 +73,16 @@ class AscendInputBatch(InputBatch):
     seq_lens_np: np.ndarray
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
+    # Optional replay-time overrides used by LAPS prefill full-graph replay.
+    replay_num_reqs: int | None = None
+    replay_num_tokens: int | None = None
+    replay_max_query_len: int | None = None
+    replay_query_start_loc: torch.Tensor | None = None
+    replay_query_start_loc_np: np.ndarray | None = None
+    replay_seq_lens: torch.Tensor | None = None
+    replay_seq_lens_np: np.ndarray | None = None
+    attn_metadata: dict[str, Any] | None = None
+    slot_mappings: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def make_dummy(
