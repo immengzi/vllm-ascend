@@ -146,6 +146,7 @@ class TestAclGraphUtilsV2(unittest.TestCase):
         self.assertEqual(materialized.replay_query_start_loc.data_ptr(), state.input_buffers.query_start_loc.data_ptr())
         self.assertEqual(materialized.replay_query_start_loc_np.tolist(), [0, 2, 4, 4, 8])
         self.assertEqual(materialized.replay_seq_lens_np.tolist(), [2, 2, 0, 4])
+        self.assertEqual(manager._build_laps_prefill_replay_plan(desc, input_batch).right_align, False)
 
     def test_prepare_laps_prefill_replay_slot_mappings_uses_graph_owned_buffer(self):
         vllm_config = MagicMock()
