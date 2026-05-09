@@ -273,6 +273,127 @@ class TestAclGraphUtilsV2(unittest.TestCase):
         self.assertTrue(torch.equal(build_attn_metadata.call_args.kwargs["seq_lens"],
                                     input_batch.replay_seq_lens))
 
+    def test_ascend_model_state_asserts_replay_attn_metadata_uses_stable_sources(self):
+        replay_query_start_loc = torch.tensor([0, 2, 4, 4, 8], dtype=torch.int32)
+        replay_query_start_loc_np = replay_query_start_loc.numpy()
+        replay_seq_lens = torch.tensor([2, 2, 0, 4], dtype=torch.int32)
+        replay_seq_lens_np = replay_seq_lens.numpy()
+        block_table = torch.arange(8, dtype=torch.int32).view(4, 2)
+        slot_mappings = torch.tensor(
+            [[10, 11, 12, 13, -1, -1, -1, -1]],
+            dtype=torch.int32,
+        )
+
+        metadata = MagicMock()
+        metadata.block_tables = block_table
+        metadata.query_start_loc = replay_query_start_loc
+        metadata.seq_lens = replay_seq_lens
+        metadata.slot_mapping = slot_mappings[0]
+        metadata.seq_lens_list = replay_seq_lens_np.tolist()
+        metadata.actual_seq_lengths_q = replay_query_start_loc_np[1:].tolist()
+
+        input_batch = MagicMock()
+        input_batch.replay_query_start_loc = replay_query_start_loc
+        input_batch.replay_query_start_loc_np = replay_query_start_loc_np
+        input_batch.replay_seq_lens = replay_seq_lens
+        input_batch.replay_seq_lens_np = replay_seq_lens_np
+        input_batch.replay_num_tokens = 8
+
+        AscendModelState._assert_laps_prefill_replay_metadata_sources(
+            input_batch=input_batch,
+            attn_metadata={"layer0": metadata},
+            block_tables=(block_table,),
+            slot_mappings=slot_mappings,
+        )
+
+    def test_ascend_model_state_rejects_replay_attn_metadata_with_unstable_slot_mapping(self):
+        replay_query_start_loc = torch.tensor([0, 2, 4, 4, 8], dtype=torch.int32)
+        replay_query_start_loc_np = replay_query_start_loc.numpy()
+        replay_seq_lens = torch.tensor([2, 2, 0, 4], dtype=torch.int32)
+        replay_seq_lens_np = replay_seq_lens.numpy()
+        block_table = torch.arange(8, dtype=torch.int32).view(4, 2)
+        stable_slot_mappings = torch.tensor(
+            [[10, 11, 12, 13, -1, -1, -1, -1]],
+            dtype=torch.int32,
+        )
+        unstable_slot_mapping = torch.tensor(
+            [10, 11, 12, 13, -1, -1, -1, -1],
+            dtype=torch.int32,
+        )
+
+        metadata = MagicMock()
+        metadata.block_tables = block_table
+        metadata.query_start_loc = replay_query_start_loc
+        metadata.seq_lens = replay_seq_lens
+        metadata.slot_mapping = unstable_slot_mapping
+        metadata.seq_lens_list = replay_seq_lens_np.tolist()
+        metadata.actual_seq_lengths_q = replay_query_start_loc_np[1:].tolist()
+
+        input_batch = MagicMock()
+        input_batch.replay_query_start_loc = replay_query_start_loc
+        input_batch.replay_query_start_loc_np = replay_query_start_loc_np
+        input_batch.replay_seq_lens = replay_seq_lens
+        input_batch.replay_seq_lens_np = replay_seq_lens_np
+        input_batch.replay_num_tokens = 8
+
+        with self.assertRaisesRegex(AssertionError, "slot_mapping"):
+            AscendModelState._assert_laps_prefill_replay_metadata_sources(
+                input_batch=input_batch,
+                attn_metadata={"layer0": metadata},
+                block_tables=(block_table,),
+                slot_mappings=stable_slot_mappings,
+            )
+
+    def test_prepare_attn_replay_rejects_unstable_metadata_from_builder(self):
+        state = AscendModelState.__new__(AscendModelState)
+        state.max_model_len = 1024
+
+        input_batch = MagicMock()
+        input_batch.num_tokens = 4
+        input_batch.num_reqs = 2
+        input_batch.num_reqs_after_padding = 4
+        input_batch.num_tokens_after_padding = 8
+        input_batch.attn_state = AscendAttentionState.PrefillNoCache
+        input_batch.num_scheduled_tokens = torch.tensor([2, 2], dtype=torch.int32).numpy()
+        input_batch.query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+        input_batch.query_start_loc_np = torch.tensor([0, 2, 4], dtype=torch.int32).numpy()
+        input_batch.seq_lens = torch.tensor([2, 2], dtype=torch.int32)
+        input_batch.seq_lens_np = torch.tensor([2, 2], dtype=torch.int32).numpy()
+        input_batch.dcp_local_seq_lens = None
+        input_batch.replay_num_reqs = 4
+        input_batch.replay_num_tokens = 8
+        input_batch.replay_max_query_len = 4
+        input_batch.replay_query_start_loc = torch.tensor([0, 2, 4, 4, 8], dtype=torch.int32)
+        input_batch.replay_query_start_loc_np = torch.tensor([0, 2, 4, 4, 8], dtype=torch.int32).numpy()
+        input_batch.replay_seq_lens = torch.tensor([2, 2, 0, 4], dtype=torch.int32)
+        input_batch.replay_seq_lens_np = torch.tensor([2, 2, 0, 4], dtype=torch.int32).numpy()
+
+        stable_block_table = torch.zeros((4, 1), dtype=torch.int32)
+        stable_slot_mappings = torch.zeros((1, 8), dtype=torch.int32)
+
+        bad_metadata = MagicMock()
+        bad_metadata.block_tables = stable_block_table
+        bad_metadata.query_start_loc = input_batch.replay_query_start_loc
+        bad_metadata.seq_lens = input_batch.replay_seq_lens
+        bad_metadata.slot_mapping = torch.zeros(8, dtype=torch.int32)
+        bad_metadata.seq_lens_list = input_batch.replay_seq_lens_np.tolist()
+        bad_metadata.actual_seq_lengths_q = input_batch.replay_query_start_loc_np[1:].tolist()
+
+        with unittest.mock.patch(
+            "vllm_ascend.worker.v2.model_states.default.build_attn_metadata",
+            return_value={"layer0": bad_metadata},
+        ):
+            with self.assertRaisesRegex(AssertionError, "slot_mapping"):
+                AscendModelState.prepare_attn(
+                    state,
+                    input_batch=input_batch,
+                    cudagraph_mode=CUDAGraphMode.FULL,
+                    block_tables=(stable_block_table,),
+                    slot_mappings=stable_slot_mappings,
+                    attn_groups=[[MagicMock()]],
+                    kv_cache_config=MagicMock(),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
