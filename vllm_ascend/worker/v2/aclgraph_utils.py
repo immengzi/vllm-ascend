@@ -224,6 +224,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         input_batch: AscendInputBatch,
     ) -> LAPSPrefillReplayPlan:
         assert desc.num_reqs is not None
+        # Ascend's prefill attention path already uses packed TND + sparse_mode=3
+        # causal semantics, so we keep replay left-packed and only pad the tail.
         return LAPSPrefillReplayPlan(
             desc=desc,
             num_reqs=input_batch.num_reqs,
