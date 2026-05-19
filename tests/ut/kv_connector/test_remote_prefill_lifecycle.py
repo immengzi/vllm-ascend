@@ -439,6 +439,37 @@ def test_recompute_scheduler_applies_laps_budgeting(monkeypatch):
     assert waiting._last_short_reserved_tokens == 256
     assert waiting._last_short_actual_used_tokens == 64
     assert waiting._last_long_actual_used_tokens == 768
+    assert waiting._dispatch_counters == {"immediate": 0, "short": 1, "long": 1}
+    assert waiting._remove_counters == {"immediate": 0, "short": 0, "long": 0}
+
+
+def test_recompute_scheduler_tracks_laps_removals_for_blocked_waiting(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_WAIT_WINDOW_MS", "0")
+
+    vllm_config = create_vllm_config()
+    base_scheduler = create_scheduler(vllm_config)
+    scheduler = RecomputeScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        log_stats=True,
+        block_size=vllm_config.cache_config.block_size,
+        structured_output_manager=base_scheduler.structured_output_manager,
+    )
+
+    blocked_request = create_request(request_id=21, num_tokens=64, do_remote_prefill=True)
+    blocked_request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+
+    scheduler.add_request(blocked_request)
+    output = scheduler.schedule()
+
+    waiting = scheduler.waiting
+    assert isinstance(waiting, LAPSRequestQueue)
+    assert output.num_scheduled_tokens == {}
+    assert waiting._dispatch_counters == {"immediate": 0, "short": 0, "long": 0}
+    assert waiting._remove_counters == {"immediate": 0, "short": 1, "long": 0}
+    assert blocked_request in scheduler.skipped_waiting
 
 
 def test_recompute_scheduler_long_prefill_cap_does_not_limit_short_prefill(monkeypatch):

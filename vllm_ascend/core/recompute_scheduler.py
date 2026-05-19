@@ -536,6 +536,11 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                 if request_queue is None:
                     break
 
+                # skipped_waiting is not owned by LAPSRequestQueue, so only route
+                # pops through LAPS when the selected queue is one of its subqueues.
+                count_with_laps = (
+                    laps_waiting is not None and request_queue in laps_waiting._queues()
+                )
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
@@ -548,7 +553,12 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    if count_with_laps:
+                        laps_waiting.pop_request_from_queue(
+                            request_queue, count_as_removal=True
+                        )
+                    else:
+                        request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -563,7 +573,12 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    if count_with_laps:
+                        laps_waiting.pop_request_from_queue(
+                            request_queue, count_as_removal=True
+                        )
+                    else:
+                        request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -598,7 +613,12 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            if count_with_laps:
+                                laps_waiting.pop_request_from_queue(
+                                    request_queue, count_as_removal=True
+                                )
+                            else:
+                                request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -755,7 +775,10 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                             preempted=request.num_preemptions > 0,
                         )
 
-                request = request_queue.pop_request()
+                if count_with_laps:
+                    request = laps_waiting.pop_request_from_queue(request_queue)
+                else:
+                    request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
