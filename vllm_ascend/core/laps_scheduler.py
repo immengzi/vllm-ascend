@@ -77,6 +77,7 @@ class LAPSRequestQueue(RequestQueue):
         self._last_long_actual_used_tokens = 0
         self._debug_logging_enabled = logger.isEnabledFor(logging.DEBUG)
         self._force_immediate_request_ids: set[str] = set()
+        self._queue_index: dict[str, RequestQueue] = {}
 
     def _queues(self) -> tuple[RequestQueue, ...]:
         return (self._immediate_queue, self._short_queue, self._long_queue)
@@ -308,6 +309,7 @@ class LAPSRequestQueue(RequestQueue):
     def add_request(self, request: Request) -> None:
         queue = self._classify_queue(request)
         queue.add_request(request)
+        self._queue_index[request.request_id] = queue
         self._enqueue_counters[self._queue_name(queue)] += 1
         if queue is not self._immediate_queue:
             self._force_immediate_request_ids.discard(request.request_id)
@@ -326,6 +328,7 @@ class LAPSRequestQueue(RequestQueue):
         self, queue: RequestQueue, *, count_as_removal: bool = False
     ) -> Request:
         request = queue.pop_request()
+        self._queue_index.pop(request.request_id, None)
         if count_as_removal:
             self._remove_counters[self._queue_name(queue)] += 1
             event_name = "remove"
@@ -350,6 +353,7 @@ class LAPSRequestQueue(RequestQueue):
             self._force_immediate_request_ids.add(request.request_id)
         queue = self._classify_queue(request, force_immediate=force_immediate)
         queue.prepend_request(request)
+        self._queue_index[request.request_id] = queue
         self._enqueue_counters[self._queue_name(queue)] += 1
         if queue is self._short_queue:
             self._on_short_queue_changed()
@@ -361,36 +365,40 @@ class LAPSRequestQueue(RequestQueue):
             self.prepend_request(cast(Request, request))
 
     def remove_request(self, request: Request) -> None:
-        for queue in self._queues():
-            matched_request = self._find_matching_request(queue, request)
-            if matched_request is not None:
-                queue.remove_request(matched_request)
-                self._force_immediate_request_ids.discard(request.request_id)
-                self._remove_counters[self._queue_name(queue)] += 1
-                if queue is self._short_queue:
-                    self._on_short_queue_changed()
-                self._debug_state("remove", request=matched_request, queue=queue)
-                self._maybe_log_stats()
-                return
-        raise ValueError("request not found in LAPS queue")
+        queue = self._queue_index.get(request.request_id)
+        if queue is None:
+            raise ValueError("request not found in LAPS queue")
+        matched_request = self._find_matching_request(queue, request)
+        if matched_request is None:
+            raise ValueError("request not found in LAPS queue")
+        queue.remove_request(matched_request)
+        self._queue_index.pop(request.request_id, None)
+        self._force_immediate_request_ids.discard(request.request_id)
+        self._remove_counters[self._queue_name(queue)] += 1
+        if queue is self._short_queue:
+            self._on_short_queue_changed()
+        self._debug_state("remove", request=matched_request, queue=queue)
+        self._maybe_log_stats()
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         queue_to_requests: dict[int, list[Request]] = {}
-        queue_map = {id(queue): queue for queue in self._queues()}
+        queue_map = {id(q): q for q in self._queues()}
         removed_count = 0
         for request in requests:
-            for queue in self._queues():
-                matched_request = self._find_matching_request(queue, request)
-                if matched_request is not None:
-                    queue_to_requests.setdefault(id(queue), []).append(matched_request)
-                    break
+            queue = self._queue_index.get(request.request_id)
+            if queue is None:
+                continue
+            matched_request = self._find_matching_request(queue, request)
+            if matched_request is not None:
+                queue_to_requests.setdefault(id(queue), []).append(matched_request)
         for queue_id, matched_requests in queue_to_requests.items():
             removed_count += len(matched_requests)
             queue = queue_map[queue_id]
             self._remove_counters[self._queue_name(queue)] += len(matched_requests)
             queue.remove_requests(matched_requests)
-            for request in matched_requests:
-                self._force_immediate_request_ids.discard(request.request_id)
+            for matched in matched_requests:
+                self._queue_index.pop(matched.request_id, None)
+                self._force_immediate_request_ids.discard(matched.request_id)
         self._on_short_queue_changed()
         if removed_count:
             self._debug_state("remove_batch", extra=f"count={removed_count}")
@@ -412,10 +420,8 @@ class LAPSRequestQueue(RequestQueue):
         yield from self._long_queue
 
     def __contains__(self, request: object) -> bool:
-        return any(
-            self._find_matching_request(queue, request) is not None
-            for queue in self._queues()
-        )
+        request_id = self._request_id(request)
+        return request_id is not None and request_id in self._queue_index
 
 
 class LAPSSchedulerMixin:
