@@ -22,7 +22,6 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import Callable, cast
 
 from vllm.logger import logger
-from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import (
@@ -33,9 +32,12 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request
 from vllm.v1.request import RequestStatus
-from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend import envs
+from vllm_ascend.core.schedule_template import (
+    AscendScheduleStepState,
+    AscendSchedulerTemplateMixin,
+)
 
 
 class LAPSRequestQueue(RequestQueue):
@@ -424,7 +426,127 @@ class LAPSRequestQueue(RequestQueue):
         return request_id is not None and request_id in self._queue_index
 
 
-class LAPSSchedulerMixin:
+class LAPSBudgetContext:
+    """Per-step LAPS budget tracker.
+
+    Consolidates the short/long token budget bookkeeping so that both
+    ``LAPSScheduler`` and ``RecomputeScheduler`` can share the same logic
+    through a handful of method calls instead of duplicating it inline.
+    """
+
+    __slots__ = (
+        "_mixin",
+        "short_reserved_tokens",
+        "long_capped_count",
+        "short_actual_used_tokens",
+        "long_actual_used_tokens",
+        "long_budget_remaining",
+        "capped_scheduled_req_ids",
+    )
+
+    def __init__(self, mixin: LAPSSchedulerMixin, token_budget: int) -> None:
+        self._mixin = mixin
+        self.short_reserved_tokens = mixin._laps_short_reserved_tokens(token_budget)
+        self.long_capped_count = 0
+        self.short_actual_used_tokens = 0
+        self.long_actual_used_tokens = 0
+        self.long_budget_remaining = mixin._compute_long_budget_remaining(
+            token_budget, self.short_reserved_tokens, 0
+        )
+        self.capped_scheduled_req_ids: set[str] = set()
+
+    def adjust_tokens(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        token_budget: int,
+        num_computed_tokens: int | None = None,
+    ) -> tuple[int, bool]:
+        """Apply long-prefill cap and budget limit.
+
+        Returns ``(adjusted_num_new_tokens, was_capped)``.
+        """
+        m = self._mixin
+        num_new_tokens, was_capped = m._apply_long_prefill_cap(
+            request, num_new_tokens, num_computed_tokens,
+        )
+        self.long_budget_remaining = m._compute_long_budget_remaining(
+            token_budget, self.short_reserved_tokens, self.short_actual_used_tokens,
+        )
+        num_new_tokens = m._apply_long_budget_limit(
+            request, num_new_tokens, self.long_budget_remaining,
+            num_computed_tokens,
+        )
+        return num_new_tokens, was_capped
+
+    def recover_zero_budget(
+        self,
+        request: Request,
+        token_budget: int,
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        """Handle the edge case where budget limit reduces tokens to zero.
+
+        Returns ``(num_new_tokens, should_break)``.  Long prefills cannot
+        make progress with zero tokens, so the caller should break.
+        Short prefills fall back to the remaining ``token_budget``.
+        """
+        if self._mixin._is_long_prefill_request(request, num_computed_tokens):
+            return 0, True
+        return min(
+            request.num_tokens - num_computed_tokens, token_budget
+        ), False
+
+    def record_scheduled(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        was_capped: bool,
+        num_computed_tokens: int | None = None,
+    ) -> None:
+        """Book-keep a successfully scheduled request."""
+        m = self._mixin
+        if was_capped:
+            self.capped_scheduled_req_ids.add(request.request_id)
+            self.long_capped_count += 1
+        if m._is_long_prefill_request(request, num_computed_tokens):
+            self.long_budget_remaining -= num_new_tokens
+        self.short_actual_used_tokens, self.long_actual_used_tokens = (
+            m._record_laps_step_usage(
+                request,
+                num_new_tokens,
+                short_actual_used_tokens=self.short_actual_used_tokens,
+                long_actual_used_tokens=self.long_actual_used_tokens,
+                num_computed_tokens=num_computed_tokens,
+            )
+        )
+
+    def rollback_scheduled(self, request: Request, released_tokens: int) -> None:
+        """Reverse book-keeping when a request is preempted or recomputed."""
+        m = self._mixin
+        if m._is_long_prefill_request(request):
+            self.long_budget_remaining += released_tokens
+        req_id = request.request_id
+        if req_id in self.capped_scheduled_req_ids:
+            self.capped_scheduled_req_ids.discard(req_id)
+            self.long_capped_count -= 1
+        if m._is_short_prefill_request(request):
+            self.short_actual_used_tokens -= released_tokens
+        elif m._is_long_prefill_request(request):
+            self.long_actual_used_tokens -= released_tokens
+
+    def finalize(self, laps_waiting: LAPSRequestQueue) -> None:
+        """Record end-of-step statistics."""
+        laps_waiting.record_schedule_step_stats(
+            long_capped_count=self.long_capped_count,
+            short_reserved_tokens=self.short_reserved_tokens,
+            short_actual_used_tokens=self.short_actual_used_tokens,
+            long_actual_used_tokens=self.long_actual_used_tokens,
+        )
+        laps_waiting._maybe_log_stats()
+
+
+class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
     """Inject a LAPS-style waiting queue into vLLM's scheduler."""
 
     laps_long_prefill_cap: int = 0
@@ -638,6 +760,108 @@ class LAPSSchedulerMixin:
             waiting.mark_force_immediate(request.request_id)
         super()._preempt_request(request, timestamp)
 
+    def _make_step_state(
+        self,
+        token_budget: int,
+        scheduled_timestamp: float,
+    ) -> AscendScheduleStepState:
+        state = super()._make_step_state(token_budget, scheduled_timestamp)
+        if self._laps_long_budgeting_enabled():
+            state.laps_ctx = LAPSBudgetContext(self, token_budget)
+        return state
+
+    def _adjust_running_num_new_tokens(
+        self,
+        state: AscendScheduleStepState,
+        request: Request,
+        num_new_tokens: int,
+    ) -> tuple[int, bool]:
+        if state.laps_ctx is None:
+            return min(num_new_tokens, state.token_budget), False
+        return state.laps_ctx.adjust_tokens(request, num_new_tokens, state.token_budget)
+
+    def _should_break_for_non_chunked_waiting_prefill(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        token_budget: int,
+        num_computed_tokens: int,
+    ) -> bool:
+        if self._laps_long_budgeting_enabled():
+            return False
+        return super()._should_break_for_non_chunked_waiting_prefill(
+            request, num_new_tokens, token_budget, num_computed_tokens
+        )
+
+    def _adjust_waiting_num_new_tokens(
+        self,
+        state: AscendScheduleStepState,
+        request: Request,
+        num_new_tokens: int,
+        num_computed_tokens: int,
+    ) -> tuple[int, bool, bool]:
+        if state.laps_ctx is None:
+            return min(num_new_tokens, state.token_budget), False, False
+        num_new_tokens, was_capped = state.laps_ctx.adjust_tokens(
+            request,
+            num_new_tokens,
+            state.token_budget,
+            num_computed_tokens=num_computed_tokens,
+        )
+        if num_new_tokens != 0:
+            return num_new_tokens, was_capped, False
+        num_new_tokens, should_break = state.laps_ctx.recover_zero_budget(
+            request,
+            state.token_budget,
+            num_computed_tokens,
+        )
+        return num_new_tokens, was_capped, should_break
+
+    def _pop_waiting_request_for_schedule(
+        self,
+        request_queue: RequestQueue,
+        *,
+        count_as_removal: bool = False,
+    ) -> Request:
+        laps_waiting = self._laps_waiting_queue()
+        if laps_waiting is not None and request_queue in laps_waiting._queues():
+            return laps_waiting.pop_request_from_queue(
+                request_queue, count_as_removal=count_as_removal
+            )
+        return super()._pop_waiting_request_for_schedule(
+            request_queue, count_as_removal=count_as_removal
+        )
+
+    def _record_scheduled_request(
+        self,
+        state: AscendScheduleStepState,
+        request: Request,
+        num_new_tokens: int,
+        num_computed_tokens: int | None = None,
+        was_capped: bool = False,
+    ) -> None:
+        if state.laps_ctx is not None:
+            state.laps_ctx.record_scheduled(
+                request,
+                num_new_tokens,
+                was_capped,
+                num_computed_tokens=num_computed_tokens,
+            )
+
+    def _rollback_scheduled_request(
+        self,
+        state: AscendScheduleStepState,
+        request: Request,
+        released_tokens: int,
+    ) -> None:
+        if state.laps_ctx is not None:
+            state.laps_ctx.rollback_scheduled(request, released_tokens)
+
+    def _finalize_step_state(self, state: AscendScheduleStepState) -> None:
+        laps_waiting = self._laps_waiting_queue()
+        if laps_waiting is not None and state.laps_ctx is not None:
+            state.laps_ctx.finalize(laps_waiting)
+
 
 from vllm.v1.core.sched.scheduler import Scheduler as BaseScheduler
 
@@ -667,573 +891,7 @@ class LAPSScheduler(LAPSSchedulerMixin, BaseScheduler):
                     long_actual_used_tokens=long_actual_used_tokens,
                 )
             return scheduler_output
-
-        scheduled_new_reqs: list[Request] = []
-        scheduled_resumed_reqs: list[Request] = []
-        scheduled_running_reqs: list[Request] = []
-        preempted_reqs: list[Request] = []
-
-        req_to_new_blocks = {}
-        num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
-            token_budget = 0
-
-        scheduled_encoder_inputs: dict[str, list[int]] = {}
-        encoder_compute_budget = self.max_num_encoder_input_tokens
-        scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-
-        scheduled_timestamp = time.monotonic()
-
-        short_reserved_tokens = self._laps_short_reserved_tokens(token_budget)
-        long_capped_count = 0
-        short_actual_used_tokens = 0
-        long_actual_used_tokens = 0
-        long_budget_remaining = self._compute_long_budget_remaining(
-            token_budget,
-            short_reserved_tokens,
-            short_actual_used_tokens,
-        )
-        capped_scheduled_req_ids: set[str] = set()
-
-        self.kv_cache_manager.new_step_starts()
-
-        req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
-            request = self.running[req_index]
-
-            if (
-                request.num_output_placeholders > 0
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
-            ):
-                req_index += 1
-                continue
-
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens, was_long_capped = self._apply_long_prefill_cap(
-                request, num_new_tokens
-            )
-            long_budget_remaining = self._compute_long_budget_remaining(
-                token_budget,
-                short_reserved_tokens,
-                short_actual_used_tokens,
-            )
-            num_new_tokens = self._apply_long_budget_limit(
-                request, num_new_tokens, long_budget_remaining
-            )
-            num_new_tokens = min(num_new_tokens, token_budget)
-
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
-
-            encoder_inputs_to_schedule = None
-            external_load_encoder_input: list[int] = []
-            new_encoder_compute_budget = encoder_compute_budget
-            if request.has_encoder_inputs:
-                (
-                    encoder_inputs_to_schedule,
-                    num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = self._try_schedule_encoder_inputs(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
-                )
-
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
-                )
-
-            if num_new_tokens == 0:
-                req_index += 1
-                continue
-
-            with record_function_or_nullcontext("schedule: allocate_slots"):
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
-                    )
-
-                    if new_blocks is not None:
-                        break
-
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            released_tokens = num_scheduled_tokens.pop(preempted_req_id)
-                            token_budget += released_tokens
-                            if self._is_long_prefill_request(preempted_req):
-                                long_budget_remaining += released_tokens
-                            if preempted_req_id in capped_scheduled_req_ids:
-                                capped_scheduled_req_ids.remove(preempted_req_id)
-                                long_capped_count -= 1
-                            if self._is_short_prefill_request(preempted_req):
-                                short_actual_used_tokens -= released_tokens
-                            elif self._is_long_prefill_request(preempted_req):
-                                long_actual_used_tokens -= released_tokens
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
-
-                    self._preempt_request(preempted_req, scheduled_timestamp)
-                    preempted_reqs.append(preempted_req)
-                    if preempted_req == request:
-                        break
-
-            if new_blocks is None:
-                break
-
-            scheduled_running_reqs.append(request)
-            request_id = request.request_id
-            req_to_new_blocks[request_id] = new_blocks
-            num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
-            if was_long_capped:
-                capped_scheduled_req_ids.add(request_id)
-                long_capped_count += 1
-            if self._is_long_prefill_request(request):
-                long_budget_remaining -= num_new_tokens
-            (
-                short_actual_used_tokens,
-                long_actual_used_tokens,
-            ) = self._record_laps_step_usage(
-                request,
-                num_new_tokens,
-                short_actual_used_tokens=short_actual_used_tokens,
-                long_actual_used_tokens=long_actual_used_tokens,
-            )
-            req_index += 1
-
-            if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
-                )
-                if num_scheduled_spec_tokens > 0:
-                    spec_token_ids = request.spec_token_ids
-                    if len(spec_token_ids) > num_scheduled_spec_tokens:
-                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
-                request.spec_token_ids = []
-
-            if encoder_inputs_to_schedule:
-                scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-                encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-
-        scheduled_loras: set[int] = set()
-        if self.lora_config:
-            scheduled_loras = set(
-                req.lora_request.lora_int_id
-                for req in scheduled_running_reqs
-                if req.lora_request and req.lora_request.lora_int_id > 0
-            )
-            assert len(scheduled_loras) <= self.lora_config.max_loras
-
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
-
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
-                    break
-
-                request_queue = self._select_waiting_queue_for_scheduling()
-                if request_queue is None:
-                    break
-
-                request = request_queue.peek_request()
-                request_id = request.request_id
-
-                if self._is_blocked_waiting_status(
-                    request.status
-                ) and not self._try_promote_blocked_waiting_request(request):
-                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
-                        logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request_id,
-                        )
-                    if laps_waiting is not None:
-                        laps_waiting.pop_request_from_queue(
-                            request_queue, count_as_removal=True
-                        )
-                    else:
-                        request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                if (
-                    self.lora_config
-                    and request.lora_request
-                    and (
-                        len(scheduled_loras) == self.lora_config.max_loras
-                        and request.lora_request.lora_int_id not in scheduled_loras
-                    )
-                ):
-                    if laps_waiting is not None:
-                        laps_waiting.pop_request_from_queue(
-                            request_queue, count_as_removal=True
-                        )
-                    else:
-                        request_queue.pop_request()
-                    step_skipped_waiting.prepend_request(request)
-                    continue
-
-                num_external_computed_tokens = 0
-                load_kv_async = False
-                connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
-
-                if request.num_computed_tokens == 0:
-                    new_computed_blocks, num_new_local_computed_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(request)
-                    )
-
-                    if self.connector is not None:
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
-                            )
-                        )
-
-                        if ext_tokens is None:
-                            if laps_waiting is not None:
-                                laps_waiting.pop_request_from_queue(
-                                    request_queue, count_as_removal=True
-                                )
-                            else:
-                                request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-
-                        request.num_external_computed_tokens = ext_tokens
-                        num_external_computed_tokens = ext_tokens
-
-                        connector_prefix_cache_queries = (
-                            request.num_tokens - num_new_local_computed_tokens
-                        )
-                        connector_prefix_cache_hits = num_external_computed_tokens
-
-                    num_computed_tokens = (
-                        num_new_local_computed_tokens + num_external_computed_tokens
-                    )
-                    assert num_computed_tokens <= request.num_tokens
-                else:
-                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
-                    num_new_local_computed_tokens = 0
-                    num_computed_tokens = request.num_computed_tokens
-
-                encoder_inputs_to_schedule = None
-                external_load_encoder_input = []
-                new_encoder_compute_budget = encoder_compute_budget
-                was_long_capped = False
-
-                if load_kv_async:
-                    assert num_external_computed_tokens > 0
-                    num_new_tokens = 0
-                else:
-                    num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
-                    num_new_tokens, was_long_capped = self._apply_long_prefill_cap(
-                        request,
-                        num_new_tokens,
-                        num_computed_tokens=num_computed_tokens,
-                    )
-
-                    long_budget_remaining = self._compute_long_budget_remaining(
-                        token_budget,
-                        short_reserved_tokens,
-                        short_actual_used_tokens,
-                    )
-                    if (
-                        not self.scheduler_config.enable_chunked_prefill
-                        and not self._laps_long_budgeting_enabled()
-                        and num_new_tokens > token_budget
-                    ):
-                        break
-
-                    num_new_tokens = self._apply_long_budget_limit(
-                        request,
-                        num_new_tokens,
-                        long_budget_remaining,
-                        num_computed_tokens=num_computed_tokens,
-                    )
-                    if num_new_tokens == 0:
-                        if self._is_long_prefill_request(
-                            request, num_computed_tokens=num_computed_tokens
-                        ):
-                            break
-                        num_new_tokens = min(request.num_tokens - num_computed_tokens, token_budget)
-                    num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
-
-                    if request.has_encoder_inputs:
-                        (
-                            encoder_inputs_to_schedule,
-                            num_new_tokens,
-                            new_encoder_compute_budget,
-                            external_load_encoder_input,
-                        ) = self._try_schedule_encoder_inputs(
-                            request,
-                            num_computed_tokens,
-                            num_new_tokens,
-                            encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
-                        )
-                        if num_new_tokens == 0:
-                            break
-
-                if self.need_mamba_block_aligned_split:
-                    num_new_tokens = self._mamba_block_aligned_split(
-                        request,
-                        num_new_tokens,
-                        num_new_local_computed_tokens,
-                        num_external_computed_tokens,
-                    )
-                    if num_new_tokens == 0:
-                        break
-
-                effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
-                )
-
-                num_encoder_tokens = 0
-                if (
-                    self.is_encoder_decoder
-                    and request.has_encoder_inputs
-                    and encoder_inputs_to_schedule
-                ):
-                    num_encoder_tokens = sum(
-                        request.get_num_encoder_embeds(i)
-                        for i in encoder_inputs_to_schedule
-                    )
-
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
-
-                if new_blocks is None:
-                    if request.has_encoder_inputs:
-                        self.encoder_cache_manager.free(request)
-                    break
-
-                if self.connector is not None:
-                    self.connector.update_state_after_alloc(
-                        request,
-                        self.kv_cache_manager.get_blocks(request_id),
-                        num_external_computed_tokens,
-                    )
-                    if (
-                        self.connector_prefix_cache_stats is not None
-                        and connector_prefix_cache_queries != 0
-                    ):
-                        self.connector_prefix_cache_stats.record(
-                            num_tokens=connector_prefix_cache_queries,
-                            num_hits=connector_prefix_cache_hits,
-                            preempted=request.num_preemptions > 0,
-                        )
-
-                if laps_waiting is not None:
-                    request = laps_waiting.pop_request_from_queue(request_queue)
-                else:
-                    request = request_queue.pop_request()
-                if load_kv_async:
-                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-                    step_skipped_waiting.prepend_request(request)
-                    request.num_computed_tokens = num_computed_tokens
-                    continue
-
-                self.running.append(request)
-                if self.log_stats:
-                    request.record_event(
-                        EngineCoreEventType.SCHEDULED, scheduled_timestamp
-                    )
-                if request.status == RequestStatus.WAITING:
-                    scheduled_new_reqs.append(request)
-                elif request.status == RequestStatus.PREEMPTED:
-                    scheduled_resumed_reqs.append(request)
-                else:
-                    raise RuntimeError(f"Invalid request status: {request.status}")
-
-                if self.lora_config and request.lora_request:
-                    scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
-                )
-                num_scheduled_tokens[request_id] = num_new_tokens
-                token_budget -= num_new_tokens
-                if self._is_long_prefill_request(
-                    request, num_computed_tokens=num_computed_tokens
-                ):
-                    long_budget_remaining -= num_new_tokens
-                if was_long_capped:
-                    long_capped_count += 1
-                (
-                    short_actual_used_tokens,
-                    long_actual_used_tokens,
-                ) = self._record_laps_step_usage(
-                    request,
-                    num_new_tokens,
-                    short_actual_used_tokens=short_actual_used_tokens,
-                    long_actual_used_tokens=long_actual_used_tokens,
-                    num_computed_tokens=num_computed_tokens,
-                )
-                request.status = RequestStatus.RUNNING
-                request.num_computed_tokens = num_computed_tokens
-                if request.num_cached_tokens < 0:
-                    request.num_cached_tokens = num_computed_tokens
-                if encoder_inputs_to_schedule:
-                    scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                    for i in encoder_inputs_to_schedule:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
-                    encoder_compute_budget = new_encoder_compute_budget
-                if external_load_encoder_input:
-                    for i in external_load_encoder_input:
-                        self.encoder_cache_manager.allocate(request, i)
-                        if self.ec_connector is not None:
-                            self.ec_connector.update_state_after_alloc(request, i)
-
-            if step_skipped_waiting:
-                self.skipped_waiting.prepend_requests(step_skipped_waiting)
-
-        total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
-
-        assert token_budget >= 0
-        assert len(self.running) <= self.max_num_running_reqs
-        assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
-            scheduled_running_reqs
-        ) <= len(self.running)
-
-        num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
-        with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
-            if self.running:
-                any_request_id = self.running[0].request_id
-                num_common_prefix_blocks = (
-                    self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
-                )
-
-        if self.use_v2_model_runner:
-            scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
-            scheduled_resumed_reqs = []
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
-                )
-                for req in scheduled_new_reqs
-            ]
-        else:
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
-                )
-                for req in scheduled_new_reqs
-            ]
-
-        with record_function_or_nullcontext("schedule: make_cached_request_data"):
-            cached_reqs_data = self._make_cached_request_data(
-                scheduled_running_reqs,
-                scheduled_resumed_reqs,
-                num_scheduled_tokens,
-                scheduled_spec_decode_tokens,
-                req_to_new_blocks,
-            )
-
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
-
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None)
-            if self.needs_kv_cache_zeroing
-            else None
-        )
-
-        scheduler_output = SchedulerOutput(
-            scheduled_new_reqs=new_reqs_data,
-            scheduled_cached_reqs=cached_reqs_data,
-            num_scheduled_tokens=num_scheduled_tokens,
-            total_num_scheduled_tokens=total_num_scheduled_tokens,
-            scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
-            scheduled_encoder_inputs=scheduled_encoder_inputs,
-            num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
-            finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-            new_block_ids_to_zero=new_block_ids_to_zero,
-        )
-
-        if self.connector is not None:
-            meta = self.connector.build_connector_meta(scheduler_output)
-            scheduler_output.kv_connector_metadata = meta
-
-        if self.ec_connector is not None:
-            ec_meta = self.ec_connector.build_connector_meta(scheduler_output)
-            scheduler_output.ec_connector_metadata = ec_meta
-
-        with record_function_or_nullcontext("schedule: update_after_schedule"):
-            self._update_after_schedule(scheduler_output)
-
-        if laps_waiting is not None:
-            laps_waiting.record_schedule_step_stats(
-                long_capped_count=long_capped_count,
-                short_reserved_tokens=short_reserved_tokens,
-                short_actual_used_tokens=short_actual_used_tokens,
-                long_actual_used_tokens=long_actual_used_tokens,
-            )
-            laps_waiting._maybe_log_stats()
-        return scheduler_output
+        return self._schedule_with_hooks()
 
 
 class AsyncLAPSScheduler(LAPSSchedulerMixin, AsyncScheduler):

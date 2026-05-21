@@ -5,6 +5,7 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_ascend.core.laps_scheduler import AsyncLAPSScheduler, LAPSScheduler
+from vllm_ascend.core.schedule_template import AscendSchedulerTemplateMixin
 
 
 @pytest.mark.cpu_test
@@ -236,3 +237,43 @@ def test_async_laps_scheduler_installs_laps_waiting_queue(monkeypatch):
     scheduler.add_request(request)
 
     assert scheduler.waiting.__class__.__name__ == "LAPSRequestQueue"
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_path_uses_shared_schedule_template(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "256")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    called = False
+    original = AscendSchedulerTemplateMixin._schedule_with_hooks
+
+    def wrapped(self):
+        nonlocal called
+        called = True
+        return original(self)
+
+    monkeypatch.setattr(
+        AscendSchedulerTemplateMixin,
+        "_schedule_with_hooks",
+        wrapped,
+    )
+
+    request = create_requests(num_requests=1, num_tokens=800)[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert called
+    assert output.num_scheduled_tokens[request.request_id] == 256

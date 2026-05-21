@@ -551,3 +551,30 @@ def test_recompute_scheduler_disables_laps_budgeting_under_priority_policy(monke
 
     assert output.num_scheduled_tokens[long_request.request_id] == 800
     assert scheduler._laps_waiting_queue() is None or not scheduler._laps_long_budgeting_enabled()
+
+
+def test_recompute_scheduler_non_chunked_waiting_prefill_keeps_break_semantics(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "256")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0")
+
+    vllm_config = create_vllm_config(max_num_batched_tokens=256)
+    vllm_config.scheduler_config.enable_chunked_prefill = False
+    base_scheduler = create_scheduler(vllm_config)
+    scheduler = RecomputeScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        log_stats=True,
+        block_size=vllm_config.cache_config.block_size,
+        structured_output_manager=base_scheduler.structured_output_manager,
+    )
+
+    long_request = create_request(request_id=22, num_tokens=800)
+    scheduler.add_request(long_request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {}
+    assert len(scheduler.running) == 0
+    assert long_request in scheduler.waiting
