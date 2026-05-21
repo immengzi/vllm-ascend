@@ -257,9 +257,9 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
         state: AscendScheduleStepState,
         request: Request,
         num_new_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, object | None]:
         if state.laps_ctx is None:
-            return min(num_new_tokens, state.token_budget), False
+            return min(num_new_tokens, state.token_budget), False, None
         return state.laps_ctx.adjust_tokens(request, num_new_tokens, state.token_budget)
 
     def _adjust_waiting_num_new_tokens(
@@ -268,23 +268,24 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
         request: Request,
         num_new_tokens: int,
         num_computed_tokens: int,
-    ) -> tuple[int, bool, bool]:
+    ) -> tuple[int, bool, bool, object | None]:
         if state.laps_ctx is None:
-            return min(num_new_tokens, state.token_budget), False, False
-        num_new_tokens, was_capped = state.laps_ctx.adjust_tokens(
+            return min(num_new_tokens, state.token_budget), False, False, None
+        num_new_tokens, was_capped, request_class = state.laps_ctx.adjust_tokens(
             request,
             num_new_tokens,
             state.token_budget,
             num_computed_tokens=num_computed_tokens,
         )
         if num_new_tokens != 0:
-            return num_new_tokens, was_capped, False
+            return num_new_tokens, was_capped, False, request_class
         num_new_tokens, should_break = state.laps_ctx.recover_zero_budget(
             request,
+            request_class,
             state.token_budget,
             num_computed_tokens,
         )
-        return num_new_tokens, was_capped, should_break
+        return num_new_tokens, was_capped, should_break, request_class
 
     def _handle_running_allocation_failure(
         self,
@@ -337,13 +338,15 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
         num_new_tokens: int,
         num_computed_tokens: int | None = None,
         was_capped: bool = False,
+        request_class: object | None = None,
     ) -> None:
         if state.laps_ctx is not None:
+            assert request_class is not None
             state.laps_ctx.record_scheduled(
                 request,
+                request_class,
                 num_new_tokens,
                 was_capped,
-                num_computed_tokens=num_computed_tokens,
             )
 
     def _rollback_scheduled_request(

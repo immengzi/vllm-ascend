@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Iterable, Iterator, Mapping
+from enum import Enum
 from typing import Callable, cast
 
 from vllm.logger import logger
@@ -426,6 +427,12 @@ class LAPSRequestQueue(RequestQueue):
         return request_id is not None and request_id in self._queue_index
 
 
+class _LAPSRequestClass(Enum):
+    DECODE = "decode"
+    SHORT_PREFILL = "short_prefill"
+    LONG_PREFILL = "long_prefill"
+
+
 class LAPSBudgetContext:
     """Per-step LAPS budget tracker.
 
@@ -442,6 +449,7 @@ class LAPSBudgetContext:
         "long_actual_used_tokens",
         "long_budget_remaining",
         "capped_scheduled_req_ids",
+        "scheduled_req_classes",
     )
 
     def __init__(self, mixin: LAPSSchedulerMixin, token_budget: int) -> None:
@@ -454,6 +462,7 @@ class LAPSBudgetContext:
             token_budget, self.short_reserved_tokens, 0
         )
         self.capped_scheduled_req_ids: set[str] = set()
+        self.scheduled_req_classes: dict[str, _LAPSRequestClass] = {}
 
     def adjust_tokens(
         self,
@@ -461,27 +470,35 @@ class LAPSBudgetContext:
         num_new_tokens: int,
         token_budget: int,
         num_computed_tokens: int | None = None,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, _LAPSRequestClass]:
         """Apply long-prefill cap and budget limit.
 
-        Returns ``(adjusted_num_new_tokens, was_capped)``.
+        Returns ``(adjusted_num_new_tokens, was_capped, request_class)``.
         """
         m = self._mixin
+        request_class = m._classify_laps_request(request, num_computed_tokens)
         num_new_tokens, was_capped = m._apply_long_prefill_cap(
-            request, num_new_tokens, num_computed_tokens,
+            request,
+            num_new_tokens,
+            num_computed_tokens,
+            request_class=request_class,
         )
         self.long_budget_remaining = m._compute_long_budget_remaining(
             token_budget, self.short_reserved_tokens, self.short_actual_used_tokens,
         )
         num_new_tokens = m._apply_long_budget_limit(
-            request, num_new_tokens, self.long_budget_remaining,
+            request,
+            num_new_tokens,
+            self.long_budget_remaining,
             num_computed_tokens,
+            request_class=request_class,
         )
-        return num_new_tokens, was_capped
+        return num_new_tokens, was_capped, request_class
 
     def recover_zero_budget(
         self,
         request: Request,
+        request_class: _LAPSRequestClass,
         token_budget: int,
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
@@ -491,7 +508,7 @@ class LAPSBudgetContext:
         make progress with zero tokens, so the caller should break.
         Short prefills fall back to the remaining ``token_budget``.
         """
-        if self._mixin._is_long_prefill_request(request, num_computed_tokens):
+        if request_class is _LAPSRequestClass.LONG_PREFILL:
             return 0, True
         return min(
             request.num_tokens - num_computed_tokens, token_budget
@@ -500,16 +517,17 @@ class LAPSBudgetContext:
     def record_scheduled(
         self,
         request: Request,
+        request_class: _LAPSRequestClass,
         num_new_tokens: int,
         was_capped: bool,
-        num_computed_tokens: int | None = None,
     ) -> None:
         """Book-keep a successfully scheduled request."""
         m = self._mixin
+        self.scheduled_req_classes[request.request_id] = request_class
         if was_capped:
             self.capped_scheduled_req_ids.add(request.request_id)
             self.long_capped_count += 1
-        if m._is_long_prefill_request(request, num_computed_tokens):
+        if request_class is _LAPSRequestClass.LONG_PREFILL:
             self.long_budget_remaining -= num_new_tokens
         self.short_actual_used_tokens, self.long_actual_used_tokens = (
             m._record_laps_step_usage(
@@ -517,22 +535,25 @@ class LAPSBudgetContext:
                 num_new_tokens,
                 short_actual_used_tokens=self.short_actual_used_tokens,
                 long_actual_used_tokens=self.long_actual_used_tokens,
-                num_computed_tokens=num_computed_tokens,
+                request_class=request_class,
             )
         )
 
     def rollback_scheduled(self, request: Request, released_tokens: int) -> None:
         """Reverse book-keeping when a request is preempted or recomputed."""
-        m = self._mixin
-        if m._is_long_prefill_request(request):
+        request_class = self.scheduled_req_classes.pop(
+            request.request_id,
+            self._mixin._classify_laps_request(request),
+        )
+        if request_class is _LAPSRequestClass.LONG_PREFILL:
             self.long_budget_remaining += released_tokens
         req_id = request.request_id
         if req_id in self.capped_scheduled_req_ids:
             self.capped_scheduled_req_ids.discard(req_id)
             self.long_capped_count -= 1
-        if m._is_short_prefill_request(request):
+        if request_class is _LAPSRequestClass.SHORT_PREFILL:
             self.short_actual_used_tokens -= released_tokens
-        elif m._is_long_prefill_request(request):
+        elif request_class is _LAPSRequestClass.LONG_PREFILL:
             self.long_actual_used_tokens -= released_tokens
 
     def finalize(self, laps_waiting: LAPSRequestQueue) -> None:
@@ -617,26 +638,40 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
     def _is_prefill_request(
         self, request: Request, num_computed_tokens: int | None = None
     ) -> bool:
+        return (
+            self._classify_laps_request(request, num_computed_tokens)
+            is not _LAPSRequestClass.DECODE
+        )
+
+    def _is_short_prefill_request(
+        self, request: Request, num_computed_tokens: int | None = None
+    ) -> bool:
+        return (
+            self._classify_laps_request(request, num_computed_tokens)
+            is _LAPSRequestClass.SHORT_PREFILL
+        )
+
+    def _is_long_prefill_request(
+        self, request: Request, num_computed_tokens: int | None = None
+    ) -> bool:
+        return (
+            self._classify_laps_request(request, num_computed_tokens)
+            is _LAPSRequestClass.LONG_PREFILL
+        )
+
+    def _classify_laps_request(
+        self, request: Request, num_computed_tokens: int | None = None
+    ) -> _LAPSRequestClass:
         computed_tokens = (
             request.num_computed_tokens
             if num_computed_tokens is None
             else num_computed_tokens
         )
-        return computed_tokens < request.num_prompt_tokens
-
-    def _is_short_prefill_request(
-        self, request: Request, num_computed_tokens: int | None = None
-    ) -> bool:
-        return self._is_prefill_request(
-            request, num_computed_tokens
-        ) and request.num_prompt_tokens <= self._laps_threshold()
-
-    def _is_long_prefill_request(
-        self, request: Request, num_computed_tokens: int | None = None
-    ) -> bool:
-        return self._is_prefill_request(
-            request, num_computed_tokens
-        ) and request.num_prompt_tokens > self._laps_threshold()
+        if computed_tokens >= request.num_prompt_tokens:
+            return _LAPSRequestClass.DECODE
+        if request.num_prompt_tokens <= self._laps_threshold():
+            return _LAPSRequestClass.SHORT_PREFILL
+        return _LAPSRequestClass.LONG_PREFILL
 
     def _laps_short_reserved_tokens(self, token_budget: int) -> int:
         laps_waiting = self._laps_waiting_queue()
@@ -683,10 +718,13 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
         request: Request,
         num_new_tokens: int,
         num_computed_tokens: int | None = None,
+        request_class: _LAPSRequestClass | None = None,
     ) -> tuple[int, bool]:
+        if request_class is None:
+            request_class = self._classify_laps_request(request, num_computed_tokens)
         if (
             getattr(self, "laps_long_prefill_cap", 0) <= 0
-            or not self._is_long_prefill_request(request, num_computed_tokens)
+            or request_class is not _LAPSRequestClass.LONG_PREFILL
         ):
             return num_new_tokens, False
         if num_new_tokens > self.laps_long_prefill_cap:
@@ -699,8 +737,11 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
         num_new_tokens: int,
         long_budget_remaining: int,
         num_computed_tokens: int | None = None,
+        request_class: _LAPSRequestClass | None = None,
     ) -> int:
-        if not self._is_long_prefill_request(request, num_computed_tokens):
+        if request_class is None:
+            request_class = self._classify_laps_request(request, num_computed_tokens)
+        if request_class is not _LAPSRequestClass.LONG_PREFILL:
             return num_new_tokens
         return min(num_new_tokens, max(long_budget_remaining, 0))
 
@@ -712,10 +753,13 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
         short_actual_used_tokens: int,
         long_actual_used_tokens: int,
         num_computed_tokens: int | None = None,
+        request_class: _LAPSRequestClass | None = None,
     ) -> tuple[int, int]:
-        if self._is_short_prefill_request(request, num_computed_tokens):
+        if request_class is None:
+            request_class = self._classify_laps_request(request, num_computed_tokens)
+        if request_class is _LAPSRequestClass.SHORT_PREFILL:
             short_actual_used_tokens += num_scheduled_tokens
-        elif self._is_long_prefill_request(request, num_computed_tokens):
+        elif request_class is _LAPSRequestClass.LONG_PREFILL:
             long_actual_used_tokens += num_scheduled_tokens
         return short_actual_used_tokens, long_actual_used_tokens
 
@@ -775,9 +819,9 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
         state: AscendScheduleStepState,
         request: Request,
         num_new_tokens: int,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, _LAPSRequestClass | None]:
         if state.laps_ctx is None:
-            return min(num_new_tokens, state.token_budget), False
+            return min(num_new_tokens, state.token_budget), False, None
         return state.laps_ctx.adjust_tokens(request, num_new_tokens, state.token_budget)
 
     def _should_break_for_non_chunked_waiting_prefill(
@@ -799,23 +843,24 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
         request: Request,
         num_new_tokens: int,
         num_computed_tokens: int,
-    ) -> tuple[int, bool, bool]:
+    ) -> tuple[int, bool, bool, _LAPSRequestClass | None]:
         if state.laps_ctx is None:
-            return min(num_new_tokens, state.token_budget), False, False
-        num_new_tokens, was_capped = state.laps_ctx.adjust_tokens(
+            return min(num_new_tokens, state.token_budget), False, False, None
+        num_new_tokens, was_capped, request_class = state.laps_ctx.adjust_tokens(
             request,
             num_new_tokens,
             state.token_budget,
             num_computed_tokens=num_computed_tokens,
         )
         if num_new_tokens != 0:
-            return num_new_tokens, was_capped, False
+            return num_new_tokens, was_capped, False, request_class
         num_new_tokens, should_break = state.laps_ctx.recover_zero_budget(
             request,
+            request_class,
             state.token_budget,
             num_computed_tokens,
         )
-        return num_new_tokens, was_capped, should_break
+        return num_new_tokens, was_capped, should_break, request_class
 
     def _pop_waiting_request_for_schedule(
         self,
@@ -839,13 +884,15 @@ class LAPSSchedulerMixin(AscendSchedulerTemplateMixin):
         num_new_tokens: int,
         num_computed_tokens: int | None = None,
         was_capped: bool = False,
+        request_class: _LAPSRequestClass | None = None,
     ) -> None:
         if state.laps_ctx is not None:
+            assert request_class is not None
             state.laps_ctx.record_scheduled(
                 request,
+                request_class,
                 num_new_tokens,
                 was_capped,
-                num_computed_tokens=num_computed_tokens,
             )
 
     def _rollback_scheduled_request(

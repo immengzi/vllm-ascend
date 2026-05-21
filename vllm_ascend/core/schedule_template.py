@@ -75,8 +75,8 @@ class AscendSchedulerTemplateMixin:
         state: AscendScheduleStepState,
         request: Request,
         num_new_tokens: int,
-    ) -> tuple[int, bool]:
-        return num_new_tokens, False
+    ) -> tuple[int, bool, Any | None]:
+        return num_new_tokens, False, None
 
     def _adjust_waiting_num_new_tokens(
         self,
@@ -84,8 +84,8 @@ class AscendSchedulerTemplateMixin:
         request: Request,
         num_new_tokens: int,
         num_computed_tokens: int,
-    ) -> tuple[int, bool, bool]:
-        return num_new_tokens, False, False
+    ) -> tuple[int, bool, bool, Any | None]:
+        return num_new_tokens, False, False, None
 
     def _should_break_for_non_chunked_waiting_prefill(
         self,
@@ -172,6 +172,7 @@ class AscendSchedulerTemplateMixin:
         num_new_tokens: int,
         num_computed_tokens: int | None = None,
         was_capped: bool = False,
+        request_class: Any | None = None,
     ) -> None:
         return None
 
@@ -234,7 +235,7 @@ class AscendSchedulerTemplateMixin:
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens, was_capped = self._adjust_running_num_new_tokens(
+            num_new_tokens, was_capped, request_class = self._adjust_running_num_new_tokens(
                 state, request, num_new_tokens
             )
             if num_new_tokens == 0:
@@ -298,7 +299,11 @@ class AscendSchedulerTemplateMixin:
             state.num_scheduled_tokens[request_id] = num_new_tokens
             state.token_budget -= num_new_tokens
             self._record_scheduled_request(
-                state, request, num_new_tokens, was_capped=was_capped
+                state,
+                request,
+                num_new_tokens,
+                was_capped=was_capped,
+                request_class=request_class,
             )
             req_index += 1
 
@@ -455,6 +460,7 @@ class AscendSchedulerTemplateMixin:
                         num_new_tokens,
                         was_capped,
                         should_break,
+                        request_class,
                     ) = self._adjust_waiting_num_new_tokens(
                         state,
                         request,
@@ -587,6 +593,7 @@ class AscendSchedulerTemplateMixin:
                     num_new_tokens,
                     num_computed_tokens=num_computed_tokens,
                     was_capped=was_capped,
+                    request_class=request_class,
                 )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens

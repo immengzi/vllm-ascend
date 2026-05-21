@@ -4,7 +4,11 @@ from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from vllm_ascend.core.laps_scheduler import AsyncLAPSScheduler, LAPSScheduler
+from vllm_ascend.core.laps_scheduler import (
+    AsyncLAPSScheduler,
+    LAPSBudgetContext,
+    LAPSScheduler,
+)
 from vllm_ascend.core.schedule_template import AscendSchedulerTemplateMixin
 
 
@@ -277,3 +281,90 @@ def test_laps_budget_path_uses_shared_schedule_template(monkeypatch):
 
     assert called
     assert output.num_scheduled_tokens[request.request_id] == 256
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_path_classifies_waiting_request_once(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "256")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    request = create_requests(num_requests=1, num_tokens=800, req_ids=["long-hot"])[0]
+    scheduler.add_request(request)
+
+    original = scheduler._classify_laps_request
+    classify_calls: list[tuple[str, int | None]] = []
+
+    def wrapped(req, num_computed_tokens=None):
+        classify_calls.append((req.request_id, num_computed_tokens))
+        return original(req, num_computed_tokens)
+
+    monkeypatch.setattr(scheduler, "_classify_laps_request", wrapped)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[request.request_id] == 256
+    assert classify_calls == [(request.request_id, 0)]
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_context_rollback_reuses_cached_request_class(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "256")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    request = create_requests(num_requests=1, num_tokens=800, req_ids=["rollback-long"])[0]
+    laps_ctx = LAPSBudgetContext(scheduler, token_budget=1024)
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        request,
+        num_new_tokens=800,
+        token_budget=1024,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        request,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    classify_calls = 0
+
+    def fail_if_classified(*args, **kwargs):
+        nonlocal classify_calls
+        classify_calls += 1
+        raise AssertionError("rollback should reuse cached request class")
+
+    monkeypatch.setattr(scheduler, "_classify_laps_request", fail_if_classified)
+
+    laps_ctx.rollback_scheduled(request, num_new_tokens)
+
+    assert classify_calls == 0
+    assert laps_ctx.long_budget_remaining == 1024
+    assert laps_ctx.long_actual_used_tokens == 0
+    assert laps_ctx.short_actual_used_tokens == 0
