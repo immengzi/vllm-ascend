@@ -213,3 +213,6 @@ csrc/output/
 
 # claude code skills
 .claude/skills/*
+
+# codex pydeps
+.codex_pydeps/
