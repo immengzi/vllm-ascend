@@ -368,3 +368,299 @@ def test_laps_budget_context_rollback_reuses_cached_request_class(monkeypatch):
     assert laps_ctx.long_budget_remaining == 1024
     assert laps_ctx.long_actual_used_tokens == 0
     assert laps_ctx.short_actual_used_tokens == 0
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_context_hot_path_avoids_recompute(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "256")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0.25")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    short_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["short-hot"],
+    )[0]
+    long_request = create_requests(
+        num_requests=1,
+        num_tokens=800,
+        req_ids=["long-hot-2"],
+    )[0]
+    decode_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["decode-hot"],
+    )[0]
+    decode_request.num_computed_tokens = decode_request.num_prompt_tokens
+
+    scheduler.add_request(short_request)
+    scheduler.add_request(long_request)
+
+    laps_ctx = LAPSBudgetContext(scheduler, token_budget=1024)
+    compute_calls = 0
+    original_compute = scheduler._compute_long_budget_remaining
+
+    def wrapped_compute(*args, **kwargs):
+        nonlocal compute_calls
+        compute_calls += 1
+        return original_compute(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_compute_long_budget_remaining", wrapped_compute)
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        decode_request,
+        num_new_tokens=1,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=decode_request.num_computed_tokens,
+    )
+    laps_ctx.record_scheduled(
+        decode_request,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        long_request,
+        num_new_tokens=800,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        long_request,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    assert compute_calls == 0
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_context_short_prefill_within_reserved_budget(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "0")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0.25")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    short_waiting = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["short-waiting-a"],
+    )[0]
+    short_scheduled = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["short-scheduled-a"],
+    )[0]
+    scheduler.add_request(short_waiting)
+    scheduler.add_request(short_scheduled)
+
+    laps_ctx = LAPSBudgetContext(scheduler, token_budget=1024)
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        short_scheduled,
+        num_new_tokens=64,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        short_scheduled,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    assert laps_ctx.long_budget_remaining == 768
+    assert laps_ctx.short_actual_used_tokens == 64
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_context_short_prefill_only_consumes_overflow(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "0")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0.25")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    short_waiting = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["short-waiting-b"],
+    )[0]
+    short_scheduled = create_requests(
+        num_requests=1,
+        num_tokens=400,
+        req_ids=["short-scheduled-b"],
+    )[0]
+    scheduler.add_request(short_waiting)
+    scheduler.add_request(short_scheduled)
+
+    laps_ctx = LAPSBudgetContext(scheduler, token_budget=1024)
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        short_scheduled,
+        num_new_tokens=400,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        short_scheduled,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    assert laps_ctx.long_budget_remaining == 624
+    assert laps_ctx.short_actual_used_tokens == 400
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_context_releases_reserved_budget_after_last_short_waiting(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "0")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0.25")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    short_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["last-short"],
+    )[0]
+    scheduler.add_request(short_request)
+    laps_ctx = LAPSBudgetContext(scheduler, token_budget=1024)
+
+    scheduler.waiting.pop_request()
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        short_request,
+        num_new_tokens=64,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        short_request,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    assert laps_ctx.has_short_waiting_requests is False
+    assert laps_ctx.token_budget_remaining == 960
+    assert laps_ctx.long_budget_remaining == 960
+
+
+@pytest.mark.cpu_test
+def test_laps_budget_context_rollback_resyncs_long_budget(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_LONG_PREFILL_CAP", "0")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SHORT_RESERVED_RATIO", "0.25")
+
+    base_scheduler = create_scheduler(
+        max_num_batched_tokens=1024,
+        enable_chunked_prefill=True,
+    )
+    scheduler = LAPSScheduler(
+        vllm_config=base_scheduler.vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        block_size=base_scheduler.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(base_scheduler.vllm_config),
+    )
+
+    short_waiting = create_requests(
+        num_requests=1,
+        num_tokens=32,
+        req_ids=["short-waiting-rollback"],
+    )[0]
+    short_request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        req_ids=["short-rollback"],
+    )[0]
+    long_request = create_requests(
+        num_requests=1,
+        num_tokens=800,
+        req_ids=["long-rollback-2"],
+    )[0]
+    scheduler.add_request(short_waiting)
+    scheduler.add_request(short_request)
+    scheduler.add_request(long_request)
+
+    laps_ctx = LAPSBudgetContext(scheduler, token_budget=1024)
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        short_request,
+        num_new_tokens=64,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        short_request,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    num_new_tokens, was_capped, request_class = laps_ctx.adjust_tokens(
+        long_request,
+        num_new_tokens=800,
+        token_budget=laps_ctx.token_budget_remaining,
+        num_computed_tokens=0,
+    )
+    laps_ctx.record_scheduled(
+        long_request,
+        request_class,
+        num_new_tokens,
+        was_capped,
+    )
+
+    laps_ctx.rollback_scheduled(long_request, num_new_tokens)
+
+    assert laps_ctx.token_budget_remaining == 960
+    assert laps_ctx.short_actual_used_tokens == 64
+    assert laps_ctx.long_actual_used_tokens == 0
+    assert laps_ctx.long_budget_remaining == 768
