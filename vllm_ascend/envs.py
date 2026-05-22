@@ -93,7 +93,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL", "0"))),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
-    # Whether to enable fused MC2 (`dispatch_gmm_combine_decode` / `dispatch_ffn_combine`).
+    # Whether to enable fused mc2(`dispatch_gmm_combine_decode`/`dispatch_ffn_combine` operator)
     # 0, or not set: default ALLTOALL and MC2 will be used.
     # 1: ALLTOALL and MC2 might be replaced by `dispatch_ffn_combine` operator.
     # `dispatch_ffn_combine` can be used only for moe layer with W8A8, EP<=32, non-mtp, non-dynamic-eplb.
@@ -101,10 +101,28 @@ env_variables: dict[str, Callable[[], Any]] = {
     # `dispatch_gmm_combine_decode` can be used only for **decode node** moe layer
     # with W8A8. And MTP layer must be W8A8.
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
-    # Whether to enable balance scheduling in the v1 scheduler.
-    # Platform validation: only PD-mixed mode (`kv_role='kv_both'` or no kv_transfer_config).
-    # Not supported in PD-disaggregated mode (`kv_producer` / `kv_consumer` only).
+    # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # Whether to enable LAPS-style length-aware prefill scheduling on the
+    # engine side. This currently targets the FCFS waiting queue path.
+    "VLLM_ASCEND_LAPS_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_LAPS_SCHEDULING", "0"))),
+    # Prompt-length threshold used by LAPS scheduling. Requests with
+    # num_prompt_tokens <= threshold are treated as short prefills.
+    "VLLM_ASCEND_LAPS_THRESHOLD": lambda: int(os.getenv("VLLM_ASCEND_LAPS_THRESHOLD", "256")),
+    # Optional waiting window for short requests, in milliseconds. When set to
+    # 0, short requests dispatch immediately. When positive, the scheduler may
+    # hold a short batch briefly to accumulate more short prefills while still
+    # allowing long prefills to run.
+    "VLLM_ASCEND_LAPS_WAIT_WINDOW_MS": lambda: float(os.getenv("VLLM_ASCEND_LAPS_WAIT_WINDOW_MS", "0")),
+    # Maximum number of short requests to accumulate before dispatching early,
+    # even if the waiting window has not expired yet.
+    "VLLM_ASCEND_LAPS_WAIT_MAX_BATCH": lambda: int(os.getenv("VLLM_ASCEND_LAPS_WAIT_MAX_BATCH", "4")),
+    # Optional periodic LAPS stats logging interval, in seconds. Set to 0 to
+    # disable aggregate stats logging. This is intended for benchmark
+    # observability without enabling global DEBUG logging.
+    "VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S", "0")
+    ),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
