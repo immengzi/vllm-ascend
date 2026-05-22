@@ -562,7 +562,7 @@ class TestNPUPlatform(TestBase):
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
-    def test_check_and_update_config_selects_async_laps_scheduler_for_fcfs(
+    def test_check_and_update_config_laps_without_recompute_warns(
         self,
         _mock_auto_detect,
         mock_init_ascend,
@@ -574,7 +574,7 @@ class TestNPUPlatform(TestBase):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.scheduler_config.policy = "fcfs"
         vllm_config.scheduler_config.async_scheduling = True
-        vllm_config.scheduler_config.scheduler_cls = None
+        original_cls = vllm_config.scheduler_config.scheduler_cls
         vllm_config.compilation_config.mode = CompilationMode.NONE
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         vllm_config.compilation_config.custom_ops = []
@@ -593,7 +593,7 @@ class TestNPUPlatform(TestBase):
 
         self.assertEqual(
             vllm_config.scheduler_config.scheduler_cls,
-            "vllm_ascend.core.laps_scheduler.AsyncLAPSScheduler",
+            original_cls,
         )
 
     @patch.dict("os.environ", {"VLLM_ASCEND_LAPS_SCHEDULING": "1"}, clear=False)

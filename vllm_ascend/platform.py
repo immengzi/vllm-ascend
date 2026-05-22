@@ -461,20 +461,10 @@ class NPUPlatform(Platform):
                     envs_ascend.VLLM_ASCEND_LAPS_WAIT_WINDOW_MS,
                     envs_ascend.VLLM_ASCEND_LAPS_WAIT_MAX_BATCH,
                 )
-        elif enable_laps and laps_supported_policy:
-            if vllm_config.scheduler_config.async_scheduling:
-                vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.laps_scheduler.AsyncLAPSScheduler"
-            else:
-                vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.laps_scheduler.LAPSScheduler"
-            logger.info(
-                "Ascend LAPS scheduler selected: scheduler_cls=%s, "
-                "policy=%s, threshold=%d, wait_window_ms=%.3f, "
-                "wait_max_batch=%d",
-                vllm_config.scheduler_config.scheduler_cls,
-                vllm_config.scheduler_config.policy,
-                envs_ascend.VLLM_ASCEND_LAPS_THRESHOLD,
-                envs_ascend.VLLM_ASCEND_LAPS_WAIT_WINDOW_MS,
-                envs_ascend.VLLM_ASCEND_LAPS_WAIT_MAX_BATCH,
+        elif enable_laps:
+            logger.warning_once(
+                "VLLM_ASCEND_LAPS_SCHEDULING requires recompute_scheduler_enable=true "
+                "in ascend_config. LAPS scheduling will not be activated.",
             )
 
         # Extend original scheduler_config to use SchedulerDynamicBatch.
