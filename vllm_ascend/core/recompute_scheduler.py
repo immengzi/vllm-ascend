@@ -505,7 +505,9 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                         )
                     if count_with_laps:
                         laps_waiting.pop_request_from_queue(
-                            request_queue, count_as_removal=True
+                            request_queue,
+                            count_as_removal=True,
+                            skip_or_requeue_reason="blocked_waiting_status",
                         )
                     else:
                         request_queue.pop_request()
@@ -525,7 +527,9 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                     # Scheduling would exceed max_loras, skip.
                     if count_with_laps:
                         laps_waiting.pop_request_from_queue(
-                            request_queue, count_as_removal=True
+                            request_queue,
+                            count_as_removal=True,
+                            skip_or_requeue_reason="max_loras",
                         )
                     else:
                         request_queue.pop_request()
@@ -565,7 +569,9 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                             # the number of matched tokens.
                             if count_with_laps:
                                 laps_waiting.pop_request_from_queue(
-                                    request_queue, count_as_removal=True
+                                    request_queue,
+                                    count_as_removal=True,
+                                    skip_or_requeue_reason="remote_kv_not_ready",
                                 )
                             else:
                                 request_queue.pop_request()

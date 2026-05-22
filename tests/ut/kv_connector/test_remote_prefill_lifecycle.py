@@ -18,6 +18,8 @@
 #
 import copy
 
+from vllm.config import LoRAConfig
+from vllm.lora.request import LoRARequest
 import vllm_ascend.envs as ascend_envs
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.request import RequestStatus
@@ -434,4 +436,83 @@ def test_recompute_scheduler_tracks_laps_removals_for_blocked_waiting(monkeypatc
     assert isinstance(waiting, LAPSRequestQueue)
     assert output.num_scheduled_tokens == {}
     assert waiting._dispatch_counters == {"immediate": 0, "short": 0, "long": 0}
-    assert waiting._remove_counters == {"immediate": 0, "short": 1, "long": 0}
+    assert waiting._skip_or_requeue_counters["blocked_waiting_status"] == {
+        "immediate": 0,
+        "short": 1,
+        "long": 0,
+    }
+
+
+def test_recompute_scheduler_tracks_laps_skip_reason_for_remote_kv_not_ready(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_WAIT_WINDOW_MS", "0")
+
+    vllm_config = create_vllm_config()
+    base_scheduler = create_scheduler(vllm_config)
+    scheduler = RecomputeScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        log_stats=True,
+        block_size=vllm_config.cache_config.block_size,
+        structured_output_manager=base_scheduler.structured_output_manager,
+    )
+
+    blocked_request = create_request(request_id=22, num_tokens=64)
+
+    original_get_num_new_matched_tokens = scheduler.connector.get_num_new_matched_tokens
+    scheduler.connector.get_num_new_matched_tokens = lambda request, num_local: (None, False)
+    try:
+        scheduler.add_request(blocked_request)
+        output = scheduler.schedule()
+    finally:
+        scheduler.connector.get_num_new_matched_tokens = original_get_num_new_matched_tokens
+
+    waiting = scheduler.waiting
+    assert isinstance(waiting, LAPSRequestQueue)
+    assert output.num_scheduled_tokens == {}
+    assert waiting._skip_or_requeue_counters["remote_kv_not_ready"] == {
+        "immediate": 0,
+        "short": 1,
+        "long": 0,
+    }
+
+
+def test_recompute_scheduler_tracks_laps_skip_reason_for_max_loras(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_SCHEDULING", "1")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_THRESHOLD", "128")
+    monkeypatch.setenv("VLLM_ASCEND_LAPS_WAIT_WINDOW_MS", "0")
+
+    vllm_config = create_vllm_config()
+    vllm_config.lora_config = LoRAConfig(max_loras=1)
+    base_scheduler = create_scheduler(vllm_config)
+    scheduler = RecomputeScheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=base_scheduler.kv_cache_config,
+        log_stats=True,
+        block_size=vllm_config.cache_config.block_size,
+        structured_output_manager=base_scheduler.structured_output_manager,
+    )
+
+    running_lora_request = create_request(request_id=23, num_tokens=64)
+    running_lora_request.lora_request = LoRARequest("running", 1, "/tmp/running")
+    scheduler.add_request(running_lora_request)
+    running_output = scheduler.schedule()
+    scheduler.update_from_output(
+        running_output, create_model_runner_output([running_lora_request])
+    )
+
+    waiting_lora_request = create_request(request_id=24, num_tokens=64)
+    waiting_lora_request.lora_request = LoRARequest("waiting", 2, "/tmp/waiting")
+    scheduler.add_request(waiting_lora_request)
+
+    output = scheduler.schedule()
+
+    waiting = scheduler.waiting
+    assert isinstance(waiting, LAPSRequestQueue)
+    assert output.num_scheduled_tokens == {}
+    assert waiting._skip_or_requeue_counters["max_loras"] == {
+        "immediate": 0,
+        "short": 1,
+        "long": 0,
+    }

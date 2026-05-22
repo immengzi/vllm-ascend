@@ -37,6 +37,12 @@ from vllm_ascend import envs
 class LAPSRequestQueue(RequestQueue):
     """Two-level waiting queue for short and long prefills."""
 
+    _SKIP_OR_REQUEUE_REASONS = (
+        "blocked_waiting_status",
+        "max_loras",
+        "remote_kv_not_ready",
+    )
+
     def __init__(
         self,
         policy: SchedulingPolicy,
@@ -59,9 +65,12 @@ class LAPSRequestQueue(RequestQueue):
             envs.VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S, 0.0
         )
         self._last_stats_log_at = time.monotonic()
-        self._enqueue_counters = {"immediate": 0, "short": 0, "long": 0}
+        self._prepend_counters = {"immediate": 0, "short": 0, "long": 0}
         self._dispatch_counters = {"immediate": 0, "short": 0, "long": 0}
-        self._remove_counters = {"immediate": 0, "short": 0, "long": 0}
+        self._skip_or_requeue_counters = {
+            reason: {"immediate": 0, "short": 0, "long": 0}
+            for reason in self._SKIP_OR_REQUEUE_REASONS
+        }
         self._short_ready_reason_counters = {
             "no_wait_window": 0,
             "max_batch": 0,
@@ -110,7 +119,8 @@ class LAPSRequestQueue(RequestQueue):
         logger.info(
             "LAPS stats: threshold=%d wait_window_ms=%.3f wait_max_batch=%d "
             "sizes=(immediate=%d short=%d long=%d) short_state=%s "
-            "enqueues=%s dispatches=%s removals=%s short_ready_reasons=%s",
+            "prepends=%s dispatches=%s skip_or_requeues=%s "
+            "short_ready_reasons=%s",
             self.threshold,
             self.wait_window_ms,
             self.wait_max_batch,
@@ -118,15 +128,22 @@ class LAPSRequestQueue(RequestQueue):
             len(self._short_queue),
             len(self._long_queue),
             self._short_wait_state(),
-            self._enqueue_counters,
+            self._prepend_counters,
             self._dispatch_counters,
-            self._remove_counters,
+            self._skip_or_requeue_counters,
             self._short_ready_reason_counters,
         )
 
     def _record_short_ready_reason(self, reason: str) -> None:
         if reason in self._short_ready_reason_counters:
             self._short_ready_reason_counters[reason] += 1
+
+    def _increment_skip_or_requeue_counter(
+        self, queue: RequestQueue, reason: str
+    ) -> None:
+        if reason not in self._skip_or_requeue_counters:
+            raise ValueError(f"Unknown skip_or_requeue reason: {reason}")
+        self._skip_or_requeue_counters[reason][self._queue_name(queue)] += 1
 
     def _debug_state(
         self,
@@ -283,7 +300,6 @@ class LAPSRequestQueue(RequestQueue):
         queue = self._classify_queue(request)
         queue.add_request(request)
         self._queue_index[request.request_id] = queue
-        self._enqueue_counters[self._queue_name(queue)] += 1
         if queue is not self._immediate_queue:
             self._force_immediate_request_ids.discard(request.request_id)
         if queue is self._short_queue:
@@ -298,13 +314,22 @@ class LAPSRequestQueue(RequestQueue):
         return self.pop_request_from_queue(queue)
 
     def pop_request_from_queue(
-        self, queue: RequestQueue, *, count_as_removal: bool = False
+        self,
+        queue: RequestQueue,
+        *,
+        count_as_removal: bool = False,
+        skip_or_requeue_reason: str | None = None,
     ) -> Request:
         request = queue.pop_request()
         self._queue_index.pop(request.request_id, None)
         if count_as_removal:
-            self._remove_counters[self._queue_name(queue)] += 1
-            event_name = "remove"
+            if skip_or_requeue_reason is not None:
+                self._increment_skip_or_requeue_counter(
+                    queue, skip_or_requeue_reason
+                )
+                event_name = f"skip_or_requeue:{skip_or_requeue_reason}"
+            else:
+                event_name = "remove"
         else:
             self._dispatch_counters[self._queue_name(queue)] += 1
             event_name = "dispatch"
@@ -327,7 +352,7 @@ class LAPSRequestQueue(RequestQueue):
         queue = self._classify_queue(request, force_immediate=force_immediate)
         queue.prepend_request(request)
         self._queue_index[request.request_id] = queue
-        self._enqueue_counters[self._queue_name(queue)] += 1
+        self._prepend_counters[self._queue_name(queue)] += 1
         if queue is self._short_queue:
             self._on_short_queue_changed()
         self._debug_state("prepend", request=request, queue=queue)
@@ -347,7 +372,6 @@ class LAPSRequestQueue(RequestQueue):
         queue.remove_request(matched_request)
         self._queue_index.pop(request.request_id, None)
         self._force_immediate_request_ids.discard(request.request_id)
-        self._remove_counters[self._queue_name(queue)] += 1
         if queue is self._short_queue:
             self._on_short_queue_changed()
         self._debug_state("remove", request=matched_request, queue=queue)
@@ -367,7 +391,6 @@ class LAPSRequestQueue(RequestQueue):
         for queue_id, matched_requests in queue_to_requests.items():
             removed_count += len(matched_requests)
             queue = queue_map[queue_id]
-            self._remove_counters[self._queue_name(queue)] += len(matched_requests)
             queue.remove_requests(matched_requests)
             for matched in matched_requests:
                 self._queue_index.pop(matched.request_id, None)

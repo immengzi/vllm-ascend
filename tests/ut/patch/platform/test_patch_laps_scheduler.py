@@ -297,3 +297,48 @@ def test_remove_request_uses_request_id_instead_of_identity():
     assert same_id_different_object in queue
     queue.remove_request(same_id_different_object)
     assert len(queue) == 0
+
+
+def test_enqueue_prepend_and_dispatch_counters_are_split():
+    queue = LAPSRequestQueue(
+        policy=SchedulingPolicy.FCFS,
+        threshold=16,
+        wait_window_ms=0,
+        wait_max_batch=4,
+    )
+    first = make_request("first", 8)
+    second = make_request("second", 8)
+
+    queue.add_request(first)
+    queue.prepend_request(second)
+
+    assert queue._prepend_counters["short"] == 1
+    assert queue._dispatch_counters["short"] == 0
+    assert queue._skip_or_requeue_counters["blocked_waiting_status"] == {
+        "immediate": 0,
+        "short": 0,
+        "long": 0,
+    }
+
+    assert queue.pop_request() is second
+    assert queue._dispatch_counters["short"] == 1
+
+
+def test_skip_or_requeue_counts_reason_for_blocked_waiting():
+    queue = LAPSRequestQueue(
+        policy=SchedulingPolicy.FCFS,
+        threshold=16,
+        wait_window_ms=0,
+        wait_max_batch=4,
+    )
+    request = make_request("blocked", 8)
+
+    queue.add_request(request)
+    assert queue.peek_request() is request
+    queue.pop_request_from_queue(
+        queue._short_queue,
+        count_as_removal=True,
+        skip_or_requeue_reason="blocked_waiting_status",
+    )
+
+    assert queue._skip_or_requeue_counters["blocked_waiting_status"]["short"] == 1
