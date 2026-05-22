@@ -46,6 +46,8 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend import envs
+from vllm_ascend.core.laps_scheduler import LAPSSchedulerMixin
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
 # whose keys are class objects bound at import time.  When the async
@@ -104,7 +106,7 @@ class RecomputeSchedulerOutput(SchedulerOutput):
     recomputed_reqs: list[RecomputeReqInfo] | None = None
 
 
-class RecomputeScheduler(Scheduler):
+class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
     running: list[Request]
 
     def __init__(self, *args, **kwargs):
@@ -124,6 +126,26 @@ class RecomputeScheduler(Scheduler):
             "qwen3_next" in self.vllm_config.model_config.hf_text_config.model_type
             or "qwen3_5" in self.vllm_config.model_config.hf_text_config.model_type
         )
+        if envs.VLLM_ASCEND_LAPS_SCHEDULING:
+            self._init_laps_waiting_queue()
+
+    def _get_attached_waiting_computed_tokens(self, request: Request) -> int | None:
+        """Return already attached computed tokens for a waiting request.
+
+        In PD recovery flows a request can legitimately carry attached/cached KV
+        blocks while ``num_computed_tokens`` has been reset to 0 for a retry.
+        Re-running ``get_computed_blocks()`` for such a request violates the KV
+        cache manager invariant for resumed requests because the blocks are
+        already attached to the request.
+        """
+        if request.num_computed_tokens != 0:
+            return None
+
+        block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        if not any(block_ids):
+            return None
+
+        return max(request.num_cached_tokens, 0)
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -242,6 +264,7 @@ class RecomputeScheduler(Scheduler):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        laps_waiting = self._laps_waiting_queue()
 
         self.kv_cache_manager.new_step_starts()
 
@@ -275,6 +298,9 @@ class RecomputeScheduler(Scheduler):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if num_new_tokens == 0:
+                req_index += 1
+                continue
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -341,6 +367,22 @@ class RecomputeScheduler(Scheduler):
                     if transfer_config is not None and not transfer_config.is_kv_producer:
                         recomputed_req = self.running.pop()
                         self.kv_cache_manager.free(recomputed_req)
+                        if recomputed_req in scheduled_running_reqs:
+                            recomputed_req_id = recomputed_req.request_id
+                            scheduled_running_reqs.remove(recomputed_req)
+                            released_tokens = num_scheduled_tokens.pop(recomputed_req_id)
+                            token_budget += released_tokens
+                            req_to_new_blocks.pop(recomputed_req_id)
+                            scheduled_spec_decode_tokens.pop(recomputed_req_id, None)
+                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                                recomputed_req_id, None
+                            )
+                            if preempted_encoder_inputs:
+                                num_embeds_to_restore = sum(
+                                    recomputed_req.get_num_encoder_embeds(i)
+                                    for i in preempted_encoder_inputs
+                                )
+                                encoder_compute_budget += num_embeds_to_restore
                         recomputed_reqs.append(
                             RecomputeReqInfo(
                                 recomputed_req.request_id, recomputed_req.output_token_ids, recomputed_req.client_index
@@ -358,7 +400,8 @@ class RecomputeScheduler(Scheduler):
                             if preempted_req in scheduled_running_reqs:
                                 preempted_req_id = preempted_req.request_id
                                 scheduled_running_reqs.remove(preempted_req)
-                                token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                                released_tokens = num_scheduled_tokens.pop(preempted_req_id)
+                                token_budget += released_tokens
                                 req_to_new_blocks.pop(preempted_req_id)
                                 scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                                 preempted_encoder_inputs = scheduled_encoder_inputs.pop(preempted_req_id, None)
@@ -440,8 +483,14 @@ class RecomputeScheduler(Scheduler):
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
+                if request_queue is None:
+                    break
 
+                # skipped_waiting is not owned by LAPSRequestQueue, so only route
+                # pops through LAPS when the selected queue is one of its subqueues.
+                count_with_laps = (
+                    laps_waiting is not None and request_queue in laps_waiting._queues()
+                )
                 request = request_queue.peek_request()
                 request_id = request.request_id
 
@@ -454,7 +503,14 @@ class RecomputeScheduler(Scheduler):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    if count_with_laps:
+                        laps_waiting.pop_request_from_queue(
+                            request_queue,
+                            count_as_removal=True,
+                            skip_or_requeue_reason="blocked_waiting_status",
+                        )
+                    else:
+                        request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -469,7 +525,14 @@ class RecomputeScheduler(Scheduler):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    if count_with_laps:
+                        laps_waiting.pop_request_from_queue(
+                            request_queue,
+                            count_as_removal=True,
+                            skip_or_requeue_reason="max_loras",
+                        )
+                    else:
+                        request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -478,7 +541,17 @@ class RecomputeScheduler(Scheduler):
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                attached_computed_tokens = self._get_attached_waiting_computed_tokens(
+                    request
+                )
+                if attached_computed_tokens is not None:
+                    # Treat the request as a resumed request with already
+                    # attached KV blocks. Do not re-run local/remote prefix-hit
+                    # discovery against the same request.
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = attached_computed_tokens
+                elif request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
                         request
@@ -494,7 +567,14 @@ class RecomputeScheduler(Scheduler):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            if count_with_laps:
+                                laps_waiting.pop_request_from_queue(
+                                    request_queue,
+                                    count_as_removal=True,
+                                    skip_or_requeue_reason="remote_kv_not_ready",
+                                )
+                            else:
+                                request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -537,11 +617,21 @@ class RecomputeScheduler(Scheduler):
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
-                    if not self.scheduler_config.enable_chunked_prefill and num_new_tokens > token_budget:
+                    if (
+                        not self.scheduler_config.enable_chunked_prefill
+                        and num_new_tokens > token_budget
+                    ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
 
+                    if num_new_tokens == 0:
+                        num_new_tokens = min(
+                            request.num_tokens - num_computed_tokens,
+                            token_budget,
+                        )
+                        if num_new_tokens == 0:
+                            break
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
@@ -622,7 +712,10 @@ class RecomputeScheduler(Scheduler):
                             preempted=request.num_preemptions > 0,
                         )
 
-                request = request_queue.pop_request()
+                if count_with_laps:
+                    request = laps_waiting.pop_request_from_queue(request_queue)
+                else:
+                    request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
