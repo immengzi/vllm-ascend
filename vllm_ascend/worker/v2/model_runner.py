@@ -83,6 +83,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
+        use_strict_rejection_sampling = (
+            self.speculative_config is not None
+            and self.speculative_config.rejection_sample_method == "strict"
+        )
         self.req_states: AscendRequestState = AscendRequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -90,6 +94,8 @@ class NPUModelRunner(GPUModelRunner):
             num_speculative_steps=self.num_speculative_steps,
             vocab_size=self.vocab_size,
             device=self.device,
+            model_dtype=self.dtype,
+            cache_draft_logits=not use_strict_rejection_sampling,
         )
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
         # so reinitialize input_buffers here.
