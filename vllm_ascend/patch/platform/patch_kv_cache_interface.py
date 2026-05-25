@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copyreg
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,33 @@ import vllm.v1.kv_cache_interface
 from typing_extensions import Self
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def _ascend_mla_spec_reduce(self: object) -> tuple[type, object]:
+    """Custom pickle reducer for AscendMLAAttentionSpec.
+
+    This ensures that the class is correctly pickled/unpickled across
+    multiprocessing boundaries, even when vllm.v1.kv_cache_interface.MLAAttentionSpec
+    has been monkey-patched with AscendMLAAttentionSpec.
+
+    Without this, pickle complains: "Can't pickle <class 'vllm.v1.kv_cache_interface.MLAAttentionSpec'>:
+    it's not the same object as vllm.v1.kv_cache_interface.MLAAttentionSpec"
+    """
+    return (type(self), (self.block_size, self.num_kv_heads, self.head_size,
+                        self.dtype, self.cache_dtype_str, self.sparse_head_dim,
+                        self.cache_sparse_c8, self.c8_k_cache_dtype,
+                        self.c8_k_scale_cache_dtype))
+
+
+def register_ascend_mla_pickle_handler():
+    """Register custom pickle handler for AscendMLAAttentionSpec.
+
+    This must be called after the patch is applied to ensure correct
+    pickling behavior across multiprocessing boundaries.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    copyreg.pickle(type(MLAAttentionSpec), _ascend_mla_spec_reduce)
 
 
 @dataclass(frozen=True)
@@ -136,3 +164,4 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
 
 
 vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec
+register_ascend_mla_pickle_handler()

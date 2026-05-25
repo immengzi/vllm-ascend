@@ -182,10 +182,18 @@
 #       This patch also adds Sparse C8 support for DSA models on NPU. As part
 #       of that support, members such as `page_size_bytes` need to be adapted,
 #       so they are overridden here as well to preserve overall readability.
+#
+#       Additionally, this patch registers a custom pickle handler to fix a
+#       multiprocessing serialization error: "Can't pickle <class 'vllm.v1.kv_cache_interface.MLAAttentionSpec'>:
+#       it's not the same object as vllm.v1.kv_cache_interface.MLAAttentionSpec".
+#       This error occurs when the monkey-patched class is pickled in one process
+#       and unpickled in another where the module has been imported differently.
 #    How:
 #       This patch subclasses the original implementation, overrides selected
 #       methods, and adds DSA-specific attributes and helpers with default
-#       values where needed.
+#       values where needed. It also registers a copyreg.pickle handler that
+#       serializes instances by their constructor arguments instead of by
+#       class reference, ensuring consistent behavior across process boundaries.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/pull/25896
 #    Future Plan:
