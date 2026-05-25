@@ -83,6 +83,7 @@ class AscendInputBatch(InputBatch):
     replay_seq_lens: torch.Tensor | None = None
     replay_seq_lens_np: np.ndarray | None = None
     replay_desc: BatchExecutionDescriptor | None = None
+    replay_seq_lens_summary: dict[str, Any] | None = None
     attn_metadata: dict[str, Any] | None = None
     slot_mappings: dict[str, torch.Tensor] | None = None
 

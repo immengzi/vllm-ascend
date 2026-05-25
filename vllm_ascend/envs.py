@@ -123,6 +123,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S": lambda: float(
         os.getenv("VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S", "0")
     ),
+    # Optional periodic LAPS prefill graph stats logging interval, in seconds.
+    # Set to 0 to disable graph hit/miss and replay/eager benefit logging.
+    "VLLM_ASCEND_LAPS_PREFILL_GRAPH_STATS_LOG_INTERVAL_S": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_PREFILL_GRAPH_STATS_LOG_INTERVAL_S", "0")
+    ),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))

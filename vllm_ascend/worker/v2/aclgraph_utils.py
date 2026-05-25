@@ -16,13 +16,15 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
@@ -48,6 +50,28 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 class PrefillGraphKey:
     num_reqs: int
     num_tokens: int
+    max_query_len: int
+
+
+@dataclass(frozen=True)
+class LAPSPrefillGraphStats:
+    candidates: int = 0
+    hits: int = 0
+    misses: int = 0
+    unsupported_mode_misses: int = 0
+    no_graph_key_misses: int = 0
+    shape_overflow_misses: int = 0
+    abi_guard_misses: int = 0
+    fallback_to_none_misses: int = 0
+    replay_tokens: int = 0
+    eager_tokens: int = 0
+    replay_us: int = 0
+    eager_us: int = 0
+
+
+@dataclass(frozen=True)
+class LAPSPrefillCUDAGraphStat(CUDAGraphStat):
+    laps_prefill_graph_stats: LAPSPrefillGraphStats | None = None
 
 
 @dataclass
@@ -58,6 +82,8 @@ class LAPSPrefillGraphState:
     logits_indices: torch.Tensor
     slot_mappings: torch.Tensor
     slot_mappings_by_layer: dict[str, torch.Tensor] | None = None
+    attn_metadata_ptrs: dict[str, tuple[int, int, int, int]] | None = None
+    last_replay_seq_lens_summary: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -65,9 +91,114 @@ class LAPSPrefillReplayPlan:
     desc: BatchExecutionDescriptor
     num_reqs: int
     num_tokens: int
+    max_query_len: int
     target_num_reqs: int
     target_num_tokens: int
     right_align: bool = False
+
+
+def assert_laps_prefill_replay_metadata_sources(
+    input_batch: AscendInputBatch,
+    attn_metadata: dict[str, Any],
+    block_tables: tuple[torch.Tensor, ...],
+    slot_mappings: torch.Tensor,
+    *,
+    graph_state: LAPSPrefillGraphState | None = None,
+    on_error: Callable[[], None] | None = None,
+) -> None:
+    replay_query_start_loc = input_batch.replay_query_start_loc
+    replay_query_start_loc_np = input_batch.replay_query_start_loc_np
+    replay_seq_lens = input_batch.replay_seq_lens
+    replay_seq_lens_np = input_batch.replay_seq_lens_np
+    replay_num_tokens = input_batch.replay_num_tokens
+    assert replay_query_start_loc is not None
+    assert replay_query_start_loc_np is not None
+    assert replay_seq_lens is not None
+    assert replay_seq_lens_np is not None
+    assert replay_num_tokens is not None
+
+    stable_block_table_by_ptr = {
+        block_table.data_ptr(): block_table for block_table in block_tables
+    }
+    stable_slot_mapping_by_ptr = {
+        slot_mapping.data_ptr(): slot_mapping for slot_mapping in slot_mappings
+    }
+
+    def fail(message: str) -> None:
+        if on_error is not None:
+            on_error()
+        raise AssertionError(message)
+
+    for layer_name, metadata in attn_metadata.items():
+        current_ptrs = (
+            metadata.block_tables.data_ptr(),
+            metadata.query_start_loc.data_ptr(),
+            metadata.seq_lens.data_ptr(),
+            metadata.slot_mapping.data_ptr(),
+        )
+        if graph_state is not None and graph_state.attn_metadata_ptrs is not None:
+            expected_ptrs = graph_state.attn_metadata_ptrs.get(layer_name)
+            if expected_ptrs is not None and expected_ptrs != current_ptrs:
+                fail(
+                    f"LAPS prefill replay attn_metadata[{layer_name}] pointer signature "
+                    "must match the capture-time stable ABI."
+                )
+        source_block_table = stable_block_table_by_ptr.get(
+            metadata.block_tables.data_ptr()
+        )
+        if source_block_table is None:
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].block_tables "
+                "must reuse the stable block_tables buffers prepared for replay."
+            )
+        if metadata.block_tables.shape != source_block_table.shape:
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].block_tables "
+                "must preserve the stable replay block_table shape."
+            )
+        if metadata.query_start_loc.data_ptr() != replay_query_start_loc.data_ptr():
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].query_start_loc "
+                "must reuse replay_query_start_loc."
+            )
+        if metadata.seq_lens.data_ptr() != replay_seq_lens.data_ptr():
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].seq_lens "
+                "must reuse replay_seq_lens."
+            )
+        source_slot_mapping = stable_slot_mapping_by_ptr.get(
+            metadata.slot_mapping.data_ptr()
+        )
+        if source_slot_mapping is None:
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].slot_mapping "
+                "must reuse the replay slot_mappings state."
+            )
+        if metadata.slot_mapping.shape != source_slot_mapping.shape:
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].slot_mapping "
+                "must preserve the stable replay slot_mapping shape."
+            )
+        if metadata.slot_mapping.shape[0] != replay_num_tokens:
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].slot_mapping "
+                "must match the padded target token shape."
+            )
+        if metadata.actual_seq_lengths_q != replay_query_start_loc_np[1:].tolist():
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].actual_seq_lengths_q "
+                "must be rebuilt from replay_query_start_loc_np."
+            )
+        if metadata.seq_lens_list != replay_seq_lens_np.tolist():
+            fail(
+                f"LAPS prefill replay attn_metadata[{layer_name}].seq_lens_list "
+                "must be rebuilt from replay_seq_lens_np."
+            )
+
+        if graph_state is not None:
+            if graph_state.attn_metadata_ptrs is None:
+                graph_state.attn_metadata_ptrs = {}
+            graph_state.attn_metadata_ptrs[layer_name] = current_ptrs
 
 
 class ModelAclGraphManager(ModelCudaGraphManager):
@@ -92,6 +223,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         self.laps_prefill_descs: dict[PrefillGraphKey, BatchExecutionDescriptor] = {}
         self.laps_prefill_states: dict[BatchExecutionDescriptor, LAPSPrefillGraphState] = {}
         self._next_laps_prefill_request: tuple[int, int, int] | None = None
+        self.laps_prefill_stats = LAPSPrefillGraphStats()
+        self._laps_prefill_stats_last_log_at = time.monotonic()
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
         self._install_laps_prefill_capture_descs()
@@ -115,8 +248,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         existing_descs = set(full_descs)
         new_descs: list[BatchExecutionDescriptor] = []
         for desc in list(full_descs):
+            max_query_len = desc.num_tokens
             for num_reqs in self._laps_prefill_capture_batch_sizes(desc.num_tokens):
-                key = PrefillGraphKey(num_reqs=num_reqs, num_tokens=desc.num_tokens)
+                key = PrefillGraphKey(
+                    num_reqs=num_reqs,
+                    num_tokens=desc.num_tokens,
+                    max_query_len=max_query_len,
+                )
                 laps_desc = BatchExecutionDescriptor(
                     cg_mode=CUDAGraphMode.FULL,
                     num_tokens=desc.num_tokens,
@@ -156,6 +294,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 dtype=torch.int32,
                 device=self.device,
             ),
+            attn_metadata_ptrs=None,
         )
         self.laps_prefill_states[desc] = state
         return state
@@ -193,7 +332,11 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     def _is_laps_prefill_desc(self, desc: BatchExecutionDescriptor) -> bool:
         if desc.num_reqs is None:
             return False
-        key = PrefillGraphKey(num_reqs=desc.num_reqs, num_tokens=desc.num_tokens)
+        key = PrefillGraphKey(
+            num_reqs=desc.num_reqs,
+            num_tokens=desc.num_tokens,
+            max_query_len=desc.num_tokens,
+        )
         return self.laps_prefill_descs.get(key) == desc
 
     def dispatch_laps_prefill(
@@ -202,20 +345,36 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         num_tokens: int,
         max_query_len: int,
     ) -> BatchExecutionDescriptor | None:
-        del max_query_len
+        self.laps_prefill_stats = replace(
+            self.laps_prefill_stats,
+            candidates=self.laps_prefill_stats.candidates + 1,
+        )
         best_desc = None
         best_key = None
+        has_available_graph = False
         for key, desc in self.laps_prefill_descs.items():
             if desc not in self.graphs:
                 continue
-            if key.num_reqs < num_reqs or key.num_tokens < num_tokens:
+            has_available_graph = True
+            if key.num_reqs < num_reqs or key.num_tokens < num_tokens or key.max_query_len < max_query_len:
                 continue
-            if best_key is None or (key.num_tokens, key.num_reqs) < (
+            if best_key is None or (key.num_tokens, key.num_reqs, key.max_query_len) < (
                 best_key.num_tokens,
                 best_key.num_reqs,
+                best_key.max_query_len,
             ):
                 best_key = key
                 best_desc = desc
+        if best_desc is not None:
+            self.laps_prefill_stats = replace(
+                self.laps_prefill_stats,
+                hits=self.laps_prefill_stats.hits + 1,
+            )
+        else:
+            if has_available_graph:
+                self.record_laps_prefill_miss("shape_overflow")
+            else:
+                self.record_laps_prefill_miss("no_graph_key")
         return best_desc
 
     def _build_laps_prefill_replay_plan(
@@ -226,10 +385,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         assert desc.num_reqs is not None
         # Ascend's prefill attention path already uses packed TND + sparse_mode=3
         # causal semantics, so we keep replay left-packed and only pad the tail.
+        max_query_len = int(np.max(input_batch.num_scheduled_tokens))
         return LAPSPrefillReplayPlan(
             desc=desc,
             num_reqs=input_batch.num_reqs,
             num_tokens=input_batch.num_tokens,
+            max_query_len=max_query_len,
             target_num_reqs=desc.num_reqs,
             target_num_tokens=desc.num_tokens,
             right_align=False,
@@ -301,10 +462,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         input_batch.logits_indices = state.logits_indices[: input_batch.logits_indices.shape[0]]
         input_batch.replay_num_reqs = plan.target_num_reqs
         input_batch.replay_num_tokens = plan.target_num_tokens
+        input_batch.replay_max_query_len = plan.max_query_len
         input_batch.replay_desc = desc
-        input_batch.replay_max_query_len = int(
-            np.max(state.input_buffers.seq_lens_np[: plan.target_num_reqs])
-        )
         input_batch.replay_query_start_loc = state.input_buffers.query_start_loc[
             : plan.target_num_reqs + 1
         ]
@@ -315,7 +474,99 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         input_batch.replay_seq_lens_np = state.input_buffers.seq_lens_np[
             : plan.target_num_reqs
         ]
+        input_batch.replay_seq_lens_summary = self._summarize_seq_lens(
+            input_batch.replay_seq_lens_np,
+            plan.target_num_reqs,
+        )
+        self._update_seq_lens_summary(state, input_batch.replay_seq_lens_summary)
         return input_batch
+
+    @staticmethod
+    def _summarize_seq_lens(seq_lens_np: np.ndarray, num_reqs: int) -> dict[str, Any]:
+        active = seq_lens_np[:num_reqs]
+        if active.size == 0:
+            return {"min": 0, "max": 0, "nonzero": 0, "buckets": {}}
+        return {
+            "min": int(active.min()),
+            "max": int(active.max()),
+            "nonzero": int(np.count_nonzero(active)),
+            "buckets": {
+                "1": int(np.sum(active == 1)),
+                "2_4": int(np.sum((active >= 2) & (active <= 4))),
+                "5_16": int(np.sum((active >= 5) & (active <= 16))),
+                "17_plus": int(np.sum(active >= 17)),
+            },
+        }
+
+    def _update_seq_lens_summary(self, state: LAPSPrefillGraphState, summary: dict[str, Any]) -> None:
+        if state.last_replay_seq_lens_summary is not None and state.last_replay_seq_lens_summary != summary:
+            logger.debug(
+                "LAPS prefill replay seq_lens summary changed for %s: previous=%s current=%s",
+                state.desc,
+                state.last_replay_seq_lens_summary,
+                summary,
+            )
+        state.last_replay_seq_lens_summary = summary
+
+    def _validate_laps_replay_abi(
+        self,
+        input_batch: AscendInputBatch,
+        attn_metadata: dict[str, Any],
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+    ) -> None:
+        state = self._get_or_create_laps_prefill_state(input_batch.replay_desc)
+        assert_laps_prefill_replay_metadata_sources(
+            input_batch,
+            attn_metadata,
+            block_tables,
+            slot_mappings,
+            graph_state=state,
+            on_error=lambda: setattr(
+                self,
+                "laps_prefill_stats",
+                replace(
+                    self.laps_prefill_stats,
+                    abi_guard_misses=self.laps_prefill_stats.abi_guard_misses + 1,
+                ),
+            )
+        )
+
+    def record_laps_prefill_execution(
+        self,
+        *,
+        replay: bool,
+        num_tokens: int,
+        elapsed_us: int,
+    ) -> None:
+        if replay:
+            self.laps_prefill_stats = replace(
+                self.laps_prefill_stats,
+                replay_tokens=self.laps_prefill_stats.replay_tokens + num_tokens,
+                replay_us=self.laps_prefill_stats.replay_us + elapsed_us,
+            )
+        else:
+            self.laps_prefill_stats = replace(
+                self.laps_prefill_stats,
+                eager_tokens=self.laps_prefill_stats.eager_tokens + num_tokens,
+                eager_us=self.laps_prefill_stats.eager_us + elapsed_us,
+            )
+
+    def record_laps_prefill_miss(self, reason: str, *, count_miss: bool = True) -> None:
+        updates: dict[str, int] = {}
+        if count_miss:
+            updates["misses"] = self.laps_prefill_stats.misses + 1
+        if reason == "unsupported_mode":
+            updates["unsupported_mode_misses"] = self.laps_prefill_stats.unsupported_mode_misses + 1
+        elif reason == "no_graph_key":
+            updates["no_graph_key_misses"] = self.laps_prefill_stats.no_graph_key_misses + 1
+        elif reason == "shape_overflow":
+            updates["shape_overflow_misses"] = self.laps_prefill_stats.shape_overflow_misses + 1
+        elif reason == "abi_guard_failed":
+            updates["abi_guard_misses"] = self.laps_prefill_stats.abi_guard_misses + 1
+        elif reason == "fallback_to_none":
+            updates["fallback_to_none_misses"] = self.laps_prefill_stats.fallback_to_none_misses + 1
+        self.laps_prefill_stats = replace(self.laps_prefill_stats, **updates)
 
     def dispatch(
         self,
@@ -328,6 +579,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 self._next_laps_prefill_request
             )
             if hinted_num_reqs == num_reqs and hinted_num_tokens == num_tokens:
+                if not self.supports_laps_prefill_graph():
+                    self.record_laps_prefill_miss("unsupported_mode")
+                    return BatchExecutionDescriptor(
+                        cg_mode=CUDAGraphMode.NONE,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                    )
                 desc = self.dispatch_laps_prefill(
                     num_reqs,
                     num_tokens,
@@ -335,6 +593,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 )
                 if desc is not None:
                     return desc
+                self.record_laps_prefill_miss("fallback_to_none", count_miss=False)
                 return BatchExecutionDescriptor(
                     cg_mode=CUDAGraphMode.NONE,
                     num_tokens=num_tokens,
@@ -419,6 +678,41 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 kv_cache_config,
             )
         return state.slot_mappings_by_layer
+
+    def get_laps_prefill_graph_stats(self) -> LAPSPrefillGraphStats:
+        return self.laps_prefill_stats
+
+    def maybe_log_laps_prefill_graph_stats(self, force: bool = False) -> None:
+        interval_s = envs.VLLM_ASCEND_LAPS_PREFILL_GRAPH_STATS_LOG_INTERVAL_S
+        if interval_s <= 0:
+            return
+        now = time.monotonic()
+        if not force and (now - self._laps_prefill_stats_last_log_at) < interval_s:
+            return
+        self._laps_prefill_stats_last_log_at = now
+        stats = self.laps_prefill_stats
+        replay_tps = (stats.replay_tokens / stats.replay_us * 1e6) if stats.replay_us else 0.0
+        eager_tps = (stats.eager_tokens / stats.eager_us * 1e6) if stats.eager_us else 0.0
+        logger.info(
+            "LAPS prefill graph stats: candidates=%d hits=%d misses=%d unsupported=%d "
+            "no_graph_key=%d shape_overflow=%d abi_guard=%d fallback_none=%d "
+            "replay_tokens=%d eager_tokens=%d replay_us=%d eager_us=%d "
+            "replay_tps=%.3f eager_tps=%.3f",
+            stats.candidates,
+            stats.hits,
+            stats.misses,
+            stats.unsupported_mode_misses,
+            stats.no_graph_key_misses,
+            stats.shape_overflow_misses,
+            stats.abi_guard_misses,
+            stats.fallback_to_none_misses,
+            stats.replay_tokens,
+            stats.eager_tokens,
+            stats.replay_us,
+            stats.eager_us,
+            replay_tps,
+            eager_tps,
+        )
 
     def capture(
         self,

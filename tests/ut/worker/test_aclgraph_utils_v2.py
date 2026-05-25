@@ -13,6 +13,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import (
     LAPSPrefillGraphState,
     ModelAclGraphManager,
     PrefillGraphKey,
+    assert_laps_prefill_replay_metadata_sources,
     prepare_inputs_to_capture,
 )
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
@@ -119,7 +120,7 @@ class TestAclGraphUtilsV2(unittest.TestCase):
                 model_runner=model_runner,
             )
 
-        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=4, num_tokens=8)]
+        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=4, num_tokens=8, max_query_len=8)]
         state = manager._get_or_create_laps_prefill_state(desc)
         source_buffers = AscendInputBuffers(
             max_num_reqs=8,
@@ -146,6 +147,10 @@ class TestAclGraphUtilsV2(unittest.TestCase):
         self.assertEqual(materialized.replay_query_start_loc.data_ptr(), state.input_buffers.query_start_loc.data_ptr())
         self.assertEqual(materialized.replay_query_start_loc_np.tolist(), [0, 2, 4, 4, 8])
         self.assertEqual(materialized.replay_seq_lens_np.tolist(), [2, 2, 0, 4])
+        self.assertEqual(
+            materialized.replay_seq_lens_summary,
+            {"min": 0, "max": 4, "nonzero": 3, "buckets": {"1": 0, "2_4": 3, "5_16": 0, "17_plus": 0}},
+        )
         self.assertEqual(manager._build_laps_prefill_replay_plan(desc, input_batch).right_align, False)
 
     def test_prepare_laps_prefill_replay_slot_mappings_uses_graph_owned_buffer(self):
@@ -173,7 +178,7 @@ class TestAclGraphUtilsV2(unittest.TestCase):
                 model_runner=model_runner,
             )
 
-        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=4, num_tokens=8)]
+        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=4, num_tokens=8, max_query_len=8)]
         state = manager._get_or_create_laps_prefill_state(desc)
         input_batch = MagicMock()
         input_batch.idx_mapping = torch.tensor([0, 1], dtype=torch.int32)
@@ -224,7 +229,7 @@ class TestAclGraphUtilsV2(unittest.TestCase):
                 model_runner=model_runner,
             )
 
-        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=2, num_tokens=8)]
+        desc = manager.laps_prefill_descs[PrefillGraphKey(num_reqs=2, num_tokens=8, max_query_len=8)]
         manager.graphs[desc] = MagicMock()
         self.assertEqual(manager.dispatch_laps_prefill(2, 6, 4), desc)
 
@@ -300,7 +305,7 @@ class TestAclGraphUtilsV2(unittest.TestCase):
         input_batch.replay_seq_lens_np = replay_seq_lens_np
         input_batch.replay_num_tokens = 8
 
-        AscendModelState._assert_laps_prefill_replay_metadata_sources(
+        assert_laps_prefill_replay_metadata_sources(
             input_batch=input_batch,
             attn_metadata={"layer0": metadata},
             block_tables=(block_table,),
@@ -338,7 +343,7 @@ class TestAclGraphUtilsV2(unittest.TestCase):
         input_batch.replay_num_tokens = 8
 
         with self.assertRaisesRegex(AssertionError, "slot_mapping"):
-            AscendModelState._assert_laps_prefill_replay_metadata_sources(
+            assert_laps_prefill_replay_metadata_sources(
                 input_batch=input_batch,
                 attn_metadata={"layer0": metadata},
                 block_tables=(block_table,),

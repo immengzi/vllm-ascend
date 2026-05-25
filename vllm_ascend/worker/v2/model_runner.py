@@ -18,6 +18,7 @@
 #
 
 import numpy as np
+import time
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -35,7 +36,10 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import set_weight_prefetch_method
-from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+from vllm_ascend.worker.v2.aclgraph_utils import (
+    LAPSPrefillCUDAGraphStat,
+    ModelAclGraphManager,
+)
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.block_table import AscendBlockTables
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
@@ -136,6 +140,7 @@ class NPUModelRunner(GPUModelRunner):
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+        self._laps_prefill_run_started_at_us: int | None = None
 
     def _should_hint_laps_prefill_graph(
         self,
@@ -169,6 +174,7 @@ class NPUModelRunner(GPUModelRunner):
         hint_laps_prefill = (
             not dummy_run and self._should_hint_laps_prefill_graph(scheduler_output)
         )
+        started_at_us = time.time_ns() // 1000 if hint_laps_prefill else None
         if hint_laps_prefill:
             self.cudagraph_manager.set_next_laps_prefill_request(
                 len(scheduler_output.num_scheduled_tokens),
@@ -176,12 +182,32 @@ class NPUModelRunner(GPUModelRunner):
                 max(scheduler_output.num_scheduled_tokens.values()),
             )
         try:
-            return super().execute_model(
+            output = super().execute_model(
                 scheduler_output,
                 intermediate_tensors,
                 dummy_run=dummy_run,
                 skip_attn_for_dummy_run=skip_attn_for_dummy_run,
             )
+            if started_at_us is not None and self.input_batch is not None:
+                self._run_laps_prefill_timing(
+                    self.input_batch,
+                    replay=self.input_batch.replay_num_reqs is not None,
+                    started_at_us=started_at_us,
+                )
+                cudagraph_stats = getattr(output, "cudagraph_stats", None)
+                if cudagraph_stats is not None:
+                    setattr(
+                        output,
+                        "cudagraph_stats",
+                        LAPSPrefillCUDAGraphStat(
+                            num_unpadded_tokens=cudagraph_stats.num_unpadded_tokens,
+                            num_padded_tokens=cudagraph_stats.num_padded_tokens,
+                            num_paddings=cudagraph_stats.num_paddings,
+                            runtime_mode=cudagraph_stats.runtime_mode,
+                            laps_prefill_graph_stats=self.cudagraph_manager.get_laps_prefill_graph_stats(),
+                        ),
+                    )
+            return output
         finally:
             if hint_laps_prefill:
                 self.cudagraph_manager.clear_next_laps_prefill_request()
@@ -392,12 +418,33 @@ class NPUModelRunner(GPUModelRunner):
             slot_mappings = self.cudagraph_manager._get_or_create_laps_prefill_state(
                 input_batch.replay_desc
             ).slot_mappings[:, : input_batch.replay_num_tokens]
+            self.cudagraph_manager._validate_laps_replay_abi(
+                input_batch,
+                input_batch.attn_metadata,
+                block_tables,
+                slot_mappings,
+            )
         else:
             input_batch.slot_mappings = build_slot_mappings_by_layer(
                 slot_mappings,
                 self.kv_cache_config,
             )
         return block_tables, slot_mappings
+
+    def _run_laps_prefill_timing(
+        self,
+        input_batch: AscendInputBatch,
+        *,
+        replay: bool,
+        started_at_us: int,
+    ) -> None:
+        elapsed_us = max(0, int(time.time_ns() // 1000) - started_at_us)
+        self.cudagraph_manager.record_laps_prefill_execution(
+            replay=replay,
+            num_tokens=input_batch.num_tokens,
+            elapsed_us=elapsed_us,
+        )
+        self.cudagraph_manager.maybe_log_laps_prefill_graph_stats()
 
     def postprocess(
         self,
