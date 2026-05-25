@@ -63,31 +63,19 @@ export VLLM_ASCEND_LAPS_WAIT_MAX_BATCH=4
 
 - `VLLM_ASCEND_LAPS_SCHEDULING=0`
   - Keep the normal scheduler path.
-- `VLLM_ASCEND_LAPS_SCHEDULING=1` and normal serving
-  - Use `vllm_ascend.core.laps_scheduler.LAPSScheduler`.
-  - Note: The standalone `LAPSScheduler` is deprecated; use
-    `RecomputeScheduler` with `VLLM_ASCEND_LAPS_SCHEDULING=1` instead.
 - `VLLM_ASCEND_LAPS_SCHEDULING=1` and `recompute_scheduler_enable=true`
   - Keep `RecomputeScheduler`, and install the LAPS waiting queue inside it.
+- `VLLM_ASCEND_LAPS_SCHEDULING=1` and `recompute_scheduler_enable=false`
+  - LAPS is not activated. The platform logs a warning and keeps the default
+    scheduler path.
 - `SLO_limits_for_dynamic_batch != -1`
   - `SchedulerDynamicBatch` takes precedence and LAPS is ignored.
 
 In other words, the effective priority is:
 
-`dynamic batch > recompute (+ optional LAPS) > LAPS > default`
+`dynamic batch > recompute (+ optional LAPS) > default`
 
 ## Minimal Examples
-
-Enable LAPS in normal serving:
-
-```bash
-export VLLM_ASCEND_LAPS_SCHEDULING=1
-export VLLM_ASCEND_LAPS_THRESHOLD=256
-export VLLM_ASCEND_LAPS_WAIT_WINDOW_MS=5
-export VLLM_ASCEND_LAPS_WAIT_MAX_BATCH=4
-
-vllm serve <model> ...
-```
 
 Enable recompute scheduler together with LAPS:
 
@@ -133,5 +121,7 @@ Dispatch priority is always: immediate > short > long.
   decode instances across nodes or proxies.
 - The implementation targets the vLLM waiting-queue layer and is intended for
   PD / EPD style serving where prompt length skew is a dominant bottleneck.
+- LAPS currently requires `recompute_scheduler_enable=true`; enabling only
+  `VLLM_ASCEND_LAPS_SCHEDULING=1` is not sufficient.
 - When dynamic batch is selected through `SLO_limits_for_dynamic_batch`,
   LAPS is not applied.
