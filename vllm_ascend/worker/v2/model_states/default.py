@@ -17,6 +17,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from typing import Any
+
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
