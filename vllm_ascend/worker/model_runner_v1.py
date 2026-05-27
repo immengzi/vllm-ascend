@@ -92,6 +92,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend import envs
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -418,9 +419,34 @@ class NPUModelRunner(GPUModelRunner):
             self.compilation_config.cudagraph_capture_sizes
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
-            self.cudagraph_batch_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
+            base_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
         else:
-            self.cudagraph_batch_sizes = []
+            base_sizes = []
+        self.cudagraph_batch_sizes = base_sizes
+
+        # Merge batch prefill capture sizes if enabled.
+        # These bs x seq_len combinations allow LAPS to batch multiple short
+        # prefills into a single NPU graph execution.
+        if envs.VLLM_ASCEND_BATCH_PREFILL_GRAPH:
+            try:
+                batch_sizes = [int(x) for x in envs.VLLM_ASCEND_BATCH_PREFILL_BATCH_SIZES.split(",")]
+                seq_lengths = [int(x) for x in envs.VLLM_ASCEND_BATCH_PREFILL_SEQ_LENGTHS.split(",")]
+                max_seq_len = envs.VLLM_ASCEND_BATCH_PREFILL_MAX_SEQ_LEN
+                # Filter out sequences longer than max_seq_len
+                seq_lengths = [sl for sl in seq_lengths if sl <= max_seq_len]
+                # Generate all bs x seq_len combinations and merge
+                batch_prefill_sizes = []
+                for bs in batch_sizes:
+                    for sl in seq_lengths:
+                        batch_prefill_sizes.append(bs * sl)
+                # Merge with existing sizes, deduplicate, and sort
+                self.cudagraph_batch_sizes = sorted(set(self.cudagraph_batch_sizes + batch_prefill_sizes))
+            except (ValueError, AttributeError):
+                logger.warning(
+                    "Invalid batch prefill graph configuration. "
+                    "Skipping batch prefill graph optimization."
+                )
+
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
 
@@ -593,6 +619,118 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.copy_to_gpu()
 
         return num_reqs_padded
+
+    def _find_batch_prefill_graph(
+        self, actual_bs: int, max_extend_len: int
+    ) -> tuple[int, int] | None:
+        """
+        Find the smallest (batch_size, seq_len) combination from configured
+        batch prefill sizes that can accommodate the actual batch.
+
+        Args:
+            actual_bs: Actual number of requests in the batch.
+            max_extend_len: Maximum length among all requests in the batch.
+
+        Returns:
+            (target_bs, target_seq_len) tuple if found, None otherwise.
+        """
+        if not envs.VLLM_ASCEND_BATCH_PREFILL_GRAPH:
+            return None
+
+        try:
+            batch_sizes = [int(x) for x in envs.VLLM_ASCEND_BATCH_PREFILL_BATCH_SIZES.split(",")]
+            seq_lengths = [int(x) for x in envs.VLLM_ASCEND_BATCH_PREFILL_SEQ_LENGTHS.split(",")]
+            max_seq_len = envs.VLLM_ASCEND_BATCH_PREFILL_MAX_SEQ_LEN
+        except (ValueError, AttributeError):
+            return None
+
+        # Skip if max_extend_len exceeds configured max
+        if max_extend_len > max_seq_len:
+            return None
+
+        # Find the smallest combination that fits
+        for bs in sorted(batch_sizes):
+            if bs < actual_bs:
+                continue
+            for sl in sorted(seq_lengths):
+                if sl >= max_extend_len:
+                    return bs, sl
+
+        return None
+
+    def _right_align_for_batch_prefill(
+        self,
+        num_reqs: int,
+        target_bs: int,
+        target_seq_len: int,
+        extend_lens: np.ndarray,
+    ) -> None:
+        """
+        Reorganize tokens for batch prefill graph: right-align each sequence
+        in fixed slots, set uniform query_start_loc, and fill dummy requests.
+
+        This transforms tightly-packed tokens [req0, req1, ...] into
+        [pad..real0, pad..real1, ...] layout.
+
+        Args:
+            num_reqs: Actual number of requests.
+            target_bs: Target batch size for the graph.
+            target_seq_len: Target sequence length for each slot.
+            extend_lens: Number of tokens scheduled per request.
+        """
+        # Copy current tokens to a temporary buffer for safe in-place reorganization
+        input_ids_cpu = self.input_ids.cpu
+        positions_cpu = self.positions.cpu
+        total_tokens = target_bs * target_seq_len
+
+        # Move tokens from right to left to avoid overwriting
+        # Start from the last sequence and work backwards
+        for req_idx in range(num_reqs - 1, -1, -1):
+            real_len = extend_lens[req_idx]
+            if real_len == 0:
+                continue
+
+            # Source position: where this req's tokens currently are (tightly packed)
+            # We need to find where each request's tokens start in the current layout
+            # Cumulative sum of previous extend_lens gives the start position
+            src_start = int(extend_lens[:req_idx].sum())
+
+            # Target position: right-aligned in this req's slot
+            slot_start = req_idx * target_seq_len
+            target_start = slot_start + target_seq_len - real_len
+
+            # Copy tokens from source to target position
+            input_ids_cpu[target_start : target_start + real_len] = input_ids_cpu[
+                src_start : src_start + real_len
+            ]
+            positions_cpu[target_start : target_start + real_len] = positions_cpu[
+                src_start : src_start + real_len
+            ]
+
+        # Fill padded regions with dummy token (e.g., 0)
+        # For real requests, fill left padding
+        for req_idx in range(num_reqs):
+            real_len = extend_lens[req_idx]
+            if real_len < target_seq_len:
+                slot_start = req_idx * target_seq_len
+                input_ids_cpu[slot_start : slot_start + target_seq_len - real_len] = 0
+
+        # Fill dummy requests entirely with padding
+        if num_reqs < target_bs:
+            dummy_start = num_reqs * target_seq_len
+            input_ids_cpu[dummy_start:total_tokens] = 0
+            positions_cpu[dummy_start:total_tokens] = 0
+
+        # Set uniform query_start_loc
+        self.query_start_loc.np[0] = 0
+        for i in range(target_bs):
+            self.query_start_loc.np[i + 1] = (i + 1) * target_seq_len
+        self.query_start_loc.np[target_bs + 1 :] = target_bs * target_seq_len
+        self.query_start_loc.copy_to_gpu()
+
+        # Copy to GPU
+        self.input_ids.copy_to_gpu(total_tokens)
+        self.positions.copy_to_gpu(total_tokens)
 
     def _prepare_inputs(
         self,
@@ -1224,13 +1362,92 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
-                (
-                    cudagraph_mode,
-                    batch_desc,
-                    should_ubatch,
-                    num_tokens_across_dp,
-                    cudagraph_stats,
-                ) = self._determine_batch_execution_and_padding(
+                # Check if batch prefill graph can be used.
+                # This allows LAPS to batch multiple short prefills into a single
+                # NPU graph execution with fixed-size right-aligned layout.
+                use_batch_prefill = (
+                    envs.VLLM_ASCEND_BATCH_PREFILL_GRAPH
+                    and self.use_aclgraph
+                    and num_reqs > 1
+                    and self.with_prefill
+                    and not self.is_multimodal_model
+                )
+
+                if use_batch_prefill:
+                    target = self._find_batch_prefill_graph(num_reqs, max_num_scheduled_tokens)
+                    if target is not None:
+                        target_bs, target_seq_len = target
+
+                        # A. Right-align input tokens in fixed-size slots
+                        self._right_align_for_batch_prefill(
+                            num_reqs, target_bs, target_seq_len, num_scheduled_tokens_np
+                        )
+
+                        # B. Override scheduling parameters for batch prefill graph
+                        cudagraph_mode = CUDAGraphMode.FULL
+                        batch_desc = BatchDescriptor(
+                            num_tokens=target_bs * target_seq_len,
+                            num_reqs=target_bs,
+                            uniform=True,
+                        )
+                        num_tokens_padded = target_bs * target_seq_len
+                        num_reqs_padded = target_bs
+
+                        # C. Force attention state to use cache path.
+                        # This ensures padding tokens don't pollute attention via
+                        # self-attention in PrefillNoCache mode.
+                        self.attn_state = AscendAttentionState.ChunkedPrefill
+
+                        # D. Set logits_indices to last position of each slot
+                        # For right-aligned tokens, the last real token is at:
+                        # slot_start + seq_len - 1 = i * target_seq_len + target_seq_len - 1
+                        logits_indices = torch.arange(
+                            target_seq_len - 1,
+                            target_bs * target_seq_len,
+                            target_seq_len,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+
+                        # E. Skip _pad_query_start_loc_for_fia since query_start_loc
+                        # was already set correctly by _right_align_for_batch_prefill
+
+                        # F. Set other required variables
+                        should_ubatch = False
+                        ubatch_slices, ubatch_slices_padded = None, None
+                        pad_attn = True
+
+                        # G. Sync batch across DP if needed
+                        num_tokens_across_dp = None
+                        if self.vllm_config.parallel_config.data_parallel_size > 1:
+                            _, num_tokens_across_dp, _ = self._sync_batch_across_dp(
+                                num_tokens_padded=num_tokens_padded,
+                                cudagraph_mode=cudagraph_mode.value,
+                            )
+
+                        # H. Create cudagraph stats
+                        cudagraph_stats = None
+                        if self.vllm_config.observability_config.cudagraph_metrics:
+                            cudagraph_stats = CUDAGraphStat(
+                                num_unpadded_tokens=int(num_scheduled_tokens_np.sum()),
+                                num_padded_tokens=num_tokens_padded,
+                                num_paddings=num_tokens_padded - int(num_scheduled_tokens_np.sum()),
+                                runtime_mode=str(cudagraph_mode),
+                            )
+
+                        # Update num_tokens_unpadded to match padded size
+                        num_tokens_unpadded = num_tokens_padded
+                    else:
+                        use_batch_prefill = False
+
+                if not use_batch_prefill:
+                    (
+                        cudagraph_mode,
+                        batch_desc,
+                        should_ubatch,
+                        num_tokens_across_dp,
+                        cudagraph_stats,
+                    ) = self._determine_batch_execution_and_padding(
                     num_tokens=num_tokens_unpadded,
                     num_reqs=num_reqs,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
@@ -1281,7 +1498,9 @@ class NPUModelRunner(GPUModelRunner):
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-                if (
+                # For batch prefill, query_start_loc is already set correctly
+                # in _right_align_for_batch_prefill, so skip padding here.
+                if not use_batch_prefill and (
                     cudagraph_mode == CUDAGraphMode.FULL
                     or (enable_sp() and not self.model_config.use_mla)
                     and self.pcp_size * self.dcp_size == 1
