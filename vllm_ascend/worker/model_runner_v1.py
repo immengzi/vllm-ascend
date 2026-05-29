@@ -648,12 +648,14 @@ class NPUModelRunner(GPUModelRunner):
         if max_extend_len > max_seq_len:
             return None
 
-        # Find the smallest combination that fits
+        # Find the smallest combination that fits within buffer capacity
         for bs in sorted(batch_sizes):
             if bs < actual_bs:
                 continue
             for sl in sorted(seq_lengths):
                 if sl >= max_extend_len:
+                    if bs * sl > self.max_num_tokens:
+                        break  # larger sl won't help, try next bs
                     return bs, sl
 
         return None

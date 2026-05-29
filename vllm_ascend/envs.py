@@ -133,7 +133,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_BATCH_PREFILL_GRAPH": lambda: bool(int(os.getenv("VLLM_ASCEND_BATCH_PREFILL_GRAPH", "0"))),
     # Maximum sequence length for batch prefill graph capture. Only sequences
     # with length <= this threshold will be considered for batch prefill graph.
-    "VLLM_ASCEND_BATCH_PREFILL_MAX_SEQ_LEN": lambda: int(os.getenv("VLLM_ASCEND_BATCH_PREFILL_MAX_SEQ_LEN", "256")),
+    "VLLM_ASCEND_BATCH_PREFILL_MAX_SEQ_LEN": lambda: int(os.getenv("VLLM_ASCEND_BATCH_PREFILL_MAX_SEQ_LEN", "2048")),
     # Comma-separated list of batch sizes for batch prefill graph capture.
     # Example: "1,2,4,8". The scheduler will select the smallest batch size
     # that can accommodate the actual batch.
@@ -141,7 +141,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated list of sequence lengths for batch prefill graph capture.
     # Example: "16,32,64,128,256". The scheduler will select the smallest
     # sequence length that can accommodate the actual sequences.
-    "VLLM_ASCEND_BATCH_PREFILL_SEQ_LENGTHS": lambda: os.getenv("VLLM_ASCEND_BATCH_PREFILL_SEQ_LENGTHS", "16,32,64,128,256"),
+    "VLLM_ASCEND_BATCH_PREFILL_SEQ_LENGTHS": lambda: os.getenv("VLLM_ASCEND_BATCH_PREFILL_SEQ_LENGTHS", "32,64,128,256,512,1024,2048"),
 }
 
 # end-env-vars-definition
