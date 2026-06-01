@@ -682,32 +682,37 @@ class NPUModelRunner(GPUModelRunner):
             target_seq_len: Target sequence length for each slot.
             extend_lens: Number of tokens scheduled per request.
         """
-        # Copy current tokens to a temporary buffer for safe in-place reorganization
         input_ids_cpu = self.input_ids.cpu
         positions_cpu = self.positions.cpu
         total_tokens = target_bs * target_seq_len
 
-        # Move tokens from right to left to avoid overwriting
-        # Start from the last sequence and work backwards
+        # Snapshot the tightly-packed source region before reorganising.
+        # Reading from and writing to the same array causes overlapping-memory
+        # errors when source and target ranges intersect.
+        total_real_tokens = int(extend_lens.sum())
+        orig_input_ids = input_ids_cpu[:total_real_tokens].copy()
+        orig_positions = positions_cpu[:total_real_tokens].copy()
+
+        # Right-align each request's tokens into its fixed-size slot.
+        # Process backwards so earlier (lower-address) slots are written last,
+        # but overlap is already safe thanks to the snapshot above.
         for req_idx in range(num_reqs - 1, -1, -1):
             real_len = extend_lens[req_idx]
             if real_len == 0:
                 continue
 
-            # Source position: where this req's tokens currently are (tightly packed)
-            # We need to find where each request's tokens start in the current layout
-            # Cumulative sum of previous extend_lens gives the start position
+            # Source position in the tightly-packed snapshot
             src_start = int(extend_lens[:req_idx].sum())
 
             # Target position: right-aligned in this req's slot
             slot_start = req_idx * target_seq_len
             target_start = slot_start + target_seq_len - real_len
 
-            # Copy tokens from source to target position
-            input_ids_cpu[target_start : target_start + real_len] = input_ids_cpu[
+            # Copy from snapshot to target position (no overlap possible)
+            input_ids_cpu[target_start : target_start + real_len] = orig_input_ids[
                 src_start : src_start + real_len
             ]
-            positions_cpu[target_start : target_start + real_len] = positions_cpu[
+            positions_cpu[target_start : target_start + real_len] = orig_positions[
                 src_start : src_start + real_len
             ]
 
