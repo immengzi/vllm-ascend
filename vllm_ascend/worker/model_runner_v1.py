@@ -81,6 +81,7 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
 )
+from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -1584,6 +1585,17 @@ class NPUModelRunner(GPUModelRunner):
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
+        # Enable CUDA graph capturing for batch prefill graph
+        # This is needed because vLLM disables capturing after profiling,
+        # but batch prefill graph captures new graphs during execution
+        using_batch_prefill_graph = (
+            cudagraph_mode == CUDAGraphMode.FULL
+            and batch_desc is not None
+            and getattr(batch_desc, "uniform", False)
+        )
+        if using_batch_prefill_graph:
+            set_cudagraph_capturing_enabled(True)
+
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
         with (
@@ -1610,6 +1622,10 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+
+        # Restore CUDA graph capturing state
+        if using_batch_prefill_graph:
+            set_cudagraph_capturing_enabled(False)
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
