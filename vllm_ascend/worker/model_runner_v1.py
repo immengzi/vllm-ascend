@@ -674,7 +674,9 @@ class NPUModelRunner(GPUModelRunner):
         in fixed slots, set uniform query_start_loc, and fill dummy requests.
 
         This transforms tightly-packed tokens [req0, req1, ...] into
-        [pad..real0, pad..real1, ...] layout.
+        [pad..real0, pad..real1, ...] layout with target_bs * target_seq_len
+        total tokens. Padding positions get input_id=0, position=0, and
+        slot_mapping=-1 so they don't pollute the KV cache.
 
         Args:
             num_reqs: Actual number of requests.
@@ -682,64 +684,64 @@ class NPUModelRunner(GPUModelRunner):
             target_seq_len: Target sequence length for each slot.
             extend_lens: Number of tokens scheduled per request.
         """
-        input_ids_cpu = self.input_ids.cpu
-        positions_cpu = self.positions.cpu
         total_tokens = target_bs * target_seq_len
+        total_real = int(extend_lens.sum())
 
-        # Snapshot the tightly-packed source region before reorganising.
-        # Reading from and writing to the same array causes overlapping-memory
-        # errors when source and target ranges intersect.
-        total_real_tokens = int(extend_lens.sum())
-        orig_input_ids = input_ids_cpu[:total_real_tokens].copy()
-        orig_positions = positions_cpu[:total_real_tokens].copy()
+        # Precompute cumulative token starts for each request.
+        cum = np.zeros(num_reqs + 1, dtype=np.int64)
+        np.cumsum(extend_lens[:num_reqs], out=cum[1:])
 
-        # Right-align each request's tokens into its fixed-size slot.
-        # Process backwards so earlier (lower-address) slots are written last,
-        # but overlap is already safe thanks to the snapshot above.
-        for req_idx in range(num_reqs - 1, -1, -1):
-            real_len = extend_lens[req_idx]
-            if real_len == 0:
+        # --- CPU: rearrange input_ids and positions via numpy views ---
+        # Use .np (numpy view of the pinned CPU tensor) so .copy() works and
+        # modifications are reflected in .cpu for copy_to_gpu().
+        ids_np = self.input_ids.np
+        pos_np = self.positions.np
+
+        # Snapshot the tightly-packed source before overwriting.
+        orig_ids = ids_np[:total_real].copy()
+        orig_pos = pos_np[:total_real].copy()
+
+        # Zero-fill the entire target region first.  This handles:
+        #   - left-padding for real requests
+        #   - dummy request slots
+        #   - position=0 for all padding tokens
+        ids_np[:total_tokens] = 0
+        pos_np[:total_tokens] = 0
+
+        # Place each request's real tokens right-aligned in its slot.
+        for i in range(num_reqs):
+            n = int(extend_lens[i])
+            if n == 0:
                 continue
+            src = int(cum[i])
+            dst = i * target_seq_len + target_seq_len - n
+            ids_np[dst : dst + n] = orig_ids[src : src + n]
+            pos_np[dst : dst + n] = orig_pos[src : src + n]
 
-            # Source position in the tightly-packed snapshot
-            src_start = int(extend_lens[:req_idx].sum())
+        self.input_ids.copy_to_gpu(total_tokens)
+        self.positions.copy_to_gpu(total_tokens)
 
-            # Target position: right-aligned in this req's slot
-            slot_start = req_idx * target_seq_len
-            target_start = slot_start + target_seq_len - real_len
+        # --- GPU: rearrange slot_mapping for each block-table group ---
+        # slot_mapping was committed for the old tightly-packed layout.
+        # Padding slots must get -1 so reshape_and_cache skips them.
+        for bt in self.input_batch.block_table.block_tables:
+            sm_gpu = bt.slot_mapping.gpu
+            orig_sm = sm_gpu[:total_real].clone()
+            sm_gpu[:total_tokens].fill_(-1)
+            for i in range(num_reqs):
+                n = int(extend_lens[i])
+                if n == 0:
+                    continue
+                src = int(cum[i])
+                dst = i * target_seq_len + target_seq_len - n
+                sm_gpu[dst : dst + n] = orig_sm[src : src + n]
 
-            # Copy from snapshot to target position (no overlap possible)
-            input_ids_cpu[target_start : target_start + real_len] = orig_input_ids[
-                src_start : src_start + real_len
-            ]
-            positions_cpu[target_start : target_start + real_len] = orig_positions[
-                src_start : src_start + real_len
-            ]
-
-        # Fill padded regions with dummy token (e.g., 0)
-        # For real requests, fill left padding
-        for req_idx in range(num_reqs):
-            real_len = extend_lens[req_idx]
-            if real_len < target_seq_len:
-                slot_start = req_idx * target_seq_len
-                input_ids_cpu[slot_start : slot_start + target_seq_len - real_len] = 0
-
-        # Fill dummy requests entirely with padding
-        if num_reqs < target_bs:
-            dummy_start = num_reqs * target_seq_len
-            input_ids_cpu[dummy_start:total_tokens] = 0
-            positions_cpu[dummy_start:total_tokens] = 0
-
-        # Set uniform query_start_loc
+        # --- query_start_loc: uniform slots ---
         self.query_start_loc.np[0] = 0
         for i in range(target_bs):
             self.query_start_loc.np[i + 1] = (i + 1) * target_seq_len
-        self.query_start_loc.np[target_bs + 1 :] = target_bs * target_seq_len
+        self.query_start_loc.np[target_bs + 1 :] = total_tokens
         self.query_start_loc.copy_to_gpu()
-
-        # Copy to GPU
-        self.input_ids.copy_to_gpu(total_tokens)
-        self.positions.copy_to_gpu(total_tokens)
 
     def _prepare_inputs(
         self,
