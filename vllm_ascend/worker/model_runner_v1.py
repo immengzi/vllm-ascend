@@ -219,6 +219,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    using_batch_prefill_graph: bool
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -1140,6 +1141,7 @@ class NPUModelRunner(GPUModelRunner):
         aux_hidden_states: torch.Tensor = None,
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
+        using_batch_prefill_graph: bool = False,
     ) -> list[list[int]] | None:
         if not self.drafter:
             # Speculative decoding is not enabled.
@@ -1150,6 +1152,11 @@ class NPUModelRunner(GPUModelRunner):
             draft_token_ids = self.drafter.propose(
                 valid_sampled_token_ids, sampling_metadata, spec_decode_metadata, sample_hidden_states
             )
+        elif using_batch_prefill_graph:
+            # Batch prefill graph right-aligns tokens into fixed-size slots with
+            # dummy padding, corrupting the layout that the drafter expects.
+            # Skip proposing on this iteration; MTP still runs on decode steps.
+            draft_token_ids = None
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
@@ -1699,6 +1706,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                using_batch_prefill_graph,
             )
             self.kv_connector_output = kv_connector_output
         return None
@@ -1742,6 +1750,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            using_batch_prefill_graph,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -1779,6 +1788,7 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states,
                 sample_hidden_states,
                 batch_desc,
+                using_batch_prefill_graph=using_batch_prefill_graph,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
