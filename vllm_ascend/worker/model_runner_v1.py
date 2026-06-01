@@ -1968,6 +1968,10 @@ class NPUModelRunner(GPUModelRunner):
         # the sampled tokens back, because there's no direct communication
         # between the first-stage worker and the last-stage worker.
         req_ids = self.input_batch.req_ids
+        # Limit num_sampled_tokens to actual number of requests.
+        # This handles batch prefill graph mode where target_bs may be larger
+        # than num_reqs due to dummy padded requests.
+        num_sampled_tokens = min(num_sampled_tokens, len(req_ids))
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
                 sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
