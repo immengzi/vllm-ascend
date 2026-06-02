@@ -675,8 +675,14 @@ class NPUModelRunner(GPUModelRunner):
 
         This transforms tightly-packed tokens [req0, req1, ...] into
         [pad..real0, pad..real1, ...] layout with target_bs * target_seq_len
-        total tokens. Padding positions get input_id=0, position=0, and
-        slot_mapping=-1 so they don't pollute the KV cache.
+        total tokens.
+
+        Padding tokens use the first real slot of their owning request (or
+        request 0 for dummy requests) so that NPU fused operators
+        (npu_kv_rmsnorm_rope_cache, npu_scatter_nd_update_) always write to a
+        valid, already-allocated cache address.  The real token's write
+        overwrites the padding write at that slot, producing the correct final
+        value.
 
         Args:
             num_reqs: Actual number of requests.
@@ -692,8 +698,6 @@ class NPUModelRunner(GPUModelRunner):
         np.cumsum(extend_lens[:num_reqs], out=cum[1:])
 
         # --- CPU: rearrange input_ids and positions via numpy views ---
-        # Use .np (numpy view of the pinned CPU tensor) so .copy() works and
-        # modifications are reflected in .cpu for copy_to_gpu().
         ids_np = self.input_ids.np
         pos_np = self.positions.np
 
@@ -701,10 +705,7 @@ class NPUModelRunner(GPUModelRunner):
         orig_ids = ids_np[:total_real].copy()
         orig_pos = pos_np[:total_real].copy()
 
-        # Zero-fill the entire target region first.  This handles:
-        #   - left-padding for real requests
-        #   - dummy request slots
-        #   - position=0 for all padding tokens
+        # Zero-fill the entire target region first.
         ids_np[:total_tokens] = 0
         pos_np[:total_tokens] = 0
 
@@ -722,18 +723,31 @@ class NPUModelRunner(GPUModelRunner):
         self.positions.copy_to_gpu(total_tokens)
 
         # --- GPU: rearrange slot_mapping for each block-table group ---
-        # slot_mapping was committed for the old tightly-packed layout.
-        # Padding slots must get -1 so reshape_and_cache skips them.
+        # Padding tokens use the first real slot of their request so that
+        # NPU fused operators write to a valid address.  Dummy request
+        # slots reuse the first real slot of request 0.
         for bt in self.input_batch.block_table.block_tables:
             sm_gpu = bt.slot_mapping.gpu
             orig_sm = sm_gpu[:total_real].clone()
-            sm_gpu[:total_tokens].fill_(-1)
+
+            # Default: fill with first real request's first slot (safe fallback
+            # for dummy request slots and left-padding of real requests).
+            safe_slot = orig_sm[0]  # scalar tensor on GPU
+            sm_gpu[:total_tokens].fill_(safe_slot.item())
+
+            # Overwrite each real request's padding with that request's own
+            # first slot, then place the real slots right-aligned.
             for i in range(num_reqs):
                 n = int(extend_lens[i])
                 if n == 0:
                     continue
                 src = int(cum[i])
-                dst = i * target_seq_len + target_seq_len - n
+                req_safe = orig_sm[src]  # first real slot of request i
+                slot_start = i * target_seq_len
+                pad_len = target_seq_len - n
+                if pad_len > 0:
+                    sm_gpu[slot_start : slot_start + pad_len].fill_(req_safe.item())
+                dst = slot_start + pad_len
                 sm_gpu[dst : dst + n] = orig_sm[src : src + n]
 
         # --- query_start_loc: uniform slots ---
@@ -742,11 +756,6 @@ class NPUModelRunner(GPUModelRunner):
             self.query_start_loc.np[i + 1] = (i + 1) * target_seq_len
         self.query_start_loc.np[target_bs + 1 :] = total_tokens
         self.query_start_loc.copy_to_gpu()
-
-        # Update actual_seq_lengths_q to reflect uniform slot sizes.
-        # This ensures the attention backend uses the correct sequence lengths
-        # for workspace calculation and kernel execution.
-        self.actual_seq_lengths_q = [target_seq_len] * target_bs
 
     def _prepare_inputs(
         self,
@@ -1421,14 +1430,11 @@ class NPUModelRunner(GPUModelRunner):
                         self.attn_state = AscendAttentionState.ChunkedPrefill
 
                         # C2. Fix seq_lens for dummy padded requests.
-                        # _prepare_inputs set seq_lens[num_reqs:] = 0, but
-                        # query_start_loc gives each dummy slot target_seq_len
-                        # query tokens. The NPU attention kernel crashes when
-                        # kv_len=0 with non-zero query_len. Set dummy slots to
-                        # target_seq_len so the kernel reads from block_table[0]
-                        # (already zeroed) for a valid but discarded result.
+                        # Following the LAPS reference: dummy requests use
+                        # seq_lens=1 (minimal KV access) so the attention
+                        # kernel reads only 1 KV entry per dummy.
                         if target_bs > num_reqs:
-                            self.seq_lens.np[num_reqs:target_bs] = target_seq_len
+                            self.seq_lens.np[num_reqs:target_bs] = 1
                             self.seq_lens.copy_to_gpu()
 
                         # C3. Update max_query_len to match the right-aligned
@@ -1571,6 +1577,17 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+
+                # Copy first real request's block table to dummy requests.
+                # _build_attention_metadata fills dummy rows with 0, but dummy
+                # requests need valid page table entries so NPU attention
+                # kernels (npu_lightning_indexer, npu_sparse_flash_attention)
+                # don't access invalid block indices.  Must run AFTER
+                # _build_attention_metadata which zeros out dummy rows.
+                if use_batch_prefill and target_bs > num_reqs:
+                    for bt in self.input_batch.block_table.block_tables:
+                        bt_dev = bt.get_device_tensor()
+                        bt_dev[num_reqs:target_bs] = bt_dev[0:1]
 
             (
                 input_ids,

@@ -1053,8 +1053,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
         # npu_kv_rmsnorm_rope_cache and npu_scatter_nd_update_ don't handle
-        # PAD_SLOT_ID (-1) unlike _npu_reshape_and_cache. Clamp to 0 so
-        # padding positions write to a valid address instead of OOB.
+        # PAD_SLOT_ID (-1).  For batch prefill, _right_align_for_batch_prefill
+        # already uses valid safe slots.  For regular decode graph padding,
+        # clamp the remaining -1 values to 0.
         slot_mapping = slot_mapping.clamp(min=0)
         slot_mapping_cp = None
         if self.enable_dsa_cp:
