@@ -1,0 +1,85 @@
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index xxxxxxx..yyyyyyy 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -535,6 +535,22 @@ class AscendDSAMetadataBuilder(AscendCommonAttentionMetadataBuilder):
+         common_prefix_len: int,
+         common_attn_metadata: AscendCommonAttentionMetadata,
+     ) -> AscendDSAPrefillMetadata:
++        # DEBUG: Check metadata at function entry
++        import os
++        if os.getenv("DEBUG_DSA_COMPRESS") == "1":
++            print(f"[DEBUG_DSA] build_prefill_metadata ENTRY:")
++            print(f"  self.num_actual_tokens: {self.num_actual_tokens}")
++            print(f"  self.num_prefill_tokens: {self.num_prefill_tokens}")
++            print(f"  self.num_prefills: {self.num_prefills}")
++            print(f"  self.num_decodes: {self.num_decodes}")
++            print(f"  self.layer_compressor_ratio: {self.layer_compressor_ratio}")
++            print(f"  self.compressor_ratio: {self.compressor_ratio}")
++            try:
++                import torch_npu
++                torch_npu.npu.synchronize()
++                print(f"  Stream sync: OK at entry")
++            except Exception as e:
++                print(f"  Stream sync FAILED at entry: {e}")
++
+         query_start_loc = common_attn_metadata.query_start_loc
+         # reqs_start: the start request position of prefill request
+         reqs_start = self.num_decodes
+@@ -582,6 +598,28 @@ class AscendDSAMetadataBuilder(AscendCommonAttentionMetadataBuilder):
+
+         def _get_padded_compressed_position(prefill_input_positions,
+                                             compress_ratio):
++            # DEBUG: Check input before processing
++            import os
++            if os.getenv("DEBUG_DSA_COMPRESS") == "1":
++                print(f"[DEBUG_DSA] _get_padded_compressed_position:")
++                print(f"  compress_ratio: {compress_ratio}")
++                print(f"  prefill_input_positions shape: {prefill_input_positions.shape}")
++                print(f"  prefill_input_positions dtype: {prefill_input_positions.dtype}")
++                print(f"  prefill_input_positions device: {prefill_input_positions.device}")
++                try:
++                    print(f"  prefill_input_positions min/max: {prefill_input_positions.min().item()}/{prefill_input_positions.max().item()}")
++                    print(f"  prefill_input_positions first 20: {prefill_input_positions[:20].tolist()}")
++                    print(f"  prefill_input_positions last 20: {prefill_input_positions[-20:].tolist()}")
++                except Exception as e:
++                    print(f"  ERROR accessing positions: {e}")
++                try:
++                    import torch_npu
++                    torch_npu.npu.synchronize()
++                    print(f"  Stream sync: OK before mask calculation")
++                except Exception as e:
++                    print(f"  Stream sync FAILED before mask: {e}")
++
+             if compress_ratio <= 1:
+                 return prefill_input_positions
+             mask = ((prefill_input_positions + 1) % compress_ratio) == 0
++
++            if os.getenv("DEBUG_DSA_COMPRESS") == "1":
++                try:
++                    print(f"  mask calculated, sum={mask.sum().item()}, shape={mask.shape}")
++                    print(f"  mask first 20: {mask[:20].tolist()}")
++                except Exception as e:
++                    print(f"  ERROR accessing mask: {e}")
++
+             input_positions = prefill_input_positions[mask]
++
++            if os.getenv("DEBUG_DSA_COMPRESS") == "1":
++                try:
++                    print(f"  input_positions after mask: shape={input_positions.shape}")
++                    print(f"  input_positions first 20: {input_positions[:20].tolist()}")
++                except Exception as e:
++                    print(f"  ERROR accessing input_positions: {e}")
++
+             input_positions = (input_positions + 1) - compress_ratio
+             target_shape = (min(
+                 self.num_prefill_tokens,
+                 self.num_prefill_tokens // compress_ratio +
+                 self.num_prefills), )
+             pad_right = target_shape[0] - input_positions.shape[0]
+             pad_positions = F.pad(input_positions, (0, pad_right), value=0.0)
++
++            if os.getenv("DEBUG_DSA_COMPRESS") == "1":
++                print(f"  Returning: shape={pad_positions.shape}, pad_right={pad_right}")
++
+             return pad_positions
