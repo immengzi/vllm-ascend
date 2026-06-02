@@ -564,6 +564,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
 
+        # In batch prefill mode, actual_seq_lengths_q contains uniform slot sizes
+        # (e.g., [128, 128, 128, 128] for 4 requests), and actual_seq_lengths_q[-1]
+        # is just one slot size. However, query.shape[0] is target_bs * target_seq_len
+        # (e.g., 4 * 128 = 512). We must use query.shape[0] for workspace sizing to
+        # ensure sufficient memory for the entire batch.
+        if len(actual_seq_lengths_q) > 1 and query.shape[0] > num_tokens:
+            all_equal = all(l == actual_seq_lengths_q[0] for l in actual_seq_lengths_q)
+            if all_equal:
+                num_tokens = query.shape[0]
+
         # Get workspace from cache or calculate it if not present.
         workspace = graph_params.workspaces.get(num_tokens)
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)

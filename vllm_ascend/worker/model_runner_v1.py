@@ -743,6 +743,11 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.np[target_bs + 1 :] = total_tokens
         self.query_start_loc.copy_to_gpu()
 
+        # Update actual_seq_lengths_q to reflect uniform slot sizes.
+        # This ensures the attention backend uses the correct sequence lengths
+        # for workspace calculation and kernel execution.
+        self.actual_seq_lengths_q = [target_seq_len] * target_bs
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
