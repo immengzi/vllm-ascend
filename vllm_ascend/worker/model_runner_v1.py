@@ -1415,6 +1415,23 @@ class NPUModelRunner(GPUModelRunner):
                         # self-attention in PrefillNoCache mode.
                         self.attn_state = AscendAttentionState.ChunkedPrefill
 
+                        # C2. Fix seq_lens for dummy padded requests.
+                        # _prepare_inputs set seq_lens[num_reqs:] = 0, but
+                        # query_start_loc gives each dummy slot target_seq_len
+                        # query tokens. The NPU attention kernel crashes when
+                        # kv_len=0 with non-zero query_len. Set dummy slots to
+                        # target_seq_len so the kernel reads from block_table[0]
+                        # (already zeroed) for a valid but discarded result.
+                        if target_bs > num_reqs:
+                            self.seq_lens.np[num_reqs:target_bs] = target_seq_len
+                            self.seq_lens.copy_to_gpu()
+
+                        # C3. Update max_query_len to match the right-aligned
+                        # slot size. After right-alignment each query in
+                        # query_start_loc is target_seq_len tokens long, so the
+                        # attention metadata must reflect this.
+                        max_num_scheduled_tokens = target_seq_len
+
                         # D. Set logits_indices to last position of each slot
                         # For right-aligned tokens, the last real token is at:
                         # slot_start + seq_len - 1 = i * target_seq_len + target_seq_len - 1
@@ -1770,6 +1787,12 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+
+        # Batch prefill graph produces logits for target_bs slots
+        # (including dummy padded requests). Truncate to actual requests
+        # so the sampler only processes real requests.
+        if using_batch_prefill_graph and logits is not None:
+            logits = logits[: self.input_batch.num_reqs]
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
