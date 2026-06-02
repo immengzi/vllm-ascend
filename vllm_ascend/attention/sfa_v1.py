@@ -1052,6 +1052,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         cos = attn_metadata.cos
         sin = attn_metadata.sin
         slot_mapping = attn_metadata.slot_mapping
+        # npu_kv_rmsnorm_rope_cache and npu_scatter_nd_update_ don't handle
+        # PAD_SLOT_ID (-1) unlike _npu_reshape_and_cache. Clamp to 0 so
+        # padding positions write to a valid address instead of OOB.
+        slot_mapping = slot_mapping.clamp(min=0)
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
