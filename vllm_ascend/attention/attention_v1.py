@@ -503,6 +503,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
                         block_tables = attn_metadata[key].block_tables
 
+                    workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                        query=query,
+                        key=key_cache,
+                        value=value,
+                        atten_mask=attn_mask,
+                        block_table=block_tables,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=actual_seq_lengths_q,
+                        actual_seq_lengths_kv=seq_lens,
+                        num_key_value_heads=num_kv_heads,
+                        num_heads=num_heads,
+                        sparse_mode=3,
+                        scale=scale,
+                    )
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query,
@@ -518,7 +533,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_heads=num_heads,
                         scale=scale,
                         sparse_mode=3,
-                        workspace=graph_params.workspaces.get(num_tokens),
+                        workspace=workspace,
                         out=[attn_output, softmax_lse],
                     )
                     torch.npu.graph_task_update_end(update_stream)
