@@ -528,6 +528,16 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         # NOTE: Currently, MTP-fullgraph is incompatibility pcp
         input_positions = common_attn_metadata.positions[: self.num_actual_tokens].long()
 
+        # DEBUG: Check input_positions and prefill positions
+        import os
+        if os.getenv("DEBUG_BUILD_PREFILL") == "1":
+            print(f"[DEBUG_BUILD_PREFILL] build_prefill_metadata:")
+            print(f"  self.num_actual_tokens: {self.num_actual_tokens}")
+            print(f"  self.num_decodes: {self.num_decodes}, self.num_decode_tokens: {self.num_decode_tokens}")
+            print(f"  self.num_prefills: {self.num_prefills}")
+            print(f"  input_positions shape: {input_positions.shape}, dtype: {input_positions.dtype}")
+            print(f"  input_positions min/max: {input_positions.min().item()}/{input_positions.max().item()}")
+
         chunked_context_metadata = self.build_chunked_metadata(common_prefix_len, common_attn_metadata)
         reqs_start = self.num_decodes  # prefill_start
         tokens_start = self.num_decode_tokens

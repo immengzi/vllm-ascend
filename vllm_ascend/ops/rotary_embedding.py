@@ -89,6 +89,18 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
 def get_cos_and_sin_mla(positions, use_cache=False):
     global _cos_cache
     global _sin_cache
+    # DEBUG: Check positions before indexing
+    if _cos_cache is not None:
+        import os
+        if os.getenv("DEBUG_ROPE") == "1":
+            print(f"[DEBUG_ROPE] get_cos_and_sin_mla:")
+            print(f"  positions shape: {positions.shape}, dtype: {positions.dtype}, device: {positions.device}")
+            print(f"  positions min/max: {positions.min().item()}/{positions.max().item()}")
+            print(f"  _cos_cache shape: {_cos_cache.shape}, dtype: {_cos_cache.dtype}")
+            # Check if any position is out of bounds
+            max_pos = positions.max().item()
+            if max_pos >= _cos_cache.shape[0]:
+                print(f"  ERROR: Position {max_pos} exceeds _cos_cache size {_cos_cache.shape[0]}")
     cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
     sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
     if not use_cache:
