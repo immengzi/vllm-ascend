@@ -564,14 +564,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Prepare tensors for attention output
         # TODO: Refactor this to step-level instead of layer-level
 
-        # In batch prefill mode, actual_seq_lengths_q contains uniform slot sizes
-        # (e.g., [128, 128, 128, 128] for 4 requests), and actual_seq_lengths_q[-1]
-        # is just one slot size. However, query.shape[0] is target_bs * target_seq_len
-        # (e.g., 4 * 128 = 512). We must use query.shape[0] for workspace sizing to
-        # ensure sufficient memory for the entire batch.
+        # In batch prefill mode, query_start_loc is set to uniform slots
+        # (e.g., [0, 128, 256, 384, 512] for 4 requests of 128 tokens each).
+        # actual_seq_lengths_q is query_start_loc[1:], which gives cumulative positions
+        # (e.g., [128, 256, 384, 512]). We detect batch prefill by checking if
+        # actual_seq_lengths_q follows the pattern: [slot_size, 2*slot_size, 3*slot_size, ...].
+        # If detected, use query.shape[0] (target_bs * target_seq_len) for workspace
+        # sizing instead of actual_seq_lengths_q[-1] to ensure sufficient memory.
         if len(actual_seq_lengths_q) > 1 and query.shape[0] > num_tokens:
-            all_equal = all(l == actual_seq_lengths_q[0] for l in actual_seq_lengths_q)
-            if all_equal:
+            slot_size = actual_seq_lengths_q[0]
+            is_uniform_slots = all(
+                actual_seq_lengths_q[i] == slot_size * (i + 1)
+                for i in range(len(actual_seq_lengths_q))
+            )
+            if is_uniform_slots:
                 num_tokens = query.shape[0]
 
         # Get workspace from cache or calculate it if not present.
