@@ -1414,19 +1414,6 @@ class NPUModelRunner(GPUModelRunner):
                             num_reqs, target_bs, target_seq_len, num_scheduled_tokens_np
                         )
 
-                        # DEBUG: Check positions after right-align
-                        import os
-                        if os.getenv("DEBUG_BATCH_PREFILL") == "1":
-                            total_tokens = target_bs * target_seq_len
-                            positions_gpu = self.positions.gpu[:total_tokens]
-                            print(f"[DEBUG_BATCH_PREFILL] After _right_align_for_batch_prefill:")
-                            print(f"  target_bs={target_bs}, target_seq_len={target_seq_len}, total_tokens={total_tokens}")
-                            print(f"  num_reqs={num_reqs}, num_scheduled_tokens sum={num_scheduled_tokens_np.sum()}")
-                            print(f"  positions shape: {positions_gpu.shape}, dtype: {positions_gpu.dtype}")
-                            print(f"  positions min/max: {positions_gpu.min().item()}/{positions_gpu.max().item()}")
-                            print(f"  positions first 20: {positions_gpu[:20].tolist()}")
-                            print(f"  positions last 20: {positions_gpu[-20:].tolist()}")
-
                         # B. Override scheduling parameters for batch prefill graph
                         cudagraph_mode = CUDAGraphMode.FULL
                         batch_desc = BatchDescriptor(

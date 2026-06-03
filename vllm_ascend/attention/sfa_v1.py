@@ -298,7 +298,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
                     actual_seq_lengths_query[i] = cum
 
                     offset = global_end - req_local_end
-                    actual_seq_lengths_key[i] = seq_lens[i].item() - offset
+                    actual_seq_lengths_key[i] = max(1, seq_lens[i].item() - offset)
                 else:
                     actual_seq_lengths_query[i] = cum
                     actual_seq_lengths_key[i] = 0
