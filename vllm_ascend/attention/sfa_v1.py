@@ -1199,16 +1199,19 @@ class AscendSFAImpl(MLAAttentionImpl):
         if kv_cache is not None:
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
+            num_actual = attn_metadata.num_actual_tokens
             torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
+                kv_cache[2].view(-1, k_li.shape[-1]),
+                slot_mapping[:num_actual].view(-1, 1),
+                k_li[:num_actual].view(-1, k_li.shape[-1]),
             )  # b, s, n, d
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
                 assert k_li_scale is not None
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[3].view(-1, k_li_scale.shape[-1]),
-                    slot_mapping.view(-1, 1),
-                    k_li_scale.view(-1, k_li_scale.shape[-1]),
+                    slot_mapping[:num_actual].view(-1, 1),
+                    k_li_scale[:num_actual].view(-1, k_li_scale.shape[-1]),
                 )
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
