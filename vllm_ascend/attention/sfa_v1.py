@@ -1060,7 +1060,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
-            slot_mapping_cp = attn_metadata.dsa_cp_context.slot_mapping_cp
+            slot_mapping_cp = attn_metadata.dsa_cp_context.slot_mapping_cp.clamp(min=0)
             actual_seq_lengths_query = attn_metadata.dsa_cp_context.actual_seq_lengths_query
             actual_seq_lengths_key = attn_metadata.dsa_cp_context.actual_seq_lengths_key
         else:
