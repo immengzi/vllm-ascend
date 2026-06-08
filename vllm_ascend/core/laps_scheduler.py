@@ -68,11 +68,16 @@ class LAPSRequestQueue(RequestQueue):
         # Tracks when each request entered the long queue, for aging.
         self._long_enqueue_at: dict[str, float] = {}
         self._long_starvation_promotions = 0
-        # Number of tokens scheduled for aged-long promotions this step; reset
-        # by begin_step().
-        self._long_tokens_this_step = 0
-        # Token budget for aged-long promotions this step; set by begin_step().
+        # Total tokens scheduled for aged-long promotions across the current
+        # starvation cycle. Reset when all starving long requests have been
+        # processed or when the budget is exceeded for an extended period.
+        self._long_tokens_total = 0
+        # Token budget for aged-long promotions, based on reservation fraction.
+        # This is the maximum total tokens that can be scheduled for aged-long
+        # requests before we stop promoting them.
         self._long_token_budget = 0.0
+        # Number of consecutive steps with budget exceeded (for reset logic).
+        self._budget_exceeded_steps = 0
         self._stats_log_interval_s = max(
             envs.VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S, 0.0
         )
@@ -200,16 +205,33 @@ class LAPSRequestQueue(RequestQueue):
         return (time.monotonic() - enqueued_at) * 1000.0 >= self.long_max_wait_ms
 
     def begin_step(self, token_budget: int) -> None:
-        """Reset per-step state and set the token reservation budget.
+        """Set the token reservation budget for the current scheduling cycle.
         Called once at the start of each schedule()."""
-        self._long_tokens_this_step = 0
-        self._long_token_budget = self.long_token_reservation * token_budget
+        # Calculate the budget as: if we scheduled this many total tokens,
+        # the aged-long lane should get at most reservation fraction of them.
+        # For example, with reservation=0.2 and budget=4096, aged-long gets
+        # up to 8192 total tokens before we stop promoting (20% of a hypothetical
+        # 40960 total token workload).
+        if self._long_token_budget == 0 or self._long_tokens_total < self._long_token_budget:
+            # Initialize or re-establish the budget
+            self._long_token_budget = self.long_token_reservation * token_budget * 20
+        # Check if we've exceeded the budget for too long
+        if self._long_tokens_total >= self._long_token_budget:
+            self._budget_exceeded_steps += 1
+            # Reset after 100 steps of budget exhaustion (no more starving requests)
+            if self._budget_exceeded_steps > 100:
+                self._long_tokens_total = 0
+                self._budget_exceeded_steps = 0
+                self._long_token_budget = self.long_token_reservation * token_budget * 20
+        else:
+            self._budget_exceeded_steps = 0
         if self._debug_logging_enabled:
             logger.debug(
-                "LAPS begin_step: token_budget=%d long_token_reservation=%.3f long_token_budget=%.0f",
+                "LAPS begin_step: token_budget=%d long_token_reservation=%.3f long_token_budget=%.0f long_tokens_total=%.0f",
                 token_budget,
                 self.long_token_reservation,
                 self._long_token_budget,
+                self._long_tokens_total,
             )
 
     def _select_schedulable_queue(self) -> RequestQueue | None:
@@ -218,28 +240,27 @@ class LAPSRequestQueue(RequestQueue):
             return self._immediate_queue
         if self._long_queue and self._long_queue_starving():
             # Token-based reservation: aged-long prefills may consume at most
-            # long_token_reservation of the per-step token budget. This bounds
-            # long-prefill compute without flipping the policy into long-first.
+            # long_token_reservation of the total compute (tracked cumulatively).
             # When short queue is non-empty, only promote long if budget remains.
             # When short queue is empty, always allow long (stall avoidance).
             if not self._short_queue:
                 # Stall avoidance: allow long when no short is waiting
                 self._debug_state(
                     "aged-long_selected_stall_avoidance",
-                    extra=f"tokens={self._long_tokens_this_step:.0f} budget={self._long_token_budget:.0f}",
+                    extra=f"tokens_total={self._long_tokens_total:.0f} budget={self._long_token_budget:.0f}",
                 )
                 return self._long_queue
-            if self._long_tokens_this_step < self._long_token_budget:
+            if self._long_tokens_total < self._long_token_budget:
                 # Reservation available: promote aged-long ahead of short
                 self._debug_state(
                     "aged-long_selected_with_budget",
-                    extra=f"tokens={self._long_tokens_this_step:.0f} budget={self._long_token_budget:.0f}",
+                    extra=f"tokens_total={self._long_tokens_total:.0f} budget={self._long_token_budget:.0f}",
                 )
                 return self._long_queue
             # Budget exhausted and short queue is non-empty: prefer short
             self._debug_state(
                 "aged-long_blocked_budget_exhausted",
-                extra=f"tokens={self._long_tokens_this_step:.0f} budget={self._long_token_budget:.0f}",
+                extra=f"tokens_total={self._long_tokens_total:.0f} budget={self._long_token_budget:.0f}",
             )
             # (fall through to short queue check below)
         if self._short_queue:
@@ -321,13 +342,13 @@ class LAPSRequestQueue(RequestQueue):
                 >= self.long_max_wait_ms
             ):
                 self._long_starvation_promotions += 1
-                self._long_tokens_this_step += scheduled_tokens
+                self._long_tokens_total += scheduled_tokens
                 self._debug_state(
                     "aged-long_dispatched",
                     request=request,
                     queue=queue,
                     extra=f"scheduled_tokens={scheduled_tokens} "
-                    f"total_tokens={self._long_tokens_this_step:.0f} "
+                    f"tokens_total={self._long_tokens_total:.0f} "
                     f"budget={self._long_token_budget:.0f}",
                 )
         self._force_immediate_request_ids.discard(request.request_id)
