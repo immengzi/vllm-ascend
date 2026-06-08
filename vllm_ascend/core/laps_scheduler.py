@@ -47,20 +47,21 @@ class LAPSRequestQueue(RequestQueue):
         self,
         policy: SchedulingPolicy,
         threshold: int,
-        wait_window_ms: float,
-        wait_max_batch: int,
+        long_max_wait_ms: float,
         immediate_predicate: Callable[[Request], bool] | None = None,
     ) -> None:
         self.policy = policy
         self.threshold = threshold
-        self.wait_window_ms = max(wait_window_ms, 0.0)
-        self.wait_max_batch = max(wait_max_batch, 1)
+        # Anti-starvation: a long request waiting longer than this many ms is
+        # promoted ahead of short prefills. <= 0 disables aging.
+        self.long_max_wait_ms = max(long_max_wait_ms, 0.0)
         self.immediate_predicate = immediate_predicate
         self._immediate_queue = create_request_queue(policy)
         self._short_queue = create_request_queue(policy)
         self._long_queue = create_request_queue(policy)
-        self._short_wait_started_at: float | None = None
-        self._short_ready_to_dispatch = False
+        # Tracks when each request entered the long queue, for aging.
+        self._long_enqueue_at: dict[str, float] = {}
+        self._long_starvation_promotions = 0
         self._stats_log_interval_s = max(
             envs.VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S, 0.0
         )
@@ -70,11 +71,6 @@ class LAPSRequestQueue(RequestQueue):
         self._skip_or_requeue_counters = {
             reason: {"immediate": 0, "short": 0, "long": 0}
             for reason in self._SKIP_OR_REQUEUE_REASONS
-        }
-        self._short_ready_reason_counters = {
-            "no_wait_window": 0,
-            "max_batch": 0,
-            "wait_window_elapsed": 0,
         }
         self._debug_logging_enabled = logger.isEnabledFor(logging.DEBUG)
         self._force_immediate_request_ids: set[str] = set()
@@ -92,23 +88,6 @@ class LAPSRequestQueue(RequestQueue):
             return "long"
         return "unknown"
 
-    def _short_wait_elapsed_ms(self) -> float | None:
-        if self._short_wait_started_at is None:
-            return None
-        return (time.monotonic() - self._short_wait_started_at) * 1000.0
-
-    def _short_wait_state(self) -> str:
-        if not self._short_queue:
-            return "empty"
-        if self._short_ready_to_dispatch:
-            return "ready"
-        if self.wait_window_ms <= 0:
-            return "no_wait"
-        elapsed_ms = self._short_wait_elapsed_ms()
-        if elapsed_ms is None:
-            return "pending"
-        return f"waiting({elapsed_ms:.3f}/{self.wait_window_ms:.3f}ms)"
-
     def _maybe_log_stats(self, force: bool = False) -> None:
         if self._stats_log_interval_s <= 0:
             return
@@ -117,26 +96,20 @@ class LAPSRequestQueue(RequestQueue):
             return
         self._last_stats_log_at = now
         logger.info(
-            "LAPS stats: threshold=%d wait_window_ms=%.3f wait_max_batch=%d "
-            "sizes=(immediate=%d short=%d long=%d) short_state=%s "
+            "LAPS stats: threshold=%d long_max_wait_ms=%.3f "
+            "sizes=(immediate=%d short=%d long=%d) "
             "prepends=%s dispatches=%s skip_or_requeues=%s "
-            "short_ready_reasons=%s",
+            "long_starvation_promotions=%d",
             self.threshold,
-            self.wait_window_ms,
-            self.wait_max_batch,
+            self.long_max_wait_ms,
             len(self._immediate_queue),
             len(self._short_queue),
             len(self._long_queue),
-            self._short_wait_state(),
             self._prepend_counters,
             self._dispatch_counters,
             self._skip_or_requeue_counters,
-            self._short_ready_reason_counters,
+            self._long_starvation_promotions,
         )
-
-    def _record_short_ready_reason(self, reason: str) -> None:
-        if reason in self._short_ready_reason_counters:
-            self._short_ready_reason_counters[reason] += 1
 
     def _increment_skip_or_requeue_counter(
         self, queue: RequestQueue, reason: str
@@ -160,7 +133,7 @@ class LAPSRequestQueue(RequestQueue):
         extra_suffix = f", {extra}" if extra else ""
         logger.debug(
             "LAPS queue %s: request_id=%s, prompt_tokens=%d, target_queue=%s, "
-            "sizes=(immediate=%d, short=%d, long=%d), short_state=%s%s",
+            "sizes=(immediate=%d, short=%d, long=%d)%s",
             event,
             request_id,
             prompt_tokens,
@@ -168,7 +141,6 @@ class LAPSRequestQueue(RequestQueue):
             len(self._immediate_queue),
             len(self._short_queue),
             len(self._long_queue),
-            self._short_wait_state(),
             extra_suffix,
         )
 
@@ -204,68 +176,24 @@ class LAPSRequestQueue(RequestQueue):
             return self._short_queue
         return self._long_queue
 
-    def _on_short_queue_changed(self) -> None:
-        if not self._short_queue:
-            self._short_wait_started_at = None
-            self._short_ready_to_dispatch = False
-            self._debug_state("short_reset")
-            return
-        if self._short_ready_to_dispatch:
-            return
-        if self.wait_window_ms <= 0 or len(self._short_queue) >= self.wait_max_batch:
-            self._short_wait_started_at = None
-            self._short_ready_to_dispatch = True
-            reason = "no_wait_window" if self.wait_window_ms <= 0 else "max_batch"
-            self._record_short_ready_reason(reason)
-            self._debug_state("short_ready", extra=f"reason={reason}")
-            self._maybe_log_stats()
-            return
-        if self._short_wait_started_at is None:
-            self._short_wait_started_at = time.monotonic()
-            self._debug_state("short_wait_started")
-
-    def _short_batch_ready(self) -> bool:
-        if not self._short_queue:
-            self._short_wait_started_at = None
-            self._short_ready_to_dispatch = False
+    def _long_queue_starving(self) -> bool:
+        """Whether the oldest long request has waited past its aging bound."""
+        if self.long_max_wait_ms <= 0 or not self._long_queue:
             return False
-        if self._short_ready_to_dispatch:
-            return True
-        if self.wait_window_ms <= 0:
-            self._short_wait_started_at = None
-            self._short_ready_to_dispatch = True
-            self._record_short_ready_reason("no_wait_window")
-            self._debug_state("short_ready", extra="reason=no_wait_window")
-            self._maybe_log_stats()
-            return True
-        if len(self._short_queue) >= self.wait_max_batch:
-            self._short_wait_started_at = None
-            self._short_ready_to_dispatch = True
-            self._record_short_ready_reason("max_batch")
-            self._debug_state("short_ready", extra="reason=max_batch")
-            self._maybe_log_stats()
-            return True
-        if self._short_wait_started_at is None:
-            self._short_wait_started_at = time.monotonic()
-            self._debug_state("short_wait_started")
+        head = self._long_queue.peek_request()  # FCFS head = oldest long request
+        enqueued_at = self._long_enqueue_at.get(head.request_id)
+        if enqueued_at is None:
             return False
-        elapsed_ms = (time.monotonic() - self._short_wait_started_at) * 1000.0
-        if elapsed_ms >= self.wait_window_ms:
-            self._short_wait_started_at = None
-            self._short_ready_to_dispatch = True
-            self._record_short_ready_reason("wait_window_elapsed")
-            self._debug_state(
-                "short_ready",
-                extra=f"reason=wait_window_elapsed, elapsed_ms={elapsed_ms:.3f}",
-            )
-            self._maybe_log_stats()
-            return True
-        return False
+        return (time.monotonic() - enqueued_at) * 1000.0 >= self.long_max_wait_ms
 
     def _select_schedulable_queue(self) -> RequestQueue | None:
+        # Pure query (no side effects): called repeatedly per scheduling step.
         if self._immediate_queue:
             return self._immediate_queue
-        if self._short_batch_ready():
+        if self._long_queue and self._long_queue_starving():
+            # Anti-starvation: an aged long request jumps ahead of short.
+            return self._long_queue
+        if self._short_queue:
             return self._short_queue
         if self._long_queue:
             return self._long_queue
@@ -300,10 +228,10 @@ class LAPSRequestQueue(RequestQueue):
         queue = self._classify_queue(request)
         queue.add_request(request)
         self._queue_index[request.request_id] = queue
+        if queue is self._long_queue:
+            self._long_enqueue_at.setdefault(request.request_id, time.monotonic())
         if queue is not self._immediate_queue:
             self._force_immediate_request_ids.discard(request.request_id)
-        if queue is self._short_queue:
-            self._on_short_queue_changed()
         self._debug_state("enqueue", request=request, queue=queue)
         self._maybe_log_stats()
 
@@ -322,6 +250,7 @@ class LAPSRequestQueue(RequestQueue):
     ) -> Request:
         request = queue.pop_request()
         self._queue_index.pop(request.request_id, None)
+        enqueued_at = self._long_enqueue_at.pop(request.request_id, None)
         if count_as_removal:
             if skip_or_requeue_reason is not None:
                 self._increment_skip_or_requeue_counter(
@@ -333,9 +262,16 @@ class LAPSRequestQueue(RequestQueue):
         else:
             self._dispatch_counters[self._queue_name(queue)] += 1
             event_name = "dispatch"
+            # Count long requests dispatched after aging past their bound.
+            if (
+                queue is self._long_queue
+                and self.long_max_wait_ms > 0
+                and enqueued_at is not None
+                and (time.monotonic() - enqueued_at) * 1000.0
+                >= self.long_max_wait_ms
+            ):
+                self._long_starvation_promotions += 1
         self._force_immediate_request_ids.discard(request.request_id)
-        if queue is self._short_queue:
-            self._on_short_queue_changed()
         self._debug_state(event_name, request=request, queue=queue)
         self._maybe_log_stats()
         return request
@@ -352,9 +288,9 @@ class LAPSRequestQueue(RequestQueue):
         queue = self._classify_queue(request, force_immediate=force_immediate)
         queue.prepend_request(request)
         self._queue_index[request.request_id] = queue
+        if queue is self._long_queue:
+            self._long_enqueue_at.setdefault(request.request_id, time.monotonic())
         self._prepend_counters[self._queue_name(queue)] += 1
-        if queue is self._short_queue:
-            self._on_short_queue_changed()
         self._debug_state("prepend", request=request, queue=queue)
         self._maybe_log_stats()
 
@@ -371,9 +307,8 @@ class LAPSRequestQueue(RequestQueue):
             raise ValueError("request not found in LAPS queue")
         queue.remove_request(matched_request)
         self._queue_index.pop(request.request_id, None)
+        self._long_enqueue_at.pop(request.request_id, None)
         self._force_immediate_request_ids.discard(request.request_id)
-        if queue is self._short_queue:
-            self._on_short_queue_changed()
         self._debug_state("remove", request=matched_request, queue=queue)
         self._maybe_log_stats()
 
@@ -394,8 +329,8 @@ class LAPSRequestQueue(RequestQueue):
             queue.remove_requests(matched_requests)
             for matched in matched_requests:
                 self._queue_index.pop(matched.request_id, None)
+                self._long_enqueue_at.pop(matched.request_id, None)
                 self._force_immediate_request_ids.discard(matched.request_id)
-        self._on_short_queue_changed()
         if removed_count:
             self._debug_state("remove_batch", extra=f"count={removed_count}")
             self._maybe_log_stats()
@@ -431,8 +366,8 @@ class LAPSSchedulerMixin:
     def _get_attached_waiting_computed_tokens(self, request: Request) -> int | None:
         return None
 
-    def _should_bypass_laps_wait_window(self, request: Request) -> bool:
-        """Recovery-style requests should not be delayed by short wait windows."""
+    def _is_recovery_request(self, request: Request) -> bool:
+        """Recovery-style requests are prioritized via the immediate queue."""
         return (
             request.status == RequestStatus.PREEMPTED
             or request.num_computed_tokens > 0
@@ -453,23 +388,20 @@ class LAPSSchedulerMixin:
             return
 
         if immediate_predicate is None:
-            immediate_predicate = self._should_bypass_laps_wait_window
+            immediate_predicate = self._is_recovery_request
         threshold = envs.VLLM_ASCEND_LAPS_THRESHOLD
-        wait_window_ms = envs.VLLM_ASCEND_LAPS_WAIT_WINDOW_MS
-        wait_max_batch = envs.VLLM_ASCEND_LAPS_WAIT_MAX_BATCH
+        long_max_wait_ms = envs.VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS
         self.waiting = LAPSRequestQueue(
             policy=self.policy,
             threshold=threshold,
-            wait_window_ms=wait_window_ms,
-            wait_max_batch=wait_max_batch,
+            long_max_wait_ms=long_max_wait_ms,
             immediate_predicate=immediate_predicate,
         )
         logger.info(
             "LAPS scheduling enabled on Ascend: threshold=%d, "
-            "wait_window_ms=%.3f, wait_max_batch=%d",
+            "long_max_wait_ms=%.3f",
             threshold,
-            wait_window_ms,
-            wait_max_batch,
+            long_max_wait_ms,
         )
 
     def _laps_waiting_queue(self) -> LAPSRequestQueue | None:

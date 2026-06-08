@@ -454,12 +454,11 @@ class NPUPlatform(Platform):
                 logger.info(
                     "Ascend LAPS scheduler selected through recompute "
                     "scheduler: scheduler_cls=%s, policy=%s, threshold=%d, "
-                    "wait_window_ms=%.3f, wait_max_batch=%d",
+                    "long_max_wait_ms=%.3f",
                     vllm_config.scheduler_config.scheduler_cls,
                     vllm_config.scheduler_config.policy,
                     envs_ascend.VLLM_ASCEND_LAPS_THRESHOLD,
-                    envs_ascend.VLLM_ASCEND_LAPS_WAIT_WINDOW_MS,
-                    envs_ascend.VLLM_ASCEND_LAPS_WAIT_MAX_BATCH,
+                    envs_ascend.VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS,
                 )
         elif enable_laps:
             logger.warning_once(

@@ -17,13 +17,21 @@ mechanisms:
 
 - `triple-queue`: split the waiting queue into immediate, short, and long prompt
   classes.
-- `waiting window`: optionally hold an isolated short request for a small time
-  window so that more short requests can join the same batch.
+- `anti-starvation (aging)`: bound how long a long prefill can be held behind
+  short prefills, so a sustained short-request stream cannot starve long
+  requests indefinitely.
+
+The original LAPS short-request *waiting window* was **not** ported: vLLM v1
+already performs continuous batching (it re-batches all running requests and
+admits new ones up to the token/running budget every step, with chunked
+prefill), so manually accumulating a short batch is redundant and only adds
+latency.
 
 The CUDA-specific `attention-in-graph` optimization from the LAPS SGLang branch
 was intentionally **not** ported, because it is tightly coupled to CUDA graph
-capture and FlashAttention internals. Likewise, router-level dynamic allocation
-has **not** been merged into the Ascend proxy layer yet.
+capture and FlashAttention internals (and is incompatible with the two-stage
+sparse attention used by models such as DeepSeek-V4). Likewise, router-level
+dynamic allocation has **not** been merged into the Ascend proxy layer yet.
 
 ## Why It Fits `vllm-ascend`
 
@@ -39,8 +47,7 @@ Enable the feature with environment variables before launching `vllm serve`:
 ```bash
 export VLLM_ASCEND_LAPS_SCHEDULING=1
 export VLLM_ASCEND_LAPS_THRESHOLD=256
-export VLLM_ASCEND_LAPS_WAIT_WINDOW_MS=5
-export VLLM_ASCEND_LAPS_WAIT_MAX_BATCH=4
+export VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS=2000
 ```
 
 ### Variables
@@ -50,12 +57,11 @@ export VLLM_ASCEND_LAPS_WAIT_MAX_BATCH=4
   - `0` disables it.
 - `VLLM_ASCEND_LAPS_THRESHOLD`
   - Prompts with `num_prompt_tokens <= threshold` are treated as short.
-- `VLLM_ASCEND_LAPS_WAIT_WINDOW_MS`
-  - `0` means short requests dispatch immediately.
-  - Positive values keep an isolated short batch waiting briefly.
-- `VLLM_ASCEND_LAPS_WAIT_MAX_BATCH`
-  - Dispatch short requests early once this many short requests are queued,
-    even if the wait window has not expired.
+- `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`
+  - Anti-starvation aging bound for long prefills, in milliseconds.
+  - A long request that has waited longer than this is promoted ahead of short
+    prefills, bounding its worst-case admission wait.
+  - `0` disables aging (strict short-priority).
 
 ## How It Is Selected
 
@@ -82,8 +88,7 @@ Enable recompute scheduler together with LAPS:
 ```bash
 export VLLM_ASCEND_LAPS_SCHEDULING=1
 export VLLM_ASCEND_LAPS_THRESHOLD=256
-export VLLM_ASCEND_LAPS_WAIT_WINDOW_MS=5
-export VLLM_ASCEND_LAPS_WAIT_MAX_BATCH=4
+export VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS=2000
 
 vllm serve <model> \
   --additional-config '{"recompute_scheduler_enable": true}'
@@ -104,15 +109,18 @@ The `LAPSRequestQueue` manages three queues:
 - **short queue**: Short prefills where `num_prompt_tokens <= threshold`.
 - **long queue**: Long prefills where `num_prompt_tokens > threshold`.
 
-Dispatch priority is always: immediate > short > long.
+Dispatch priority is: immediate > aged-long > short > long.
 
 - Immediate requests are dispatched as soon as they arrive.
-- Short requests accumulate in a waiting window (if configured) to form larger
-  batches, or dispatch early if `wait_max_batch` is reached.
-- Long requests are only dispatched when no immediate or short requests are
-  schedulable.
-- If only short requests are queued and the waiting window has not expired,
-  the engine stays idle briefly instead of dispatching a tiny batch.
+- Short requests are dispatched whenever the short queue is non-empty (vLLM's
+  continuous batching groups them together each step).
+- Long requests are normally only dispatched when no immediate or short
+  requests are schedulable.
+- **Anti-starvation:** if the oldest long request has waited longer than
+  `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`, it is promoted ahead of short prefills.
+  This bounds each long request's worst-case admission wait so a sustained
+  short-request stream cannot starve long prefills. Aged long requests are
+  drained one at a time, so this does not flood the batch with long prefills.
 
 ## Current Scope and Limitations
 

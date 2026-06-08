@@ -109,14 +109,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Prompt-length threshold used by LAPS scheduling. Requests with
     # num_prompt_tokens <= threshold are treated as short prefills.
     "VLLM_ASCEND_LAPS_THRESHOLD": lambda: int(os.getenv("VLLM_ASCEND_LAPS_THRESHOLD", "256")),
-    # Optional waiting window for short requests, in milliseconds. When set to
-    # 0, short requests dispatch immediately. When positive, the scheduler may
-    # hold a short batch briefly to accumulate more short prefills while still
-    # allowing long prefills to run.
-    "VLLM_ASCEND_LAPS_WAIT_WINDOW_MS": lambda: float(os.getenv("VLLM_ASCEND_LAPS_WAIT_WINDOW_MS", "0")),
-    # Maximum number of short requests to accumulate before dispatching early,
-    # even if the waiting window has not expired yet.
-    "VLLM_ASCEND_LAPS_WAIT_MAX_BATCH": lambda: int(os.getenv("VLLM_ASCEND_LAPS_WAIT_MAX_BATCH", "4")),
+    # Anti-starvation aging bound for long prefills, in milliseconds. A long
+    # request that has waited longer than this is promoted ahead of short
+    # prefills, bounding its worst-case admission wait. Set to 0 to disable
+    # aging (strict short-priority).
+    "VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS", "0")
+    ),
     # Optional periodic LAPS stats logging interval, in seconds. Set to 0 to
     # disable aggregate stats logging. This is intended for benchmark
     # observability without enabling global DEBUG logging.
