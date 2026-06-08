@@ -8,7 +8,7 @@ set -euo pipefail
 
 MODEL_PATH="${MODEL_PATH:-/workspace/models/GLM-5.1-w4a8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm-5.1}"
-PREPARED_TRACE_DIR="${PREPARED_TRACE_DIR:-}"
+PREPARED_TRACE_DIR="${PREPARED_TRACE_DIR:-/vllm-workspace/bench_inputs/claude_prepared_60x4}"
 
 VLLM_ASCEND_DIR="${VLLM_ASCEND_DIR:-/vllm-workspace/vllm-ascend}"
 VLLM_DIR="${VLLM_DIR:-/vllm-workspace/vllm}"

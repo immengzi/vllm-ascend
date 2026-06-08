@@ -265,6 +265,9 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
         # For logging.
         scheduled_timestamp = time.monotonic()
         laps_waiting = self._laps_waiting_queue()
+        if laps_waiting is not None:
+            # Reset per-step LAPS state (e.g. aged-long promotion cap).
+            laps_waiting.begin_step()
 
         self.kv_cache_manager.new_step_starts()
 

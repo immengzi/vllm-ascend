@@ -116,6 +116,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS": lambda: float(
         os.getenv("VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS", "0")
     ),
+    # Maximum number of aged long prefills that may be promoted ahead of short
+    # prefills per scheduler step. This throttles aging so it rescues starving
+    # long requests without flipping the policy into long-first. Higher values
+    # rescue long requests more aggressively (tighter long-wait bound, harsher
+    # on the short-request tail); 1 is the gentlest. Clamped to >= 1.
+    "VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP": lambda: int(
+        os.getenv("VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP", "1")
+    ),
     # Optional periodic LAPS stats logging interval, in seconds. Set to 0 to
     # disable aggregate stats logging. This is intended for benchmark
     # observability without enabling global DEBUG logging.

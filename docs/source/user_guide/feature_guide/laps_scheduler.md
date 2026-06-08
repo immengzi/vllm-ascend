@@ -48,6 +48,7 @@ Enable the feature with environment variables before launching `vllm serve`:
 export VLLM_ASCEND_LAPS_SCHEDULING=1
 export VLLM_ASCEND_LAPS_THRESHOLD=256
 export VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS=2000
+export VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP=1
 ```
 
 ### Variables
@@ -62,6 +63,12 @@ export VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS=2000
   - A long request that has waited longer than this is promoted ahead of short
     prefills, bounding its worst-case admission wait.
   - `0` disables aging (strict short-priority).
+- `VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP`
+  - Maximum number of aged long prefills promoted ahead of short prefills per
+    scheduler step (default `1`, clamped to `>= 1`).
+  - This throttles aging so it rescues starving long requests without flipping
+    the policy into long-first. Higher values rescue long requests more
+    aggressively (tighter long-wait bound, harsher on the short-request tail).
 
 ## How It Is Selected
 
@@ -89,6 +96,7 @@ Enable recompute scheduler together with LAPS:
 export VLLM_ASCEND_LAPS_SCHEDULING=1
 export VLLM_ASCEND_LAPS_THRESHOLD=256
 export VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS=2000
+export VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP=1
 
 vllm serve <model> \
   --additional-config '{"recompute_scheduler_enable": true}'
@@ -117,10 +125,16 @@ Dispatch priority is: immediate > aged-long > short > long.
 - Long requests are normally only dispatched when no immediate or short
   requests are schedulable.
 - **Anti-starvation:** if the oldest long request has waited longer than
-  `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`, it is promoted ahead of short prefills.
-  This bounds each long request's worst-case admission wait so a sustained
-  short-request stream cannot starve long prefills. Aged long requests are
-  drained one at a time, so this does not flood the batch with long prefills.
+  `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`, it is promoted ahead of short prefills,
+  bounding each long request's worst-case admission wait so a sustained
+  short-request stream cannot starve long prefills.
+- **Throttle:** at most `VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP` aged long
+  requests may jump ahead of short per scheduler step. Without this cap, a small
+  `LONG_MAX_WAIT_MS` under overload would make every long request "aged" at once
+  and invert the policy into long-first (catastrophic short-request latency); the
+  cap keeps short-priority as the default and lets aging only rescue genuinely
+  starving long requests. (When no short request is waiting, long is dispatched
+  regardless of the cap to avoid stalling.)
 
 ## Current Scope and Limitations
 

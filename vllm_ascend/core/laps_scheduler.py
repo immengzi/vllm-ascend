@@ -48,6 +48,7 @@ class LAPSRequestQueue(RequestQueue):
         policy: SchedulingPolicy,
         threshold: int,
         long_max_wait_ms: float,
+        max_long_promotions_per_step: int = 1,
         immediate_predicate: Callable[[Request], bool] | None = None,
     ) -> None:
         self.policy = policy
@@ -55,6 +56,10 @@ class LAPSRequestQueue(RequestQueue):
         # Anti-starvation: a long request waiting longer than this many ms is
         # promoted ahead of short prefills. <= 0 disables aging.
         self.long_max_wait_ms = max(long_max_wait_ms, 0.0)
+        # Cap on how many aged long requests may jump ahead of short prefills
+        # per scheduler step, so aging rescues starving long requests without
+        # flipping the policy into long-first. Clamped to >= 1.
+        self.max_long_promotions_per_step = max(int(max_long_promotions_per_step), 1)
         self.immediate_predicate = immediate_predicate
         self._immediate_queue = create_request_queue(policy)
         self._short_queue = create_request_queue(policy)
@@ -62,6 +67,9 @@ class LAPSRequestQueue(RequestQueue):
         # Tracks when each request entered the long queue, for aging.
         self._long_enqueue_at: dict[str, float] = {}
         self._long_starvation_promotions = 0
+        # Number of aged long promotions dispatched in the current step; reset
+        # by begin_step().
+        self._long_promotions_this_step = 0
         self._stats_log_interval_s = max(
             envs.VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S, 0.0
         )
@@ -97,11 +105,13 @@ class LAPSRequestQueue(RequestQueue):
         self._last_stats_log_at = now
         logger.info(
             "LAPS stats: threshold=%d long_max_wait_ms=%.3f "
+            "max_long_promotions_per_step=%d "
             "sizes=(immediate=%d short=%d long=%d) "
             "prepends=%s dispatches=%s skip_or_requeues=%s "
             "long_starvation_promotions=%d",
             self.threshold,
             self.long_max_wait_ms,
+            self.max_long_promotions_per_step,
             len(self._immediate_queue),
             len(self._short_queue),
             len(self._long_queue),
@@ -186,13 +196,25 @@ class LAPSRequestQueue(RequestQueue):
             return False
         return (time.monotonic() - enqueued_at) * 1000.0 >= self.long_max_wait_ms
 
+    def begin_step(self) -> None:
+        """Reset per-step state. Called once at the start of each schedule()."""
+        self._long_promotions_this_step = 0
+
     def _select_schedulable_queue(self) -> RequestQueue | None:
         # Pure query (no side effects): called repeatedly per scheduling step.
         if self._immediate_queue:
             return self._immediate_queue
         if self._long_queue and self._long_queue_starving():
-            # Anti-starvation: an aged long request jumps ahead of short.
-            return self._long_queue
+            # Throttle: at most max_long_promotions_per_step aged long requests
+            # jump ahead of short per step, so aging rescues starving long
+            # requests without flipping the policy into long-first. Always allow
+            # long when no short is waiting (avoid stalling).
+            if (
+                not self._short_queue
+                or self._long_promotions_this_step
+                < self.max_long_promotions_per_step
+            ):
+                return self._long_queue
         if self._short_queue:
             return self._short_queue
         if self._long_queue:
@@ -271,6 +293,7 @@ class LAPSRequestQueue(RequestQueue):
                 >= self.long_max_wait_ms
             ):
                 self._long_starvation_promotions += 1
+                self._long_promotions_this_step += 1
         self._force_immediate_request_ids.discard(request.request_id)
         self._debug_state(event_name, request=request, queue=queue)
         self._maybe_log_stats()
@@ -391,17 +414,22 @@ class LAPSSchedulerMixin:
             immediate_predicate = self._is_recovery_request
         threshold = envs.VLLM_ASCEND_LAPS_THRESHOLD
         long_max_wait_ms = envs.VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS
+        max_long_promotions_per_step = (
+            envs.VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP
+        )
         self.waiting = LAPSRequestQueue(
             policy=self.policy,
             threshold=threshold,
             long_max_wait_ms=long_max_wait_ms,
+            max_long_promotions_per_step=max_long_promotions_per_step,
             immediate_predicate=immediate_predicate,
         )
         logger.info(
             "LAPS scheduling enabled on Ascend: threshold=%d, "
-            "long_max_wait_ms=%.3f",
+            "long_max_wait_ms=%.3f, max_long_promotions_per_step=%d",
             threshold,
             long_max_wait_ms,
+            max_long_promotions_per_step,
         )
 
     def _laps_waiting_queue(self) -> LAPSRequestQueue | None:
