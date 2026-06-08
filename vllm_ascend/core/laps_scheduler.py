@@ -204,6 +204,13 @@ class LAPSRequestQueue(RequestQueue):
         Called once at the start of each schedule()."""
         self._long_tokens_this_step = 0
         self._long_token_budget = self.long_token_reservation * token_budget
+        if self._debug_logging_enabled:
+            logger.debug(
+                "LAPS begin_step: token_budget=%d long_token_reservation=%.3f long_token_budget=%.0f",
+                token_budget,
+                self.long_token_reservation,
+                self._long_token_budget,
+            )
 
     def _select_schedulable_queue(self) -> RequestQueue | None:
         # Pure query (no side effects): called repeatedly per scheduling step.
@@ -213,12 +220,28 @@ class LAPSRequestQueue(RequestQueue):
             # Token-based reservation: aged-long prefills may consume at most
             # long_token_reservation of the per-step token budget. This bounds
             # long-prefill compute without flipping the policy into long-first.
-            # Always allow long when no short is waiting (avoid stalling).
-            if (
-                not self._short_queue
-                or self._long_tokens_this_step < self._long_token_budget
-            ):
+            # When short queue is non-empty, only promote long if budget remains.
+            # When short queue is empty, always allow long (stall avoidance).
+            if not self._short_queue:
+                # Stall avoidance: allow long when no short is waiting
+                self._debug_state(
+                    "aged-long_selected_stall_avoidance",
+                    extra=f"tokens={self._long_tokens_this_step:.0f} budget={self._long_token_budget:.0f}",
+                )
                 return self._long_queue
+            if self._long_tokens_this_step < self._long_token_budget:
+                # Reservation available: promote aged-long ahead of short
+                self._debug_state(
+                    "aged-long_selected_with_budget",
+                    extra=f"tokens={self._long_tokens_this_step:.0f} budget={self._long_token_budget:.0f}",
+                )
+                return self._long_queue
+            # Budget exhausted and short queue is non-empty: prefer short
+            self._debug_state(
+                "aged-long_blocked_budget_exhausted",
+                extra=f"tokens={self._long_tokens_this_step:.0f} budget={self._long_token_budget:.0f}",
+            )
+            # (fall through to short queue check below)
         if self._short_queue:
             return self._short_queue
         if self._long_queue:
@@ -299,6 +322,14 @@ class LAPSRequestQueue(RequestQueue):
             ):
                 self._long_starvation_promotions += 1
                 self._long_tokens_this_step += scheduled_tokens
+                self._debug_state(
+                    "aged-long_dispatched",
+                    request=request,
+                    queue=queue,
+                    extra=f"scheduled_tokens={scheduled_tokens} "
+                    f"total_tokens={self._long_tokens_this_step:.0f} "
+                    f"budget={self._long_token_budget:.0f}",
+                )
         self._force_immediate_request_ids.discard(request.request_id)
         self._debug_state(event_name, request=request, queue=queue)
         self._maybe_log_stats()
