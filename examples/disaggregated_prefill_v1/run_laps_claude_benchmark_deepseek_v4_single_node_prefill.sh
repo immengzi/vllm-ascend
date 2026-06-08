@@ -7,29 +7,29 @@ set -euo pipefail
 # server for every warmup / measured / repeat / LAPS variant.
 #
 # Test Variants (CASE_VARIANTS):
-#   Format: t<threshold>[:m<long_max_wait_ms>][:p<max_long_promotions_per_step>]
+#   Format: t<threshold>[:m<long_max_wait_ms>][:f<long_token_reservation>]
 #
 #   Examples:
 #   off                    - No LAPS
 #   t256                   - LAPS, strict short-priority (no aging)
-#   t256:m2000             - LAPS, long requests aged in after 2000ms
-#   t256:m2000:p1          - LAPS, aging 2000ms, <=1 aged-long promoted per step
-#   t256:m2000:p4          - LAPS, aging 2000ms, <=4 aged-long promoted per step
+#   t256:m2000             - LAPS, long requests aged in after 2000ms, no reservation
+#   t256:m2000:f0.2        - LAPS, aging 2000ms, 20% token reservation for aged-long
+#   t256:m2000:f0.4        - LAPS, aging 2000ms, 40% token reservation for aged-long
 #
 # Default Variants:
 #   off                    - Baseline (no LAPS)
-#   t4096                  - LAPS, uses LAPS_LONG_MAX_WAIT_MS / *_PROMOTIONS env defaults
+#   t4096                  - LAPS, uses LAPS_LONG_MAX_WAIT_MS / *_RESERVATION env defaults
 #
 # Environment Variables:
-#   LAPS_LONG_MAX_WAIT_MS              - Default long-request aging bound, ms (default: 0)
-#   LAPS_MAX_LONG_PROMOTIONS_PER_STEP - Default aged-long promotion cap per step (default: 1)
+#   LAPS_LONG_MAX_WAIT_MS       - Default long-request aging bound, ms (default: 0)
+#   LAPS_LONG_TOKEN_RESERVATION - Default token reservation fraction (default: 0)
 #
 # Example usage:
 #   # Compare aging vs no-aging at threshold 512
 #   CASE_VARIANTS="off t512 t512:m2000" bash script.sh
 #
-#   # Sweep the promotion throttle at a fixed aging bound
-#   CASE_VARIANTS="off t512:m2000:p1 t512:m2000:p4" bash script.sh
+#   # Sweep the reservation at a fixed aging bound
+#   CASE_VARIANTS="off t512:m2000:f0.2 t512:m2000:f0.4" bash script.sh
 #
 #   # Use default variants with custom aging bound
 #   CASE_VARIANTS="off t512" LAPS_LONG_MAX_WAIT_MS=2000 bash script.sh
@@ -81,7 +81,7 @@ REQUEST_MAX_TOKENS="${REQUEST_MAX_TOKENS:-1}"
 BENCH_RATES="${BENCH_RATES=5 10 15 20 25 30}"
 
 LAPS_LONG_MAX_WAIT_MS="${LAPS_LONG_MAX_WAIT_MS:-0}"
-LAPS_MAX_LONG_PROMOTIONS_PER_STEP="${LAPS_MAX_LONG_PROMOTIONS_PER_STEP:-1}"
+LAPS_LONG_TOKEN_RESERVATION="${LAPS_LONG_TOKEN_RESERVATION:-0}"
 LAPS_STATS_LOG_INTERVAL_S="${LAPS_STATS_LOG_INTERVAL_S:-5}"
 
 ASCEND_CONNECT_TIMEOUT="${ASCEND_CONNECT_TIMEOUT:-30000}"
@@ -496,13 +496,13 @@ case_variant_to_params() {
     return
   fi
 
-  # Parse LAPS variants with optional config: t256:m2000:p1
+  # Parse LAPS variants with optional config: t256:m2000:f0.2
   # t256  - threshold
   # m2000 - long_max_wait_ms anti-starvation aging bound (optional, default env)
-  # p1    - max_long_promotions_per_step throttle (optional, default env)
+  # f0.2  - long_token_reservation fraction (optional, default env)
   local threshold=""
   local long_max_wait_ms="${LAPS_LONG_MAX_WAIT_MS}"
-  local max_long_promos="${LAPS_MAX_LONG_PROMOTIONS_PER_STEP}"
+  local long_token_reservation="${LAPS_LONG_TOKEN_RESERVATION}"
 
   if [[ "${variant}" =~ ^t([0-9]+)(:.*)?$ ]]; then
     threshold="${BASH_REMATCH[1]}"
@@ -511,12 +511,12 @@ case_variant_to_params() {
     if [[ "${config}" =~ :m([0-9]+) ]]; then
       long_max_wait_ms="${BASH_REMATCH[1]}"
     fi
-    if [[ "${config}" =~ :p([0-9]+) ]]; then
-      max_long_promos="${BASH_REMATCH[1]}"
+    if [[ "${config}" =~ :f([0-9]+\.?[0-9]*) ]]; then
+      long_token_reservation="${BASH_REMATCH[1]}"
     fi
 
-    local suffix="laps_t${threshold}_m${long_max_wait_ms}_p${max_long_promos}"
-    printf '%s|%s|%s|%s\n' "${threshold}" "${long_max_wait_ms}" "${max_long_promos}" "${suffix}"
+    local suffix="laps_t${threshold}_m${long_max_wait_ms}_f${long_token_reservation}"
+    printf '%s|%s|%s|%s\n' "${threshold}" "${long_max_wait_ms}" "${long_token_reservation}" "${suffix}"
     return
   fi
 
@@ -528,7 +528,7 @@ start_prefill() {
   local case_name="$1"
   local laps_threshold="$2"
   local laps_wait_window_ms="$3"
-  local laps_max_long_promos="$4"
+  local long_token_reservation="$4"
   local log_file="${RESULT_DIR}/logs/${case_name}_prefill.log"
   local kv_transfer_config_json
   local prefill_extra_args=()
@@ -572,14 +572,14 @@ start_prefill() {
     export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
 
     if [ "${laps_threshold}" = "off" ]; then
-      unset VLLM_ASCEND_LAPS_SCHEDULING VLLM_ASCEND_LAPS_THRESHOLD VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S
+      unset VLLM_ASCEND_LAPS_SCHEDULING VLLM_ASCEND_LAPS_THRESHOLD VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S
     else
       export VLLM_ASCEND_LAPS_SCHEDULING=1
       export VLLM_ASCEND_LAPS_THRESHOLD="${laps_threshold}"
       # laps_wait_window_ms carries the long_max_wait_ms aging bound (tuple field 2);
-      # laps_max_long_promos carries max_long_promotions_per_step (tuple field 3).
+      # long_token_reservation carries the token reservation fraction (tuple field 3).
       export VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS="${laps_wait_window_ms}"
-      export VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP="${laps_max_long_promos}"
+      export VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION="${long_token_reservation}"
       export VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S="${LAPS_STATS_LOG_INTERVAL_S}"
     fi
 
@@ -672,7 +672,7 @@ run_case() {
   local variant_name="$2"
   local laps_threshold="$3"
   local laps_wait_window_ms="$4"
-  local laps_max_long_promos="$5"
+  local long_token_reservation="$5"
   local rate="$6"
   local case_dir="${RESULT_DIR}/${case_name}"
   local warmup_output_dir="${case_dir}/warmup"
@@ -691,10 +691,10 @@ run_case() {
   fi
   log "Rate: ${rate:-unlimited} (closed-loop mode)"
   log "Prepared trace dir: ${PREPARED_TRACE_DIR}"
-  log "LAPS config: threshold=${laps_threshold}, long_max_wait_ms=${laps_wait_window_ms}, max_long_promotions_per_step=${laps_max_long_promos}"
+  log "LAPS config: threshold=${laps_threshold}, long_max_wait_ms=${laps_wait_window_ms}, long_token_reservation=${long_token_reservation}"
 
   stop_services
-  start_prefill "${case_name}" "${laps_threshold}" "${laps_wait_window_ms}" "${laps_max_long_promos}"
+  start_prefill "${case_name}" "${laps_threshold}" "${laps_wait_window_ms}" "${long_token_reservation}"
   wait_log "${RESULT_DIR}/logs/${case_name}_prefill.log" "Application startup complete" "Prefill startup"
   wait_http "http://${PREFILL_CONNECT_HOST}:${PREFILL_PORT}/health" "Prefill"
 
@@ -727,7 +727,7 @@ run_case_with_recovery() {
   local variant_name="$2"
   local laps_threshold="$3"
   local laps_wait_window_ms="$4"
-  local laps_max_long_promos="$5"
+  local long_token_reservation="$5"
   local rate="$6"
   local attempt=1
   local rc=0
@@ -737,7 +737,7 @@ run_case_with_recovery() {
       log "Retrying case ${case_name}: attempt ${attempt}/${CASE_RETRY_LIMIT}"
     fi
 
-    if run_case "${case_name}" "${variant_name}" "${laps_threshold}" "${laps_wait_window_ms}" "${laps_max_long_promos}" "${rate}"; then
+    if run_case "${case_name}" "${variant_name}" "${laps_threshold}" "${laps_wait_window_ms}" "${long_token_reservation}" "${rate}"; then
       append_case_status "${case_name}" "passed" "attempt=${attempt}"
       return 0
     fi
@@ -771,13 +771,13 @@ main() {
   log "Warmup enabled: ${RUN_WARMUP}"
   log "Warmup timeout: ${WARMUP_TIMEOUT}s"
   log "Measured timeout: ${MEASURE_TIMEOUT}s"
-  log "LAPS defaults: long_max_wait_ms=${LAPS_LONG_MAX_WAIT_MS}, max_long_promotions_per_step=${LAPS_MAX_LONG_PROMOTIONS_PER_STEP}"
+  log "LAPS defaults: long_max_wait_ms=${LAPS_LONG_MAX_WAIT_MS}, long_token_reservation=${LAPS_LONG_TOKEN_RESERVATION}"
 
   local variant
   local case_spec
   local laps_threshold
   local laps_wait_window_ms
-  local laps_max_long_promos
+  local long_token_reservation
   local case_suffix
   local repeat_idx
   local rate
@@ -786,13 +786,13 @@ main() {
     for ((repeat_idx = 1; repeat_idx <= CASE_REPEATS; repeat_idx++)); do
       for variant in ${CASE_VARIANTS}; do
         case_spec="$(case_variant_to_params "${variant}")"
-        IFS='|' read -r laps_threshold laps_wait_window_ms laps_max_long_promos case_suffix <<< "${case_spec}"
+        IFS='|' read -r laps_threshold laps_wait_window_ms long_token_reservation case_suffix <<< "${case_spec}"
         run_case_with_recovery \
           "claude_rate${rate}_${case_suffix}_rep${repeat_idx}" \
           "${variant}" \
           "${laps_threshold}" \
           "${laps_wait_window_ms}" \
-          "${laps_max_long_promos}" \
+          "${long_token_reservation}" \
           "${rate}"
       done
     done

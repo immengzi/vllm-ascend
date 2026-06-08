@@ -48,7 +48,7 @@ class LAPSRequestQueue(RequestQueue):
         policy: SchedulingPolicy,
         threshold: int,
         long_max_wait_ms: float,
-        max_long_promotions_per_step: int = 1,
+        long_token_reservation: float = 0.0,
         immediate_predicate: Callable[[Request], bool] | None = None,
     ) -> None:
         self.policy = policy
@@ -56,10 +56,11 @@ class LAPSRequestQueue(RequestQueue):
         # Anti-starvation: a long request waiting longer than this many ms is
         # promoted ahead of short prefills. <= 0 disables aging.
         self.long_max_wait_ms = max(long_max_wait_ms, 0.0)
-        # Cap on how many aged long requests may jump ahead of short prefills
-        # per scheduler step, so aging rescues starving long requests without
-        # flipping the policy into long-first. Clamped to >= 1.
-        self.max_long_promotions_per_step = max(int(max_long_promotions_per_step), 1)
+        # Fraction of the per-step token budget reserved for aged-long prefills.
+        # 0.0 disables aging (strict short-priority); larger values reserve more
+        # compute for the aged-long lane, tightening long-wait SLO bounds at the
+        # cost of short-request latency. Clamped to [0.0, 1.0].
+        self.long_token_reservation = max(0.0, min(long_token_reservation, 1.0))
         self.immediate_predicate = immediate_predicate
         self._immediate_queue = create_request_queue(policy)
         self._short_queue = create_request_queue(policy)
@@ -67,9 +68,11 @@ class LAPSRequestQueue(RequestQueue):
         # Tracks when each request entered the long queue, for aging.
         self._long_enqueue_at: dict[str, float] = {}
         self._long_starvation_promotions = 0
-        # Number of aged long promotions dispatched in the current step; reset
+        # Number of tokens scheduled for aged-long promotions this step; reset
         # by begin_step().
-        self._long_promotions_this_step = 0
+        self._long_tokens_this_step = 0
+        # Token budget for aged-long promotions this step; set by begin_step().
+        self._long_token_budget = 0.0
         self._stats_log_interval_s = max(
             envs.VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S, 0.0
         )
@@ -105,13 +108,13 @@ class LAPSRequestQueue(RequestQueue):
         self._last_stats_log_at = now
         logger.info(
             "LAPS stats: threshold=%d long_max_wait_ms=%.3f "
-            "max_long_promotions_per_step=%d "
+            "long_token_reservation=%.3f "
             "sizes=(immediate=%d short=%d long=%d) "
             "prepends=%s dispatches=%s skip_or_requeues=%s "
             "long_starvation_promotions=%d",
             self.threshold,
             self.long_max_wait_ms,
-            self.max_long_promotions_per_step,
+            self.long_token_reservation,
             len(self._immediate_queue),
             len(self._short_queue),
             len(self._long_queue),
@@ -196,23 +199,24 @@ class LAPSRequestQueue(RequestQueue):
             return False
         return (time.monotonic() - enqueued_at) * 1000.0 >= self.long_max_wait_ms
 
-    def begin_step(self) -> None:
-        """Reset per-step state. Called once at the start of each schedule()."""
-        self._long_promotions_this_step = 0
+    def begin_step(self, token_budget: int) -> None:
+        """Reset per-step state and set the token reservation budget.
+        Called once at the start of each schedule()."""
+        self._long_tokens_this_step = 0
+        self._long_token_budget = self.long_token_reservation * token_budget
 
     def _select_schedulable_queue(self) -> RequestQueue | None:
         # Pure query (no side effects): called repeatedly per scheduling step.
         if self._immediate_queue:
             return self._immediate_queue
         if self._long_queue and self._long_queue_starving():
-            # Throttle: at most max_long_promotions_per_step aged long requests
-            # jump ahead of short per step, so aging rescues starving long
-            # requests without flipping the policy into long-first. Always allow
-            # long when no short is waiting (avoid stalling).
+            # Token-based reservation: aged-long prefills may consume at most
+            # long_token_reservation of the per-step token budget. This bounds
+            # long-prefill compute without flipping the policy into long-first.
+            # Always allow long when no short is waiting (avoid stalling).
             if (
                 not self._short_queue
-                or self._long_promotions_this_step
-                < self.max_long_promotions_per_step
+                or self._long_tokens_this_step < self._long_token_budget
             ):
                 return self._long_queue
         if self._short_queue:
@@ -269,6 +273,7 @@ class LAPSRequestQueue(RequestQueue):
         *,
         count_as_removal: bool = False,
         skip_or_requeue_reason: str | None = None,
+        scheduled_tokens: int = 0,
     ) -> Request:
         request = queue.pop_request()
         self._queue_index.pop(request.request_id, None)
@@ -293,7 +298,7 @@ class LAPSRequestQueue(RequestQueue):
                 >= self.long_max_wait_ms
             ):
                 self._long_starvation_promotions += 1
-                self._long_promotions_this_step += 1
+                self._long_tokens_this_step += scheduled_tokens
         self._force_immediate_request_ids.discard(request.request_id)
         self._debug_state(event_name, request=request, queue=queue)
         self._maybe_log_stats()
@@ -414,22 +419,20 @@ class LAPSSchedulerMixin:
             immediate_predicate = self._is_recovery_request
         threshold = envs.VLLM_ASCEND_LAPS_THRESHOLD
         long_max_wait_ms = envs.VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS
-        max_long_promotions_per_step = (
-            envs.VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP
-        )
+        long_token_reservation = envs.VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION
         self.waiting = LAPSRequestQueue(
             policy=self.policy,
             threshold=threshold,
             long_max_wait_ms=long_max_wait_ms,
-            max_long_promotions_per_step=max_long_promotions_per_step,
+            long_token_reservation=long_token_reservation,
             immediate_predicate=immediate_predicate,
         )
         logger.info(
             "LAPS scheduling enabled on Ascend: threshold=%d, "
-            "long_max_wait_ms=%.3f, max_long_promotions_per_step=%d",
+            "long_max_wait_ms=%.3f, long_token_reservation=%.3f",
             threshold,
             long_max_wait_ms,
-            max_long_promotions_per_step,
+            long_token_reservation,
         )
 
     def _laps_waiting_queue(self) -> LAPSRequestQueue | None:

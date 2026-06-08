@@ -116,13 +116,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS": lambda: float(
         os.getenv("VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS", "0")
     ),
-    # Maximum number of aged long prefills that may be promoted ahead of short
-    # prefills per scheduler step. This throttles aging so it rescues starving
-    # long requests without flipping the policy into long-first. Higher values
-    # rescue long requests more aggressively (tighter long-wait bound, harsher
-    # on the short-request tail); 1 is the gentlest. Clamped to >= 1.
-    "VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP": lambda: int(
-        os.getenv("VLLM_ASCEND_LAPS_MAX_LONG_PROMOTIONS_PER_STEP", "1")
+    # Maximum fraction of the per-step token budget that aged-long prefills may
+    # consume (reservation-based anti-starvation). This reserves compute for the
+    # aged-long lane. 0 disables aging (strict short-priority); larger values
+    # tighten long-wait SLO bounds at the cost of short-request latency. Clamped
+    # to [0.0, 1.0].
+    "VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION", "0")
     ),
     # Optional periodic LAPS stats logging interval, in seconds. Set to 0 to
     # disable aggregate stats logging. This is intended for benchmark

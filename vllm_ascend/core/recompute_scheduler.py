@@ -137,6 +137,7 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
         *,
         count_as_removal: bool = False,
         skip_or_requeue_reason: str | None = None,
+        scheduled_tokens: int = 0,
     ) -> Request:
         if count_with_laps:
             laps_waiting = self._laps_waiting_queue()
@@ -144,6 +145,7 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                 request_queue,
                 count_as_removal=count_as_removal,
                 skip_or_requeue_reason=skip_or_requeue_reason,
+                scheduled_tokens=scheduled_tokens,
             )
         return request_queue.pop_request()
 
@@ -266,8 +268,8 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
         scheduled_timestamp = time.monotonic()
         laps_waiting = self._laps_waiting_queue()
         if laps_waiting is not None:
-            # Reset per-step LAPS state (e.g. aged-long promotion cap).
-            laps_waiting.begin_step()
+            # Reset per-step LAPS state and set the token reservation budget.
+            laps_waiting.begin_step(self.max_num_scheduled_tokens)
 
         self.kv_cache_manager.new_step_starts()
 
@@ -669,7 +671,7 @@ class RecomputeScheduler(LAPSSchedulerMixin, Scheduler):
                             preempted=request.num_preemptions > 0,
                         )
 
-                request = self._pop_waiting_request(request_queue, count_with_laps)
+                request = self._pop_waiting_request(request_queue, count_with_laps, scheduled_tokens=num_new_tokens)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
