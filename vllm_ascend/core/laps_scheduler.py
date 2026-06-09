@@ -43,6 +43,24 @@ class LAPSRequestQueue(RequestQueue):
         "remote_kv_not_ready",
     )
 
+    # Burst allowance for the aged-long admission bucket, in scheduling steps:
+    # the bucket caps at `reservation * token_budget * _LONG_BURST_STEPS`, so an
+    # idle aged-long lane can accumulate at most this many steps' worth of
+    # reservation before a burst of admissions, bounding short-request impact.
+    _LONG_BURST_STEPS = 4
+
+    # Hard-deadline multiplier on `long_max_wait_ms`. Aging has two tiers:
+    #   * soft (>= long_max_wait_ms): the long is eligible for promotion but the
+    #     token bucket rate-limits it, so a backlog of aged longs cannot flip the
+    #     queue into long-first and starve shorts.
+    #   * hard (>= hard bound): the long is promoted unconditionally, bypassing
+    #     the bucket, which makes the worst-case wait a true upper bound.
+    # With reservation == 0 the bucket never refills, so there is no useful soft
+    # phase; the hard bound collapses to long_max_wait_ms (pure deadline aging).
+    # With reservation > 0 the hard bound is long_max_wait_ms * this multiplier,
+    # leaving the [soft, hard) window for bucket-smoothed promotion.
+    _LONG_HARD_DEADLINE_MULT = 2.0
+
     def __init__(
         self,
         policy: SchedulingPolicy,
@@ -54,12 +72,15 @@ class LAPSRequestQueue(RequestQueue):
         self.policy = policy
         self.threshold = threshold
         # Anti-starvation: a long request waiting longer than this many ms is
-        # promoted ahead of short prefills. <= 0 disables aging.
+        # promoted ahead of short prefills (soft phase, bucket-rate-limited; then
+        # unconditionally past the hard deadline). <= 0 disables aging entirely.
         self.long_max_wait_ms = max(long_max_wait_ms, 0.0)
-        # Fraction of the per-step token budget reserved for aged-long prefills.
-        # 0.0 disables aging (strict short-priority); larger values reserve more
-        # compute for the aged-long lane, tightening long-wait SLO bounds at the
-        # cost of short-request latency. Clamped to [0.0, 1.0].
+        # Average fraction of token throughput reserved for admitting aged-long
+        # prefills ahead of waiting shorts during the soft aging phase
+        # (token-bucket rate; see begin_step). 0.0 disables soft-phase smoothing,
+        # reducing aging to a pure deadline at long_max_wait_ms; larger values
+        # drain aged-long requests sooner at the cost of short-request latency.
+        # Clamped to [0.0, 1.0].
         self.long_token_reservation = max(0.0, min(long_token_reservation, 1.0))
         self.immediate_predicate = immediate_predicate
         self._immediate_queue = create_request_queue(policy)
@@ -67,17 +88,22 @@ class LAPSRequestQueue(RequestQueue):
         self._long_queue = create_request_queue(policy)
         # Tracks when each request entered the long queue, for aging.
         self._long_enqueue_at: dict[str, float] = {}
+        # Aged-long requests admitted ahead of waiting shorts (soft + hard).
         self._long_starvation_promotions = 0
-        # Total tokens scheduled for aged-long promotions across the current
-        # starvation cycle. Reset when all starving long requests have been
-        # processed or when the budget is exceeded for an extended period.
-        self._long_tokens_total = 0
-        # Token budget for aged-long promotions, based on reservation fraction.
-        # This is the maximum total tokens that can be scheduled for aged-long
-        # requests before we stop promoting them.
-        self._long_token_budget = 0.0
-        # Number of consecutive steps with budget exceeded (for reset logic).
-        self._budget_exceeded_steps = 0
+        # Subset of the above forced through by the hard deadline (bucket bypass).
+        self._long_hard_deadline_promotions = 0
+        # Token bucket throttling aged-long admissions (see begin_step). The
+        # bucket refills by `long_token_reservation * token_budget` every
+        # scheduling step and is charged the first-chunk size each time an aged
+        # long is admitted ahead of waiting shorts. Gating on `bucket > 0` caps
+        # the average aged-long admission rate at the reservation fraction of
+        # token throughput, with a bounded burst, and without the cliff/debt of
+        # a cumulative quota.
+        self._long_bucket = 0.0
+        self._long_bucket_capacity = 0.0
+        self._long_refill_per_step = 0.0
+        # Total first-chunk tokens charged to the bucket so far (observability).
+        self._long_tokens_charged = 0
         self._stats_log_interval_s = max(
             envs.VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S, 0.0
         )
@@ -116,7 +142,9 @@ class LAPSRequestQueue(RequestQueue):
             "long_token_reservation=%.3f "
             "sizes=(immediate=%d short=%d long=%d) "
             "prepends=%s dispatches=%s skip_or_requeues=%s "
-            "long_starvation_promotions=%d",
+            "long_starvation_promotions=%d long_hard_deadline_promotions=%d "
+            "long_tokens_charged=%d "
+            "bucket=%.0f capacity=%.0f",
             self.threshold,
             self.long_max_wait_ms,
             self.long_token_reservation,
@@ -127,6 +155,10 @@ class LAPSRequestQueue(RequestQueue):
             self._dispatch_counters,
             self._skip_or_requeue_counters,
             self._long_starvation_promotions,
+            self._long_hard_deadline_promotions,
+            self._long_tokens_charged,
+            self._long_bucket,
+            self._long_bucket_capacity,
         )
 
     def _increment_skip_or_requeue_counter(
@@ -194,44 +226,68 @@ class LAPSRequestQueue(RequestQueue):
             return self._short_queue
         return self._long_queue
 
-    def _long_queue_starving(self) -> bool:
-        """Whether the oldest long request has waited past its aging bound."""
+    def _long_head_wait_ms(self) -> float | None:
+        """Milliseconds the oldest long request has waited, or None if N/A.
+
+        Single source of truth for the long-queue head age (one peek +
+        monotonic() + dict lookup), reused by the soft and hard aging checks so
+        the hot path does not recompute it.
+        """
         if self.long_max_wait_ms <= 0 or not self._long_queue:
-            return False
+            return None
         head = self._long_queue.peek_request()  # FCFS head = oldest long request
         enqueued_at = self._long_enqueue_at.get(head.request_id)
         if enqueued_at is None:
-            return False
-        return (time.monotonic() - enqueued_at) * 1000.0 >= self.long_max_wait_ms
+            return None
+        return (time.monotonic() - enqueued_at) * 1000.0
+
+    def _long_hard_deadline_ms(self) -> float:
+        """Hard aging bound: past this, a long is promoted bypassing the bucket.
+
+        Collapses to long_max_wait_ms when reservation is 0 (no soft phase, pure
+        deadline aging); otherwise long_max_wait_ms * _LONG_HARD_DEADLINE_MULT.
+        """
+        if self.long_token_reservation <= 0.0:
+            return self.long_max_wait_ms
+        return self.long_max_wait_ms * self._LONG_HARD_DEADLINE_MULT
+
+    def _long_queue_starving(self) -> bool:
+        """Whether the oldest long request has waited past its (soft) aging bound."""
+        wait_ms = self._long_head_wait_ms()
+        return wait_ms is not None and wait_ms >= self.long_max_wait_ms
+
+    def _long_queue_hard_starving(self) -> bool:
+        """Whether the oldest long request has waited past its hard deadline."""
+        wait_ms = self._long_head_wait_ms()
+        return wait_ms is not None and wait_ms >= self._long_hard_deadline_ms()
 
     def begin_step(self, token_budget: int) -> None:
-        """Set the token reservation budget for the current scheduling cycle.
-        Called once at the start of each schedule()."""
-        # Calculate the budget as: if we scheduled this many total tokens,
-        # the aged-long lane should get at most reservation fraction of them.
-        # For example, with reservation=0.2 and budget=4096, aged-long gets
-        # up to 8192 total tokens before we stop promoting (20% of a hypothetical
-        # 40960 total token workload).
-        if self._long_token_budget == 0 or self._long_tokens_total < self._long_token_budget:
-            # Initialize or re-establish the budget
-            self._long_token_budget = self.long_token_reservation * token_budget * 20
-        # Check if we've exceeded the budget for too long
-        if self._long_tokens_total >= self._long_token_budget:
-            self._budget_exceeded_steps += 1
-            # Reset after 100 steps of budget exhaustion (no more starving requests)
-            if self._budget_exceeded_steps > 100:
-                self._long_tokens_total = 0
-                self._budget_exceeded_steps = 0
-                self._long_token_budget = self.long_token_reservation * token_budget * 20
-        else:
-            self._budget_exceeded_steps = 0
+        """Refill the aged-long admission token bucket for this scheduling step.
+
+        Called once at the start of each schedule(). The bucket refills by
+        `long_token_reservation * token_budget` tokens per step (capped at
+        `_LONG_BURST_STEPS` steps' worth), so over any window the aged-long lane
+        is admitted at an average rate of the reservation fraction of token
+        throughput during the soft aging phase. With reservation=0 the bucket
+        stays empty, so there is no soft phase: a long is admitted only via the
+        stall-avoidance path (no short waiting) or the hard deadline (see
+        `_long_hard_deadline_ms`).
+        """
+        self._long_refill_per_step = self.long_token_reservation * token_budget
+        self._long_bucket_capacity = self._long_refill_per_step * self._LONG_BURST_STEPS
+        self._long_bucket = min(
+            self._long_bucket_capacity,
+            self._long_bucket + self._long_refill_per_step,
+        )
         if self._debug_logging_enabled:
             logger.debug(
-                "LAPS begin_step: token_budget=%d long_token_reservation=%.3f long_token_budget=%.0f long_tokens_total=%.0f",
+                "LAPS begin_step: token_budget=%d long_token_reservation=%.3f "
+                "refill_per_step=%.0f bucket=%.0f capacity=%.0f",
                 token_budget,
                 self.long_token_reservation,
-                self._long_token_budget,
-                self._long_tokens_total,
+                self._long_refill_per_step,
+                self._long_bucket,
+                self._long_bucket_capacity,
             )
 
     def _select_schedulable_queue(self) -> RequestQueue | None:
@@ -239,28 +295,39 @@ class LAPSRequestQueue(RequestQueue):
         if self._immediate_queue:
             return self._immediate_queue
         if self._long_queue and self._long_queue_starving():
-            # Token-based reservation: aged-long prefills may consume at most
-            # long_token_reservation of the total compute (tracked cumulatively).
-            # When short queue is non-empty, only promote long if budget remains.
-            # When short queue is empty, always allow long (stall avoidance).
+            # Token-bucket reservation: aged-long admissions are rate-limited to
+            # the reservation fraction of token throughput. When the short queue
+            # is non-empty, only promote long while the bucket has credit. When
+            # the short queue is empty, always allow long (stall avoidance).
             if not self._short_queue:
-                # Stall avoidance: allow long when no short is waiting
+                # Stall avoidance: allow long when no short is waiting.
                 self._debug_state(
                     "aged-long_selected_stall_avoidance",
-                    extra=f"tokens_total={self._long_tokens_total:.0f} budget={self._long_token_budget:.0f}",
+                    extra=f"bucket={self._long_bucket:.0f} capacity={self._long_bucket_capacity:.0f}",
                 )
                 return self._long_queue
-            if self._long_tokens_total < self._long_token_budget:
-                # Reservation available: promote aged-long ahead of short
+            if self._long_bucket > 0.0:
+                # Reservation credit available: promote aged-long ahead of short.
                 self._debug_state(
                     "aged-long_selected_with_budget",
-                    extra=f"tokens_total={self._long_tokens_total:.0f} budget={self._long_token_budget:.0f}",
+                    extra=f"bucket={self._long_bucket:.0f} capacity={self._long_bucket_capacity:.0f}",
                 )
                 return self._long_queue
-            # Budget exhausted and short queue is non-empty: prefer short
+            if self._long_queue_hard_starving():
+                # Hard deadline: the long has waited past its hard bound. Promote
+                # it unconditionally (bypassing the bucket) so the worst-case wait
+                # stays a true upper bound even when the reservation rate is too
+                # low to drain it via the soft phase.
+                self._debug_state(
+                    "aged-long_selected_hard_deadline",
+                    extra=f"bucket={self._long_bucket:.0f} capacity={self._long_bucket_capacity:.0f}",
+                )
+                return self._long_queue
+            # Bucket exhausted, hard deadline not reached, short queue non-empty:
+            # prefer short.
             self._debug_state(
                 "aged-long_blocked_budget_exhausted",
-                extra=f"tokens_total={self._long_tokens_total:.0f} budget={self._long_token_budget:.0f}",
+                extra=f"bucket={self._long_bucket:.0f} capacity={self._long_bucket_capacity:.0f}",
             )
             # (fall through to short queue check below)
         if self._short_queue:
@@ -334,22 +401,43 @@ class LAPSRequestQueue(RequestQueue):
             self._dispatch_counters[self._queue_name(queue)] += 1
             event_name = "dispatch"
             # Count long requests dispatched after aging past their bound.
-            if (
+            wait_ms = (
+                (time.monotonic() - enqueued_at) * 1000.0
+                if enqueued_at is not None
+                else None
+            )
+            aged = (
                 queue is self._long_queue
                 and self.long_max_wait_ms > 0
-                and enqueued_at is not None
-                and (time.monotonic() - enqueued_at) * 1000.0
-                >= self.long_max_wait_ms
-            ):
-                self._long_starvation_promotions += 1
-                self._long_tokens_total += scheduled_tokens
+                and wait_ms is not None
+                and wait_ms >= self.long_max_wait_ms
+            )
+            if aged:
+                # A stall-avoidance admission (no short waiting) did not jump the
+                # queue, so it counts as neither a starvation promotion nor a
+                # bucket charge; only count/charge when shorts were actually
+                # waiting and got passed.
+                jumped_shorts = len(self._short_queue) > 0
+                if jumped_shorts:
+                    self._long_starvation_promotions += 1
+                    # Forced through by the hard deadline (the bucket was empty,
+                    # so soft-phase smoothing alone would not have admitted it).
+                    if (
+                        self._long_bucket <= 0.0
+                        and wait_ms >= self._long_hard_deadline_ms()
+                    ):
+                        self._long_hard_deadline_promotions += 1
+                charged = jumped_shorts and scheduled_tokens > 0
+                if charged:
+                    self._long_bucket -= scheduled_tokens
+                    self._long_tokens_charged += scheduled_tokens
                 self._debug_state(
                     "aged-long_dispatched",
                     request=request,
                     queue=queue,
-                    extra=f"scheduled_tokens={scheduled_tokens} "
-                    f"tokens_total={self._long_tokens_total:.0f} "
-                    f"budget={self._long_token_budget:.0f}",
+                    extra=f"scheduled_tokens={scheduled_tokens} charged={bool(charged)} "
+                    f"bucket={self._long_bucket:.0f} "
+                    f"capacity={self._long_bucket_capacity:.0f}",
                 )
         self._force_immediate_request_ids.discard(request.request_id)
         self._debug_state(event_name, request=request, queue=queue)

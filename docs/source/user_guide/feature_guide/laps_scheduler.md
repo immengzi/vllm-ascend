@@ -60,17 +60,41 @@ export VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION=0.2
   - Prompts with `num_prompt_tokens <= threshold` are treated as short.
 - `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`
   - Anti-starvation aging bound for long prefills, in milliseconds.
-  - A long request that has waited longer than this is promoted ahead of short
-    prefills, bounding its worst-case admission wait.
   - `0` disables aging (strict short-priority).
+  - Aging is two-tiered (see `LONG_TOKEN_RESERVATION`):
+    - **soft** (waited `>= LONG_MAX_WAIT_MS`): the long becomes eligible to be
+      promoted ahead of shorts, but the token bucket rate-limits the promotion.
+    - **hard** (waited `>= hard bound`): the long is promoted unconditionally,
+      bypassing the bucket, which makes the worst-case admission wait a true
+      upper bound.
+  - The hard bound (and thus the worst-case wait) is:
+    - `LONG_MAX_WAIT_MS` when `LONG_TOKEN_RESERVATION == 0` (pure deadline
+      aging — no soft phase, since the bucket never refills);
+    - `~2 * LONG_MAX_WAIT_MS` when `LONG_TOKEN_RESERVATION > 0`, leaving the
+      `[soft, hard)` window for bucket-smoothed promotion.
 - `VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION`
-  - Maximum fraction of the per-step token budget that aged-long prefills may
-    consume (default `0.0`, valid range `[0.0, 1.0]`).
-  - This reserves compute for the aged-long lane. `0` disables aging (strict
-    short-priority); larger values tighten long-wait SLO bounds at the cost of
-    short-request latency.
-  - Aging is only active when both `LONG_MAX_WAIT_MS > 0` and
-    `LONG_TOKEN_RESERVATION > 0`.
+  - Average fraction of token throughput reserved for **admitting** aged-long
+    prefills ahead of waiting shorts during the *soft* aging phase (default
+    `0.0`, valid range `[0.0, 1.0]`).
+  - Implemented as a token bucket: it refills by
+    `reservation * per-step token budget` every scheduling step (burst capped at
+    a few steps' worth), and admitting an aged-long ahead of shorts spends that
+    credit. In the soft phase an aged-long is promoted only while the bucket has
+    credit; once spent, shorts are preferred until the bucket refills (typically
+    within a handful of steps). This smoothing prevents a backlog of aged longs
+    from flipping the queue into long-first and starving shorts.
+  - `0` disables soft-phase smoothing: aging then reduces to a pure deadline at
+    `LONG_MAX_WAIT_MS` (the hard bound). Larger values drain aged-long requests
+    faster during the soft phase at the cost of short-request latency.
+  - The bucket bounds the *admission rate*, not total compute: once admitted, a
+    long prefill proceeds chunk-by-chunk through the normal running loop. The
+    reservation only affects how aggressively the soft phase drains; the hard
+    deadline guarantees the worst-case wait regardless of reservation.
+  - The bucket refills against `max_num_scheduled_tokens` (the full per-step
+    budget), not the budget left after running requests. Under decode-heavy load
+    the bucket therefore tends to stay saturated, so aged longs are admitted
+    almost as soon as they reach the soft phase. This errs toward stronger
+    anti-starvation and is an intentional trade-off.
 
 ## How It Is Selected
 
@@ -126,17 +150,28 @@ Dispatch priority is: immediate > aged-long > short > long.
   continuous batching groups them together each step).
 - Long requests are normally only dispatched when no immediate or short
   requests are schedulable.
-- **Anti-starvation:** if the oldest long request has waited longer than
-  `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`, it is promoted ahead of short prefills,
-  bounding each long request's worst-case admission wait so a sustained
-  short-request stream cannot starve long prefills.
-- **Token reservation:** aged-long prefills may consume at most
-  `VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION` of the per-step token budget.
-  This reserves compute for the aged-long lane without flipping the policy into
-  long-first. Larger values tighten long-wait SLO bounds at the cost of
-  short-request latency. When no short request is waiting, long is dispatched
-  regardless of the reservation to avoid stalling. Aging is only active when
-  both `LONG_MAX_WAIT_MS > 0` and `LONG_TOKEN_RESERVATION > 0`.
+- **Anti-starvation (two-tier aging):** aging kicks in once the oldest long
+  request has waited longer than `VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS`.
+  - **Soft phase** (`>= LONG_MAX_WAIT_MS`): the long is promoted ahead of shorts
+    only while the token-reservation bucket has credit, so the promotion rate is
+    smoothed and a backlog of aged longs cannot flip the queue into long-first.
+  - **Hard phase** (`>= hard bound`): the long is promoted unconditionally,
+    bypassing the bucket. This makes the worst-case admission wait a true upper
+    bound — `LONG_MAX_WAIT_MS` when `LONG_TOKEN_RESERVATION == 0`, or
+    `~2 * LONG_MAX_WAIT_MS` when it is `> 0` — so a sustained short-request
+    stream cannot starve long prefills regardless of the reservation.
+- **Token reservation (soft-phase smoothing):** aged-long admissions in the soft
+  phase are rate-limited by a token bucket that refills
+  `VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION` of the per-step token budget each
+  step (burst capped at a few steps' worth). While the bucket has credit an
+  aged-long is promoted ahead of shorts; admitting it spends the first chunk's
+  tokens from the bucket. When the bucket is empty shorts are preferred until it
+  refills (a few steps) — unless the hard deadline has been reached, in which
+  case the long is forced through. When no short request is waiting, long is
+  dispatched regardless of the bucket (stall avoidance) and is **not** charged or
+  counted as a starvation promotion, since it did not jump the queue. Larger
+  reservations drain aged-long requests faster during the soft phase at the cost
+  of short-request latency.
 
 ## Current Scope and Limitations
 

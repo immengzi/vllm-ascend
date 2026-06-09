@@ -111,15 +111,20 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LAPS_THRESHOLD": lambda: int(os.getenv("VLLM_ASCEND_LAPS_THRESHOLD", "256")),
     # Anti-starvation aging bound for long prefills, in milliseconds. A long
     # request that has waited longer than this is promoted ahead of short
-    # prefills, bounding its worst-case admission wait. Set to 0 to disable
-    # aging (strict short-priority).
+    # prefills: first in a bucket-rate-limited soft phase, then unconditionally
+    # past the hard deadline, which bounds its worst-case admission wait
+    # (= this value when reservation is 0, else ~2x this value). Set to 0 to
+    # disable aging entirely (strict short-priority).
     "VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS": lambda: float(
         os.getenv("VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS", "0")
     ),
-    # Maximum fraction of the per-step token budget that aged-long prefills may
-    # consume (reservation-based anti-starvation). This reserves compute for the
-    # aged-long lane. 0 disables aging (strict short-priority); larger values
-    # tighten long-wait SLO bounds at the cost of short-request latency. Clamped
+    # Average fraction of token throughput reserved for admitting aged-long
+    # prefills ahead of waiting shorts during the soft aging phase (token-bucket
+    # smoothing). The bucket refills this fraction of the per-step token budget
+    # each step; admitting an aged-long ahead of shorts spends that credit. 0
+    # disables soft-phase smoothing, reducing aging to a pure deadline at
+    # LONG_MAX_WAIT_MS; larger values drain aged-long requests sooner at the cost
+    # of short-request latency. Bounds admission rate, not total compute. Clamped
     # to [0.0, 1.0].
     "VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION": lambda: float(
         os.getenv("VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION", "0")
