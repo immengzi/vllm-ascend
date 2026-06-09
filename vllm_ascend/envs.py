@@ -103,6 +103,38 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_FUSED_MC2": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_FUSED_MC2", "0")),
     # Whether to anbale balance scheduling
     "VLLM_ASCEND_BALANCE_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_BALANCE_SCHEDULING", "0"))),
+    # Whether to enable LAPS-style length-aware prefill scheduling on the
+    # engine side. This currently targets the FCFS waiting queue path.
+    "VLLM_ASCEND_LAPS_SCHEDULING": lambda: bool(int(os.getenv("VLLM_ASCEND_LAPS_SCHEDULING", "0"))),
+    # Prompt-length threshold used by LAPS scheduling. Requests with
+    # num_prompt_tokens <= threshold are treated as short prefills.
+    "VLLM_ASCEND_LAPS_THRESHOLD": lambda: int(os.getenv("VLLM_ASCEND_LAPS_THRESHOLD", "256")),
+    # Anti-starvation aging bound for long prefills, in milliseconds. A long
+    # request that has waited longer than this is promoted ahead of short
+    # prefills: first in a bucket-rate-limited soft phase, then unconditionally
+    # past the hard deadline, which bounds its worst-case admission wait
+    # (= this value when reservation is 0, else ~2x this value). Set to 0 to
+    # disable aging entirely (strict short-priority).
+    "VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_LONG_MAX_WAIT_MS", "0")
+    ),
+    # Average fraction of token throughput reserved for admitting aged-long
+    # prefills ahead of waiting shorts during the soft aging phase (token-bucket
+    # smoothing). The bucket refills this fraction of the per-step token budget
+    # each step; admitting an aged-long ahead of shorts spends that credit. 0
+    # disables soft-phase smoothing, reducing aging to a pure deadline at
+    # LONG_MAX_WAIT_MS; larger values drain aged-long requests sooner at the cost
+    # of short-request latency. Bounds admission rate, not total compute. Clamped
+    # to [0.0, 1.0].
+    "VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_LONG_TOKEN_RESERVATION", "0")
+    ),
+    # Optional periodic LAPS stats logging interval, in seconds. Set to 0 to
+    # disable aggregate stats logging. This is intended for benchmark
+    # observability without enabling global DEBUG logging.
+    "VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S": lambda: float(
+        os.getenv("VLLM_ASCEND_LAPS_STATS_LOG_INTERVAL_S", "0")
+    ),
     # use fused op transpose_kv_cache_by_block, default is True
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
