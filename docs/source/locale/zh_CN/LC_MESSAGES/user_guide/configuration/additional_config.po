@@ -277,7 +277,65 @@ msgstr ""
 "config](https://docs.vllm.ai/en/stable/api/vllm/config.html#vllm.config.SchedulerConfig)"
 " 的选项。例如，你也可以在 ascend_scheduler_config 中添加 `enable_chunked_prefill: True`。"
 
-#: ../../user_guide/configuration/additional_config.md:60
+#: ../../user_guide/configuration/additional_config.md
+msgid "`short_request_first_config`"
+msgstr "`short_request_first_config`"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid ""
+"Configuration options for ShortRequestFirst prefill scheduling. Requires "
+"`recompute_scheduler_enable=true`."
+msgstr "ShortRequestFirst 预填充调度的配置选项。需要 `recompute_scheduler_enable=true`。"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid "**short_request_first_config**"
+msgstr "**short_request_first_config**"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid ""
+"ShortRequestFirst prefill scheduling. Only takes effect together with "
+"`recompute_scheduler_enable=true` and the FCFS scheduler policy."
+msgstr "ShortRequestFirst 预填充调度。仅在同时启用 `recompute_scheduler_enable=true` 和 FCFS 调度策略时生效。"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid "Whether to enable ShortRequestFirst scheduling."
+msgstr "是否启用 ShortRequestFirst 调度。"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid "`threshold`"
+msgstr "`threshold`"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid "`256`"
+msgstr "`256`"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid ""
+"Prompt-length threshold (tokens). Requests with `num_prompt_tokens <= "
+"threshold` are treated as short prefills and prioritized over long "
+"prefills."
+msgstr ""
+"prompt 长度阈值（token）。`num_prompt_tokens <= threshold` "
+"的请求会被视为短预填充请求，并优先于长预填充请求。"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid "`long_max_wait_ms`"
+msgstr "`long_max_wait_ms`"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid "`0.0`"
+msgstr "`0.0`"
+
+#: ../../user_guide/configuration/additional_config.md
+msgid ""
+"Maximum time a long prefill may wait behind short prefills before it can "
+"be promoted ahead of them. `0` disables long-request promotion and keeps "
+"strict short-request priority."
+msgstr ""
+"长预填充请求在短预填充请求之后最多可等待的时间；超过该时间后，它可以被提升到短请求之前。"
+"`0` 表示禁用长请求提升，并保持严格的短请求优先级。"
+
+#: ../../user_guide/configuration/additional_config.md
 msgid "Example"
 msgstr "示例"
 

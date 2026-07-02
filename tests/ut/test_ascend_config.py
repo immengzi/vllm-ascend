@@ -18,7 +18,12 @@ from unittest.mock import patch
 from vllm.config import VllmConfig
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import clear_ascend_config, get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import (
+    ShortRequestFirstConfig,
+    clear_ascend_config,
+    get_ascend_config,
+    init_ascend_config,
+)
 
 
 class TestAscendConfig(TestBase):
@@ -112,3 +117,41 @@ class TestAscendConfig(TestBase):
         clear_ascend_config()
         with self.assertRaises(RuntimeError):
             get_ascend_config()
+
+
+class TestShortRequestFirstConfig(TestBase):
+    def test_default_is_disabled(self):
+        cfg = ShortRequestFirstConfig({})
+        self.assertFalse(cfg.enabled)
+        self.assertEqual(cfg.threshold, 256)
+        self.assertEqual(cfg.long_max_wait_ms, 0.0)
+
+    def test_explicit_config(self):
+        cfg = ShortRequestFirstConfig(
+            {
+                "enabled": True,
+                "threshold": 512,
+                "long_max_wait_ms": 2000,
+            }
+        )
+        self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.threshold, 512)
+        self.assertEqual(cfg.long_max_wait_ms, 2000.0)
+
+    def test_unknown_key_rejected(self):
+        with self.assertRaises(ValueError):
+            ShortRequestFirstConfig({"foo": 1})
+
+    def test_validation_rejects_out_of_range(self):
+        with self.assertRaises(ValueError):
+            ShortRequestFirstConfig({"long_token_reservation": 1.5})
+        with self.assertRaises(ValueError):
+            ShortRequestFirstConfig({"threshold": -1})
+        with self.assertRaises(ValueError):
+            ShortRequestFirstConfig({"long_max_wait_ms": -1})
+
+    def test_none_config_is_disabled(self):
+        cfg = ShortRequestFirstConfig(None)
+        self.assertFalse(cfg.enabled)
+        self.assertEqual(cfg.threshold, 256)
+        self.assertEqual(cfg.long_max_wait_ms, 0.0)

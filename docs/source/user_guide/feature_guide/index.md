@@ -17,6 +17,7 @@ rfork
 Multi_Token_Prediction
 dynamic_batch
 epd_disaggregation
+short_request_first
 kv_pool
 external_dp
 large_scale_ep

@@ -46,6 +46,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `layer_sharding`                    | dict | `{}`    | Configuration options for Layer Sharding Linear |
 | `enable_sparse_c8`                  | bool | `False` | Whether to enable KV cache C8 in DSA models (e.g., DeepSeekV3.2 and GLM5). Not supported on A5 devices now |
 | `enable_mc2_hierarchy_comm`         | bool | `False` | Enable dispatch/combine op inter-node communication by ROCE. |
+| `short_request_first_config`        | dict | `{}`    | Configuration options for ShortRequestFirst prefill scheduling. Requires `recompute_scheduler_enable=true`. |
 
 The details of each configuration option are as follows:
 
@@ -93,6 +94,16 @@ The details of each configuration option are as follows:
 | `algorithm_execution_interval`   | int | `30`   | The forward iterations when the EPLB worker will finish CPU tasks. |
 | `expert_map_record_path`         | str | `None` | Save the expert load calculation results to a new expert table in the specified directory.|
 | `num_redundant_experts`          | int | `0`    | Specify redundant experts during initialization. |
+
+**short_request_first_config**
+
+ShortRequestFirst prefill scheduling. Only takes effect together with `recompute_scheduler_enable=true` and the FCFS scheduler policy.
+
+| Name | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `enabled`                | bool  | `False` | Whether to enable ShortRequestFirst scheduling. |
+| `threshold`              | int   | `256`   | Prompt-length threshold (tokens). Requests with `num_prompt_tokens <= threshold` are treated as short prefills and prioritized over long prefills. |
+| `long_max_wait_ms`       | float | `0.0`   | Maximum time a long prefill may wait behind short prefills before it can be promoted ahead of them. `0` disables long-request promotion and keeps strict short-request priority. |
 
 ### Example
 
