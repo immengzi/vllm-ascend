@@ -139,6 +139,9 @@ class AscendConfig:
         self.multistream_overlap_gate = additional_config.get("multistream_overlap_gate", False)
         # PD-disaggregated only (kv_producer/kv_consumer); invalid in PD-mixed (kv_both / no kv_transfer_config).
         self.recompute_scheduler_enable = additional_config.get("recompute_scheduler_enable", False)
+        self.short_request_first_config = ShortRequestFirstConfig(
+            additional_config.get("short_request_first_config", {})
+        )
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         self.enable_matmul_allreduce = self._get_config_value(
@@ -771,6 +774,33 @@ class EplbConfig:
 
         logger.info("Dynamic EPLB is %s", self.config["dynamic_eplb"])
         logger.info("The number of redundant experts is %s", self.config["num_redundant_experts"])
+
+
+class ShortRequestFirstConfig:
+    """Configuration object for ``additional_config[\"short_request_first_config\"]``."""
+
+    _defaults = {
+        "enabled": False,
+        "threshold": 256,
+        "long_max_wait_ms": 0.0,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        user_config = user_config or {}
+        unknown = set(user_config) - set(self._defaults)
+        if unknown:
+            raise ValueError(f"Unknown short_request_first_config keys: {sorted(unknown)}")
+
+        self.enabled = bool(user_config.get("enabled", self._defaults["enabled"]))
+        self.threshold = int(user_config.get("threshold", self._defaults["threshold"]))
+        self.long_max_wait_ms = float(user_config.get("long_max_wait_ms", self._defaults["long_max_wait_ms"]))
+        self._validate_config()
+
+    def _validate_config(self):
+        if self.threshold < 0:
+            raise ValueError(f"short_request_first_config.threshold must be a non-negative int; got {self.threshold}")
+        if self.long_max_wait_ms < 0:
+            raise ValueError(f"short_request_first_config.long_max_wait_ms must be >= 0; got {self.long_max_wait_ms}")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
