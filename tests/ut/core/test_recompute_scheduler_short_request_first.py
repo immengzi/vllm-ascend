@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Integration tests for ShortRequestFirst wired into ``RecomputeScheduler``."""
+"""Regression tests for ``RecomputeScheduler`` without ShortRequestFirst."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -28,7 +28,6 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import ShortRequestFirstConfig
 from vllm_ascend.core.short_request_first_scheduler import ShortRequestFirstRequestQueue
 
 EOS_TOKEN_ID = 50256
@@ -36,23 +35,6 @@ MODEL = "Qwen3-0.6B"
 THRESHOLD = 256
 MAX_NUM_BATCHED_TOKENS = 10000
 BLOCK_SIZE = 16
-
-
-class FakeClock:
-    def __init__(self):
-        self.now = 1000.0
-
-    def monotonic(self):
-        return self.now
-
-    def advance(self, seconds: float):
-        self.now += seconds
-
-
-def _fake_ascend_config(**overrides) -> SimpleNamespace:
-    config = {"enabled": True, "threshold": THRESHOLD}
-    config.update(overrides)
-    return SimpleNamespace(scheduler_config=SimpleNamespace(short_request_first_config=ShortRequestFirstConfig(config)))
 
 
 def create_requests(num_tokens_list, max_tokens: int = 16):
@@ -73,11 +55,11 @@ def create_requests(num_tokens_list, max_tokens: int = 16):
     return requests
 
 
-class TestRecomputeSchedulerShortRequestFirst(TestBase):
+class TestRecomputeSchedulerWithoutShortRequestFirst(TestBase):
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
     @patch("vllm.config.ModelConfig.is_encoder_decoder", PropertyMock(return_value=False))
-    def create_scheduler(self, **config_overrides):
+    def create_scheduler(self):
         from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
 
         scheduler_config = SchedulerConfig(
@@ -134,18 +116,13 @@ class TestRecomputeSchedulerShortRequestFirst(TestBase):
         )
         cache_config.num_gpu_blocks = 10000
 
-        fake_cfg = _fake_ascend_config(**config_overrides)
-        with (
-            patch("vllm_ascend.core.recompute_scheduler.get_ascend_config", return_value=fake_cfg),
-            patch("vllm_ascend.core.short_request_first_scheduler.get_ascend_config", return_value=fake_cfg),
-        ):
-            scheduler = RecomputeScheduler(
-                vllm_config=vllm_config,
-                kv_cache_config=kv_cache_config,
-                block_size=BLOCK_SIZE,
-                log_stats=True,
-                structured_output_manager=MagicMock(spec=StructuredOutputManager),
-            )
+        scheduler = RecomputeScheduler(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            block_size=BLOCK_SIZE,
+            log_stats=True,
+            structured_output_manager=MagicMock(spec=StructuredOutputManager),
+        )
 
         scheduler.structured_output_manager.should_advance = MagicMock(return_value=False)
         return scheduler
@@ -153,11 +130,11 @@ class TestRecomputeSchedulerShortRequestFirst(TestBase):
     def _running_order(self, scheduler):
         return [req.request_id for req in scheduler.running]
 
-    def test_waiting_queue_is_short_request_first(self):
+    def test_waiting_queue_is_not_short_request_first(self):
         scheduler = self.create_scheduler()
-        self.assertIsInstance(scheduler.waiting, ShortRequestFirstRequestQueue)
+        self.assertNotIsInstance(scheduler.waiting, ShortRequestFirstRequestQueue)
 
-    def test_short_prefill_scheduled_before_long(self):
+    def test_waiting_requests_keep_fcfs_order(self):
         scheduler = self.create_scheduler()
         long_req, short_req = create_requests([THRESHOLD + 1000, 10])
         scheduler.add_request(long_req)
@@ -168,19 +145,4 @@ class TestRecomputeSchedulerShortRequestFirst(TestBase):
         order = self._running_order(scheduler)
         self.assertIn("1", order)
         self.assertIn("0", order)
-        self.assertLess(order.index("1"), order.index("0"))
-
-    def test_aged_long_promoted_over_short_after_wait(self):
-        clock = FakeClock()
-        with patch("vllm_ascend.core.short_request_first_scheduler.time", clock):
-            scheduler = self.create_scheduler(long_max_wait_ms=100.0)
-            long_req, short_req = create_requests([THRESHOLD + 1000, 10])
-            scheduler.add_request(long_req)
-            scheduler.add_request(short_req)
-
-            clock.advance(0.2)
-            scheduler.schedule()
-
-            order = self._running_order(scheduler)
-            self.assertIn("0", order)
-            self.assertLess(order.index("0"), order.index("1"))
+        self.assertLess(order.index("0"), order.index("1"))

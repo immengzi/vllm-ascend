@@ -8,18 +8,17 @@ Enable ShortRequestFirst when:
 
 - request lengths are highly skewed
 - short-request TTFT matters more than strict FCFS ordering
-- the prefill node already runs with the recompute scheduler enabled
+- the serving path uses a synchronous scheduler
 
 Keep it disabled if the workload is mostly uniform, or if FCFS ordering is more important than short-request latency.
 
 ## Configuration
 
-Add `short_request_first_config` to the prefill (P) node's `scheduler_config` in a PD-disaggregated deployment. Because ShortRequestFirst is wired through the recompute scheduler, keep `recompute_scheduler_enable=true` in the same P-node configuration:
+Add `short_request_first_config` to `scheduler_config` on a synchronous prefill or PD-mixed node. ShortRequestFirst replaces that scheduler's normal `waiting` queue; it does not require the recompute scheduler:
 
 ```json
 {
   "scheduler_config": {
-    "recompute_scheduler_enable": true,
     "short_request_first_config": {
       "enabled": true,
       "threshold": 256,
@@ -38,6 +37,23 @@ Add `short_request_first_config` to the prefill (P) node's `scheduler_config` in
 - `long_max_wait_ms` (float, default `0`)
   Maximum time a long request may wait behind short requests before it can be promoted ahead of them.
   `0` disables long-request promotion and keeps strict short-request priority.
+
+### Supported deployments and constraints
+
+ShortRequestFirst is supported on these synchronous scheduler paths:
+
+- a PD-disaggregated prefill (P) node (`kv_role='kv_producer'`)
+- a PD-mixed node, with balance scheduling disabled or enabled (`kv_role='kv_both'` or no KV-transfer configuration)
+- a `ProfilingChunkScheduler` deployment
+
+The following combinations fail at startup rather than silently disabling the policy:
+
+- `scheduler_config.policy` is not `fcfs`
+- `async_scheduling=true`
+- `batch_job_sched_config.enabled=true`
+- a PD-disaggregated decode (D) node (`kv_role='kv_consumer'`)
+
+Balance scheduling remains limited to PD-mixed deployments. Profiling chunk scheduling and balance scheduling retain their existing mutual-exclusion rule.
 
 ## Threshold tuning
 
@@ -103,7 +119,7 @@ ShortRequestFirst also emits an aggregate stats log every 5 seconds so queue beh
 
 ## Relationship with recompute scheduler
 
-ShortRequestFirst only changes the waiting-queue policy and is wired into the recompute scheduler. With `recompute_scheduler_enable=false`, the normal scheduler path is used and ShortRequestFirst is not activated.
+ShortRequestFirst only changes waiting admission and is independent of the recompute scheduler. Recompute remains a PD-disaggregated D-node feature and does not install ShortRequestFirst. If `recompute_scheduler_enable=true` is accidentally present on a P-node configuration, vLLM Ascend warns and disables recompute; a valid ShortRequestFirst configuration remains active on the normal synchronous scheduler.
 
 ## Minimal examples
 

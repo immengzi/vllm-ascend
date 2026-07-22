@@ -78,6 +78,9 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.core.short_request_first_scheduler import install_short_request_first_waiting_queue
+
 
 def _balance_scheduling_enabled(vllm_config) -> bool:
     # Primary source of truth is AscendConfig. The additional_config fallback
@@ -121,6 +124,13 @@ class BalanceScheduler(Scheduler):
             include_finished_set,
             log_stats,
         )
+        short_request_first_config = init_ascend_config(vllm_config).scheduler_config.short_request_first_config
+        if short_request_first_config.enabled:
+            install_short_request_first_waiting_queue(
+                self,
+                threshold=short_request_first_config.threshold,
+                long_max_wait_ms=short_request_first_config.long_max_wait_ms,
+            )
         self._balance_enabled = _balance_scheduling_enabled(vllm_config)
         # Injected by BalanceDPEngineCoreProc._has_global_unfinished_reqs
         # before the first gather. Only used on the enabled path (balance

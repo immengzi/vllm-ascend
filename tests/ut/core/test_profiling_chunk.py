@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -30,6 +31,9 @@ from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import ProfilingChunkConfig, clear_ascend_config, init_ascend_config
 from vllm_ascend.core.profiling_chunk_predictor import ChunkSizePredictor, ProfilingChunkManager
 from vllm_ascend.core.scheduler_profiling_chunk import ProfilingChunkScheduler
+from vllm_ascend.core.short_request_first_scheduler import (
+    ShortRequestFirstRequestQueue,
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 BLOCK_SIZE = 16
@@ -250,12 +254,17 @@ class TestProfilingChunkScheduler(TestBase):
     @patch("vllm.config.ModelConfig.__post_init__", MagicMock())
     @patch("vllm.config.VllmConfig.__post_init__", MagicMock())
     @patch("vllm.config.device.DeviceConfig.__post_init__", MagicMock())
-    def create_scheduler(self, mock_get_ascend_config):
+    def create_scheduler(self, mock_get_ascend_config, short_request_first_enabled=False):
         profiling_cfg = MagicMock()
         profiling_cfg.enabled = True
         profiling_cfg.smooth_factor = 0.8
         profiling_cfg.min_chunk = 256
         mock_get_ascend_config.return_value.scheduler_config.profiling_chunk_config = profiling_cfg
+        mock_get_ascend_config.return_value.scheduler_config.short_request_first_config = SimpleNamespace(
+            enabled=short_request_first_enabled,
+            threshold=256,
+            long_max_wait_ms=0.0,
+        )
 
         mock_hf_config = MagicMock()
         mock_hf_config.model_type = "qwen3"
@@ -335,6 +344,20 @@ class TestProfilingChunkScheduler(TestBase):
         scheduler = self.create_scheduler()
         self.assertIsNotNone(scheduler.profiling_chunk_manager)
         self.assertFalse(scheduler._profiling_initialized)
+
+    def test_scheduler_installs_short_request_first_waiting_queue(self):
+        scheduler = self.create_scheduler(short_request_first_enabled=True)
+        long_request = create_requests(num_requests=1, num_tokens=512)[0]
+        long_request.request_id = "long"
+        short_request = create_requests(num_requests=1, num_tokens=16)[0]
+        short_request.request_id = "short"
+        scheduler.add_request(long_request)
+        scheduler.add_request(short_request)
+
+        output = scheduler.schedule()
+
+        self.assertIsInstance(scheduler.waiting, ShortRequestFirstRequestQueue)
+        self.assertEqual([request.req_id for request in output.scheduled_new_reqs], ["short", "long"])
 
     def test_run_profiling_chunk_init_success(self):
         scheduler = self.create_scheduler()

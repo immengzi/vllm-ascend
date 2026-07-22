@@ -41,6 +41,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
+from vllm_ascend.core.short_request_first_scheduler import install_short_request_first_waiting_queue
 
 
 class ProfilingChunkScheduler(Scheduler):
@@ -80,7 +81,16 @@ class ProfilingChunkScheduler(Scheduler):
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 
         init_ascend_config(vllm_config)
-        profiling_cfg = get_ascend_config().scheduler_config.profiling_chunk_config
+        scheduler_extension_config = get_ascend_config().scheduler_config
+        short_request_first_config = scheduler_extension_config.short_request_first_config
+        if short_request_first_config.enabled:
+            install_short_request_first_waiting_queue(
+                self,
+                threshold=short_request_first_config.threshold,
+                long_max_wait_ms=short_request_first_config.long_max_wait_ms,
+            )
+
+        profiling_cfg = scheduler_extension_config.profiling_chunk_config
         self.profiling_chunk_config = profiling_cfg
         base_chunk = self.max_num_scheduled_tokens
 

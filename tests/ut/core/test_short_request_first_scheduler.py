@@ -18,7 +18,6 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 
 from vllm_ascend.core.short_request_first_scheduler import ShortRequestFirstRequestQueue
@@ -79,10 +78,10 @@ def test_immediate_predicate_routes_to_immediate_queue():
 
 
 def test_dispatch_priority_immediate_then_short_then_long():
-    q = make_queue()
+    q = make_queue(immediate_predicate=lambda request: request.request_id == "imm")
     q.add_request(long_req("l"))
     q.add_request(short_req("s"))
-    q.prepend_request(make_request("imm", 5), force_immediate=True)
+    q.prepend_request(make_request("imm", 5))
 
     assert q.pop_request().request_id == "imm"
     assert q.pop_request().request_id == "s"
@@ -120,37 +119,78 @@ def test_no_aging_when_long_max_wait_is_zero():
         assert q._select_schedulable_queue() is q._short_queue
 
 
-def test_owns_queue_only_true_for_internal_subqueues():
-    q = make_queue()
-    assert q.owns_queue(q._immediate_queue)
-    assert q.owns_queue(q._short_queue)
-    assert q.owns_queue(q._long_queue)
-    external = create_request_queue(SchedulingPolicy.FCFS)
-    assert not q.owns_queue(external)
-    assert not q.owns_queue(None)
+def test_peek_pins_short_request_across_aging_boundary():
+    clock = FakeClock()
+    with patch("vllm_ascend.core.short_request_first_scheduler.time", clock):
+        q = make_queue(long_max_wait_ms=100.0)
+        q.add_request(long_req("l"))
+        q.add_request(short_req("s"))
+
+        assert q.peek_request().request_id == "s"
+        clock.advance(0.2)
+
+        assert q.pop_request().request_id == "s"
+        assert q.pop_request().request_id == "l"
 
 
-def test_skip_or_requeue_counts_reason():
+def test_queue_mutation_clears_pinned_request():
     q = make_queue()
+    q.add_request(long_req("l"))
+    assert q.peek_request().request_id == "l"
+
     q.add_request(short_req("s"))
-    q.pop_request_from_queue(
-        q._short_queue,
-        count_as_removal=True,
-        skip_or_requeue_reason="blocked_waiting_status",
-    )
-    assert q._skip_or_requeue_counters["blocked_waiting_status"]["short"] == 1
-    assert q._dispatch_counters["short"] == 0
+    assert q.pop_request().request_id == "s"
 
 
-def test_unknown_skip_or_requeue_reason_raises():
+def test_removing_pinned_request_clears_pin_and_reselects():
     q = make_queue()
-    q.add_request(short_req("s"))
-    with pytest.raises(ValueError):
-        q.pop_request_from_queue(
-            q._short_queue,
-            count_as_removal=True,
-            skip_or_requeue_reason="bogus",
-        )
+    long = long_req("l")
+    short = short_req("s")
+    q.add_request(long)
+    q.add_request(short)
+    assert q.peek_request().request_id == "s"
+
+    q.remove_request(short)
+    assert q.pop_request().request_id == "l"
+
+
+def test_batch_remove_clears_pinned_request_and_queue_index():
+    q = make_queue()
+    long = long_req("l")
+    short = short_req("s")
+    q.add_request(long)
+    q.add_request(short)
+    assert q.peek_request().request_id == "s"
+
+    q.remove_requests([short])
+
+    assert short not in q
+    assert len(q) == 1
+    assert q.pop_request().request_id == "l"
+
+
+def test_prepend_clears_pin_and_reselects_request():
+    q = make_queue()
+    q.add_request(long_req("l"))
+    assert q.peek_request().request_id == "l"
+
+    q.prepend_request(short_req("s"))
+
+    assert q.pop_request().request_id == "s"
+
+
+def test_prepend_requests_clears_pin_and_preserves_request_indexes():
+    q = make_queue()
+    q.add_request(long_req("l"))
+    assert q.peek_request().request_id == "l"
+    incoming = create_request_queue(SchedulingPolicy.FCFS)
+    short = short_req("s")
+    incoming.add_request(short)
+
+    q.prepend_requests(incoming)
+
+    assert short in q
+    assert q.pop_request().request_id == "s"
 
 
 def test_repeated_aged_long_promotions_trigger_warning_and_reset_after_short_dispatch():
@@ -169,13 +209,13 @@ def test_repeated_aged_long_promotions_trigger_warning_and_reset_after_short_dis
         clock.advance(0.2)
         for _ in range(3):
             assert q._select_schedulable_queue() is q._long_queue
-            q.pop_request_from_queue(q._long_queue)
+            q.pop_request()
 
         mock_warning_once.assert_called_once()
         assert q._consecutive_aged_long_promotions == 3
 
         assert q._select_schedulable_queue() is q._short_queue
-        q.pop_request_from_queue(q._short_queue)
+        q.pop_request()
         assert q._consecutive_aged_long_promotions == 0
 
 

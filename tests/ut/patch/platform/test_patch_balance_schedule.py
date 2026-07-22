@@ -43,7 +43,7 @@ import subprocess
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -52,9 +52,15 @@ import pytest
 # the pristine classes/file paths first.
 import vllm.v1.core.sched.scheduler as _upstream_sched_mod
 import vllm.v1.engine.core as _upstream_engine_mod
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as _UpstreamScheduler
 from vllm.v1.engine.core import DPEngineCoreProc as _UpstreamDPEngineCoreProc
 from vllm.v1.engine.core import EngineCoreProc as _UpstreamEngineCoreProc
+
+from vllm_ascend.core.short_request_first_scheduler import (
+    ShortRequestFirstRequestQueue,
+    install_short_request_first_waiting_queue,
+)
 
 _UPSTREAM_SCHED_FILE = _upstream_sched_mod.__file__
 
@@ -122,6 +128,57 @@ def test_balance_config_fallback_accepts_legacy_top_level_config():
 
     with patch("vllm_ascend.ascend_config.get_ascend_config", side_effect=RuntimeError):
         assert _balance_scheduling_enabled(vllm_config) is True
+
+
+@pytest.mark.parametrize("balance_enabled", [False, True])
+def test_balance_scheduler_accepts_short_request_first_waiting_queue(balance_enabled):
+    """SRF uses the standard queue API for both BalanceScheduler paths."""
+    scheduler = object.__new__(BalanceScheduler)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.skipped_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler._balance_enabled = balance_enabled
+
+    queue = install_short_request_first_waiting_queue(
+        scheduler,
+        threshold=256,
+        long_max_wait_ms=0.0,
+    )
+
+    assert isinstance(queue, ShortRequestFirstRequestQueue)
+    assert scheduler.waiting is queue
+    assert scheduler._balance_enabled is balance_enabled
+
+
+def test_balance_scheduler_constructor_installs_short_request_first_queue(monkeypatch):
+    def fake_scheduler_init(self, *args, **kwargs):
+        del args, kwargs
+        self.policy = SchedulingPolicy.FCFS
+        self.waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(self.policy)
+
+    short_request_first_config = SimpleNamespace(enabled=True, threshold=256, long_max_wait_ms=0.0)
+    ascend_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            enable_balance_scheduling=False,
+            short_request_first_config=short_request_first_config,
+        )
+    )
+    monkeypatch.setattr(BalanceScheduler.__bases__[0], "__init__", fake_scheduler_init)
+
+    with patch(
+        "vllm_ascend.patch.platform.patch_balance_schedule.init_ascend_config",
+        return_value=ascend_config,
+    ):
+        scheduler = BalanceScheduler(
+            SimpleNamespace(additional_config={}),
+            MagicMock(),
+            MagicMock(),
+            16,
+        )
+
+    assert isinstance(scheduler.waiting, ShortRequestFirstRequestQueue)
+    assert scheduler._balance_enabled is False
 
 
 # ---------------------------------------------------------------------------
