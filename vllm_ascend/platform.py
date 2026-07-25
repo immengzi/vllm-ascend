@@ -432,6 +432,42 @@ class NPUPlatform(Platform):
         if get_ascend_device_type() != AscendDeviceType._310P:
             compilation_config.custom_ops = ["all"]
 
+        short_request_first_config = ascend_config.short_request_first_config
+        if short_request_first_config.enabled:
+            kv_transfer_config = vllm_config.kv_transfer_config
+            kv_role = getattr(kv_transfer_config, "kv_role", None)
+            if vllm_config.scheduler_config.policy != "fcfs":
+                raise ValueError(
+                    "ShortRequestFirst scheduling requires scheduler_config.policy='fcfs', "
+                    f"but got {vllm_config.scheduler_config.policy!r}."
+                )
+            if kv_role == "kv_consumer" or (
+                kv_transfer_config is not None and getattr(kv_transfer_config, "is_kv_consumer", False)
+            ):
+                raise ValueError(
+                    "ShortRequestFirst scheduling is supported only on ordinary, "
+                    "PD-prefill, or PD-mixed nodes, not PD-disaggregated D nodes "
+                    "(kv_role='kv_consumer')."
+                )
+            if ascend_config.recompute_scheduler_enable:
+                raise ValueError(
+                    "ShortRequestFirst scheduling does not use the recompute scheduler. "
+                    "Set recompute_scheduler_enable to false."
+                )
+            if ascend_config.SLO_limits_for_dynamic_batch != -1:
+                raise ValueError(
+                    "ShortRequestFirst scheduling cannot be enabled with "
+                    "SLO_limits_for_dynamic_batch. Please disable one of them."
+                )
+            if vllm_config.scheduler_config.async_scheduling:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.short_request_first_scheduler.ShortRequestFirstAsyncScheduler"
+                )
+            elif not envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING:
+                vllm_config.scheduler_config.scheduler_cls = (
+                    "vllm_ascend.core.short_request_first_scheduler.ShortRequestFirstScheduler"
+                )
+
         if ascend_config.recompute_scheduler_enable:
             from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
 

@@ -18,7 +18,12 @@ from unittest.mock import patch
 from vllm.config import VllmConfig
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import clear_ascend_config, get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import (
+    ShortRequestFirstConfig,
+    clear_ascend_config,
+    get_ascend_config,
+    init_ascend_config,
+)
 
 
 class TestAscendConfig(TestBase):
@@ -80,14 +85,10 @@ class TestAscendConfig(TestBase):
     def test_init_ascend_config_enable_npugraph_ex(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "ascend_compilation_config": {
-                "enable_npugraph_ex": True,
-                "enable_static_kernel": True
-            },
-            "refresh": True
+            "ascend_compilation_config": {"enable_npugraph_ex": True, "enable_static_kernel": True},
+            "refresh": True,
         }
-        ascend_compilation_config = init_ascend_config(
-            test_vllm_config).ascend_compilation_config
+        ascend_compilation_config = init_ascend_config(test_vllm_config).ascend_compilation_config
         self.assertTrue(ascend_compilation_config.enable_npugraph_ex)
         self.assertTrue(ascend_compilation_config.enable_static_kernel)
 
@@ -102,6 +103,25 @@ class TestAscendConfig(TestBase):
     def test_get_ascend_config_without_init(self):
         with self.assertRaises(RuntimeError):
             get_ascend_config()
+
+    def test_short_request_first_config_defaults_and_values(self):
+        defaults = ShortRequestFirstConfig()
+        self.assertFalse(defaults.enabled)
+        self.assertEqual(defaults.threshold, 256)
+        self.assertEqual(defaults.long_max_wait_ms, 0.0)
+
+        configured = ShortRequestFirstConfig({"enabled": True, "threshold": 128, "long_max_wait_ms": 50})
+        self.assertTrue(configured.enabled)
+        self.assertEqual(configured.threshold, 128)
+        self.assertEqual(configured.long_max_wait_ms, 50.0)
+
+    def test_short_request_first_config_rejects_invalid_values(self):
+        with self.assertRaisesRegex(ValueError, "Unknown short_request_first_config keys"):
+            ShortRequestFirstConfig({"unknown": True})
+        with self.assertRaisesRegex(ValueError, "threshold must be a non-negative"):
+            ShortRequestFirstConfig({"threshold": -1})
+        with self.assertRaisesRegex(ValueError, "long_max_wait_ms must be >= 0"):
+            ShortRequestFirstConfig({"long_max_wait_ms": -1})
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")

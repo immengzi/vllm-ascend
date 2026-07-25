@@ -38,6 +38,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `multistream_overlap_shared_expert` | bool | `False` | Whether to enable multi-stream shared expert. This option only takes effect on MoE models with shared experts. |
 | `multistream_overlap_gate`          | bool | `False` | Whether to enable multi-stream overlap gate. This option only takes effect on MoE models with shared experts.  |
 | `recompute_scheduler_enable`        | bool | `False` | Whether to enable recompute scheduler.                                                                    |
+| `short_request_first_config`        | dict | `{}`    | Configuration options for ShortRequestFirst scheduling. See [ShortRequestFirst Prefill Scheduling](../feature_guide/short_request_first.md). |
 | `enable_cpu_binding`                | bool | `True`  | Whether to enable CPU binding. Only takes effect on ARM CPUs; A3 uses the global-slicing CPU allocation strategy and other device types use the topo-affinity CPU allocation strategy. |
 | `SLO_limits_for_dynamic_batch`      | int  | `-1`    | SLO limits for dynamic batch. This is new scheduler to support dynamic batch feature                            |
 | `enable_npugraph_ex`                | bool | `False` | Whether to enable npugraph_ex graph mode.                                                                 |
@@ -93,6 +94,16 @@ The details of each configuration option are as follows:
 | `algorithm_execution_interval`   | int | `30`   | The forward iterations when the EPLB worker will finish CPU tasks. |
 | `expert_map_record_path`         | str | `None` | Save the expert load calculation results to a new expert table in the specified directory.|
 | `num_redundant_experts`          | int | `0`    | Specify redundant experts during initialization. |
+
+**short_request_first_config**
+
+ShortRequestFirst is a waiting-queue policy for FCFS synchronous or asynchronous scheduling on ordinary, PD-prefill, and PD-mixed nodes. It cannot be combined with `recompute_scheduler_enable` or `SLO_limits_for_dynamic_batch`, and it is not supported on PD-disaggregated D nodes (`kv_role='kv_consumer'`).
+
+| Name | Type | Default | Description |
+| ---- | ---- | ------- | ----------- |
+| `enabled` | bool | `False` | Whether to enable ShortRequestFirst scheduling. |
+| `threshold` | int | `256` | Prompt-length threshold in tokens. Requests with `num_prompt_tokens <= threshold` are treated as short prefills. |
+| `long_max_wait_ms` | float | `0.0` | Maximum time a long prefill may wait behind short prefills before promotion. `0` disables promotion. |
 
 ### Example
 

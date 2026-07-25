@@ -24,6 +24,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.ascend_config import init_ascend_config
+
 
 class BalanceScheduler(Scheduler):
     def __init__(
@@ -45,6 +47,15 @@ class BalanceScheduler(Scheduler):
             include_finished_set,
             log_stats,
         )
+        short_request_first_config = init_ascend_config(vllm_config).short_request_first_config
+        if short_request_first_config.enabled:
+            from vllm_ascend.core.short_request_first_scheduler import install_short_request_first_waiting_queue
+
+            install_short_request_first_waiting_queue(
+                self,
+                threshold=short_request_first_config.threshold,
+                long_max_wait_ms=short_request_first_config.long_max_wait_ms,
+            )
         # Balance scheduling.
         self.balance_queue = [
             torch.tensor([0], dtype=torch.int, device="cpu")
