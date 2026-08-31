@@ -1,0 +1,174 @@
+--- a/vllm_ascend/device_allocator/camem.py
++++ b/vllm_ascend/device_allocator/camem.py
+@@ -17,6 +17,7 @@
+ # CANN-mem-based pytorch pluggable allocator to implement sleep mode.
+ #
+ import dataclasses
++import gc
+ import os
+ from collections.abc import Callable
+ from contextlib import contextmanager
+@@ -133,6 +134,11 @@
+ 
+     instance = None
+     default_tag: str = "default"
++    # When "1", sleep() also unmaps pool blocks that the torch NPU caching
++    # allocator keeps cached (freed but not returned to the pluggable
++    # allocator), so their physical HBM is released while asleep. wake_up()
++    # re-maps the same handles, so this is safe across a sleep/wake cycle.
++    unmap_free_blocks_env = "VLLM_ASCEND_CAMEM_SLEEP_UNMAP_FREE_BLOCKS"
+ 
+     @staticmethod
+     def get_instance() -> "CaMemAllocator":
+@@ -174,6 +180,73 @@
+             data.cpu_backup_tensor = None
+         return data.handle
+ 
++    def _find_free_pool_blocks(self) -> list[tuple[int, AllocationData]]:
++        """
++        Find allocations in ``pointer_to_data`` whose blocks the torch NPU
++        caching allocator currently keeps as cached (freed) blocks.
++
++        Freed pool blocks go to the MemPool free lists instead of ``my_free``,
++        so ``python_free_callback`` never runs and the handles stay in
++        ``pointer_to_data``. Only ``sleep()`` can return their physical HBM:
++        unmap + free the physical memory now and re-map the same handles in
++        ``wake_up()``.
++
++        torch_npu 2.9.0 exposes no working ``emptyCache``/``releasePool`` for
++        the pluggable allocator (both are no-ops), so the block inventory is
++        read from ``torch.npu.memory_snapshot()``: segments owned by our
++        MemPools carry a ``segment_pool_id``, and a free (cached) block has
++        ``state == "inactive"`` (i.e. contributes 0 to ``allocated_size``).
++        """
++        try:
++            snapshot = torch.npu.memory_snapshot()
++        except Exception as e:  # pragma: no cover - NPU only
++            logger.warning("[camem] memory_snapshot unavailable: %s", e)
++            return []
++
++        pool_ids = set()
++        for mem_pool, _alloc in self.allocator_and_pools.values():
++            try:
++                pool_ids.add(tuple(mem_pool.id))
++            except Exception:  # pragma: no cover - defensive
++                continue
++
++        free_blocks: list[tuple[int, AllocationData]] = []
++        for segment in snapshot:
++            owner = segment.get("segment_pool_id", segment.get("owner_private_pool_id"))
++            if owner is None or tuple(owner) not in pool_ids:
++                continue
++            for block in segment.get("blocks", []):
++                # Only whole, non-split blocks can match a handle we own:
++                # pointer_to_data is keyed by the reserved base address.
++                if block.get("state") == "inactive":
++                    data = self.pointer_to_data.get(block.get("address"))
++                    if data is not None:
++                        free_blocks.append((block.get("address"), data))
++        return free_blocks
++
++    def _unmap_free_pool_blocks(self, free_blocks: list[tuple[int, AllocationData]]) -> int:
++        """
++        Unmap and release physical HBM of cached free pool blocks.
++
++        The address reservations and handles are kept in ``pointer_to_data``,
++        so ``wake_up()`` can re-map them before the engine resumes.
++        """
++        unmapped_bytes = 0
++        for ptr, data in free_blocks:
++            handle = data.handle
++            try:
++                unmap_and_release(handle)
++                unmapped_bytes += handle[1]
++            except Exception as e:  # pragma: no cover - NPU only
++                logger.warning("[camem] failed to unmap free block ptr=%s: %s", ptr, e)
++        if unmapped_bytes > 0:
++            logger.info(
++                "[camem] sleep: unmapped %d cached free pool block(s), %.2f GiB returned",
++                len(free_blocks),
++                unmapped_bytes / 1024**3,
++            )
++        return unmapped_bytes
++
+     def sleep(self, offload_tags: tuple[str, ...] | str | None = None) -> None:
+         """
+         Put the allocator in sleep mode.
+@@ -191,6 +264,19 @@
+ 
+         assert isinstance(offload_tags, tuple)
+ 
++        try:
++            tag_sizes: dict[str, int] = {}
++            for data in self.pointer_to_data.values():
++                tag_sizes[data.tag] = tag_sizes.get(data.tag, 0) + data.handle[1]
++            logger.info(
++                "[camem] sleep start: active=%d total=%.2f GiB per_tag=%s",
++                len(self.pointer_to_data),
++                sum(tag_sizes.values()) / 1024**3,
++                {k: round(v / 1024**3, 2) for k, v in tag_sizes.items()},
++            )
++        except Exception:  # pragma: no cover - logging must not break sleep
++            pass
++
+         for ptr, data in self.pointer_to_data.items():
+             handle = data.handle
+             if data.tag in offload_tags:
+@@ -203,15 +289,49 @@
+                 data.cpu_backup_tensor = cpu_backup_tensor
+             unmap_and_release(handle)
+ 
++        gc.collect()
++        torch.npu.empty_cache()
++
++        # Report whether the NPU caching allocator still holds freed pool
++        # blocks. This is diagnostic by default; only unmap them when the env
++        # flag is set, so the first overlay run can A/B the hypothesis without
++        # changing behavior on the baseline.
++        free_blocks = self._find_free_pool_blocks()
++        if free_blocks:
++            logger.info(
++                "[camem] sleep: found %d cached free pool block(s), %.2f GiB "
++                "(set %s=1 to unmap them)",
++                len(free_blocks),
++                sum(data.handle[1] for _ptr, data in free_blocks) / 1024**3,
++                self.unmap_free_blocks_env,
++            )
++        if os.environ.get(self.unmap_free_blocks_env, "0") == "1":
++            self._unmap_free_pool_blocks(free_blocks)
++
+     def wake_up(self, tags: list[str] | None = None) -> None:
+         """
+         Wake up the allocator from sleep mode.
+         All data that is previously offloaded will be loaded back to GPU
+         memory, and the rest of the data will have empty memory."""
++        restore_count = sum(1 for data in self.pointer_to_data.values() if tags is None or data.tag in tags)
++        logger.info(
++            "[camem] wake_up: restoring %s/%s allocations (tags=%s)",
++            restore_count,
++            len(self.pointer_to_data),
++            tags or "all",
++        )
++        restored = 0
+         for ptr, data in self.pointer_to_data.items():
+             if tags is None or data.tag in tags:
+                 handle = data.handle
++                logger.debug(
++                    "[camem] wake_up remap ptr=%s tag=%s size=%.2f GiB",
++                    ptr,
++                    data.tag,
++                    handle[1] / 1024**3,
++                )
+                 create_and_map(handle)
++                restored += 1
+                 if data.cpu_backup_tensor is not None:
+                     cpu_backup_tensor = data.cpu_backup_tensor
+                     if cpu_backup_tensor is not None:
+@@ -221,6 +341,7 @@
+                         dest_max = ptr + size_in_bytes * 2
+                         memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
+                         data.cpu_backup_tensor = None
++        logger.info("[camem] wake_up: restored %s/%s allocations", restored, restore_count)
+ 
+     @contextmanager
+     def use_memory_pool(self, tag: str | None = None):
