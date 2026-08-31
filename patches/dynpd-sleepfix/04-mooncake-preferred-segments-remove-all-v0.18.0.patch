@@ -1,0 +1,71 @@
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+@@ -22,8 +22,13 @@
+ class MooncakeBackend(Backend):
+     def __init__(self, parallel_config: ParallelConfig):
+         try:
+-            from mooncake.store import MooncakeDistributedStore  # type: ignore
++            from mooncake.store import MooncakeDistributedStore, ReplicateConfig  # type: ignore
+         except ImportError as e:
++            ReplicateConfig = None
++            try:
++                from mooncake.store import MooncakeDistributedStore  # type: ignore
++            except ImportError:
++                raise
+             raise ImportError(
+                 "Please install mooncake by following the instructions at "
+                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+@@ -61,6 +66,8 @@
+                     self.config.master_server_address,
+                 )
+ 
++        self._replicate_config_cls = ReplicateConfig
++
+         if ret != 0:
+             msg = "Initialize mooncake failed."
+             logger.error(msg)
+@@ -80,7 +87,18 @@
+ 
+     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+         try:
+-            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
++            # Workaround (dyn-pd per-card warmstandby): the mooncake-store client
++            # only sets preferred_segment for the cxl protocol, so with
++            # protocol=ascend the master allocates each PUT to a random
++            # registered local segment (often a co-located sleeping engine) and
++            # the transfer fails. Pin the allocation to this engine's own local
++            # segment so the PUT is a local write and always succeeds.
++            if self._replicate_config_cls is not None:
++                cfg = self._replicate_config_cls()
++                cfg.preferred_segments = [self.local_seg]
++                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, cfg)
++            else:
++                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes)
+             for value in res:
+                 if value < 0:
+                     logger.error(f"Failed to put key {keys},res:{res}")
+@@ -96,7 +114,24 @@
+         except Exception as e:
+             logger.error(f"Failed to get key {keys}, error:{e}")
+ 
++    def remove_all(self) -> bool:
++        """Wipe all keys from the mooncake store (reset cascade).
+ 
++        Called by the AscendStore reset path before the engine sleeps, so
++        KV blocks exported to the remote store are released and cannot keep
++        the local device memory pinned across a sleep/wake cycle.
++        """
++        try:
++            if hasattr(self.store, "remove_all"):
++                self.store.remove_all(force=True)
++                logger.info("MooncakeBackend remove_all succeeded.")
++                return True
++            logger.warning("MooncakeDistributedStore has no remove_all; reset is a no-op.")
++        except Exception as e:
++            logger.error(f"MooncakeBackend remove_all failed: {e}")
++        return False
++
++
+ @dataclass
+ class MooncakeStoreConfig:
+     metadata_server: str

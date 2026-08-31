@@ -67,3 +67,34 @@ Apply:
 cd <vllm-ascend-v0.18.0-source>
 git apply patches/dynpd-sleepfix/03-camem-sleep-free-block-diagnostics-v0.18.0.patch
 ```
+
+## 04-mooncake-preferred-segments-remove-all-v0.18.0.patch
+
+Custom dyn-pd backport for
+`vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py`
+on `vllm-ascend:v0.18.0`. Verified with `patch -p1 --dry-run` against the
+`v0.18.0` tree; the applied result matches the deployed runtime overlay
+byte-for-byte.
+
+Why (two fixes):
+
+1. `put()` pins the allocation to this engine's own local segment
+   (`preferred_segments=[self.local_seg]`): the mooncake-store client only
+   sets `preferred_segment` for the cxl protocol, so with `protocol=ascend`
+   the master allocates each PUT to a random registered local segment (often
+   a co-located sleeping engine) and the transfer fails with `TRANSFER_FAIL
+   -800`. Validated remotely (dyn-pd rev >= 37): sleep/wake no longer leaves
+   the engine with failing KV exports. `ReplicateConfig` is imported with a
+   fallback so older mooncake-store versions still work.
+2. `remove_all()` wipes all keys from the mooncake store (reset cascade):
+   called by the AscendStore reset path before the engine sleeps, so KV
+   blocks exported to the remote store are released and cannot keep the local
+   device memory pinned across a sleep/wake cycle. Validated in the dyn-pd
+   P4 experiment (`MooncakeBackend remove_all succeeded`).
+
+Apply:
+
+```bash
+cd <vllm-ascend-v0.18.0-source>
+git apply patches/dynpd-sleepfix/04-mooncake-preferred-segments-remove-all-v0.18.0.patch
+```
