@@ -201,6 +201,19 @@ class CaMemAllocator:
             len(self.pointer_to_data),
             offload_tags,
         )
+        # Workaround for upstream vllm-ascend #13757 (merged): synchronize
+        # pending NPU work before unmapping tensor memory so in-flight graph
+        # replay cannot race with the unmap loop.
+        torch.npu.synchronize()
+        try:
+            from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+            _bufs = getattr(global_te, "registered_buffers", None) or []
+            logger.info(
+                "[camem] sleep begin: mooncake_te_is_registered=%s registered_buffers=%d",
+                getattr(global_te, "is_register_buffer", None), len(_bufs),
+            )
+        except Exception:
+            pass
         for ptr, data in self.pointer_to_data.items():
             if data.tag == CaMemAllocator.sleep_persistent_tag:
                 # This memory is not offloaded or released during sleep.
@@ -231,13 +244,39 @@ class CaMemAllocator:
             len(self.pointer_to_data),
             tags or "all",
         )
+        try:
+            from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+            _bufs = getattr(global_te, "registered_buffers", None) or []
+            logger.info(
+                "[camem] wake_up begin: mooncake_te_is_registered=%s registered_buffers=%d",
+                getattr(global_te, "is_register_buffer", None), len(_bufs),
+            )
+        except Exception:
+            pass
         for ptr, data in self.pointer_to_data.items():
             if data.tag == CaMemAllocator.sleep_persistent_tag:
                 # It was never released in sleep(), so there is nothing to remap.
                 continue
             if tags is None or data.tag in tags:
                 handle = data.handle
-                create_and_map(handle)
+                _free_b, _total_b = torch.npu.mem_get_info()
+                logger.info(
+                    "[camem] wake_up remap device=%s ptr=%s tag=%s size=%.2f GiB "
+                    "mem_free=%.2f GiB mem_total=%.2f GiB",
+                    handle[0], ptr, data.tag, handle[1] / 1024**3,
+                    _free_b / 1024**3, _total_b / 1024**3,
+                )
+                try:
+                    create_and_map(handle)
+                except Exception as exc:
+                    free_b, total_b = torch.npu.mem_get_info()
+                    logger.error(
+                        "[camem] wake_up ALLOC FAILED device=%s size=%.2f GiB "
+                        "ptr=%s tag=%s exc=%r mem_free=%.2f GiB mem_total=%.2f GiB",
+                        handle[0], handle[1] / 1024**3, ptr, data.tag, exc,
+                        free_b / 1024**3, total_b / 1024**3,
+                    )
+                    raise
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
