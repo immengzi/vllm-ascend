@@ -40,6 +40,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     get_cache_family_granularity,
     infer_cache_family_ratio,
     infer_group_cache_families,
+    infer_tp_mismatch_info,
     normalize_block_ids_by_group,
 )
 
@@ -169,6 +170,19 @@ class KVPoolScheduler:
             self.num_kv_head = 1
         else:
             self.num_kv_head = model_config.get_total_num_kv_heads()
+        use_mla = getattr(vllm_config.model_config, "use_mla", False)
+        tp_mismatch_info = infer_tp_mismatch_info(
+            self.kv_role,
+            vllm_config.kv_transfer_config.kv_connector_extra_config,
+            getattr(vllm_config.parallel_config, "tensor_parallel_size", 1),
+            vllm_config.model_config.get_total_num_kv_heads(),
+            use_mla if isinstance(use_mla, bool) else False,
+            use_hybrid=self.use_hybrid,
+        )
+        self.tp_mismatch = tp_mismatch_info.enabled
+        self.peer_tp_size = tp_mismatch_info.peer_tp_size
+        self.effective_tp_size = tp_mismatch_info.effective_tp_size
+        self.num_sub_keys = tp_mismatch_info.num_sub_keys
         if self.num_kv_head < self.tp_size:
             self.put_step = self.tp_size // self.num_kv_head
         else:
@@ -178,7 +192,7 @@ class KVPoolScheduler:
 
         # Keep this in sync with pool_worker.py because it affects GVA allocation size.
         num_layer_keys = self.num_layers if self.use_gva_layerwise else 1
-        keys_per_block_hash = self.pcp_size * self.dcp_size * (self.tp_size // self.put_step) * num_layer_keys
+        keys_per_block_hash = self.pcp_size * self.dcp_size * (self.effective_tp_size // self.put_step) * num_layer_keys
         self.keys_per_block_hash = keys_per_block_hash
 
         self.client: LookupKeyClient | None = None
@@ -212,7 +226,7 @@ class KVPoolScheduler:
         include_layers: bool = False,
         kv_cache_group_id: int = 0,
     ) -> list[list[str]]:
-        head_or_tp_ranks = self.tp_size // self.put_step
+        head_or_tp_ranks = self.effective_tp_size // self.put_step
         cache_family = self._get_group_family(self.kv_cache_group_families, kv_cache_group_id)
         keys_by_block = []
         for block_hash in block_hashes:
@@ -293,7 +307,7 @@ class KVPoolScheduler:
         Returns one key per PCP, DCP, PP, and head_or_tp rank. Ranks in the
         same put_step group share one key when DCP is disabled.
         """
-        head_or_tp_ranks = self.tp_size // self.put_step
+        head_or_tp_ranks = self.effective_tp_size // self.put_step
         if len(self.kv_cache_group_ids) > 1:
             return [
                 f"{self.model_name}@{group_id}@{block_hash_hex}@{h}@pcp{pcp}@dcp{dcp}@pp{pp}"
@@ -818,7 +832,7 @@ class KVPoolScheduler:
         # saved; only decode increments are gated by save_decode_cache.
         req_tuple = self._unfinished_requests.get(req_id)
         is_decoding = req_tuple is not None and req_tuple[0].num_computed_tokens >= req_tuple[0].num_prompt_tokens
-        if is_decoding and not self.save_decode_cache:
+        if is_decoding and not self.save_decode_cache and not self.tp_mismatch:
             return None
         request_tracker = self._request_trackers.get(req_id)
         if request_tracker is None:
@@ -851,7 +865,7 @@ class KVPoolScheduler:
             request_tracker.block_keys = keys
             if last_block_key is not None:
                 request_tracker.last_block_key = last_block_key
-        if new_block_ids is not None:
+        if new_block_ids:
             request_tracker.update(new_block_ids)
         load_spec = None
         return self._build_req_meta(
@@ -950,9 +964,11 @@ class KVPoolScheduler:
         if not force_skip_save:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
-                if not new_block_ids:
+                if not new_block_ids and not self.tp_mismatch:
                     continue
                 if req_id in self._preempted_req_ids:
+                    if not new_block_ids:
+                        continue
                     req_meta = self._process_preempted_cached_request(
                         new_block_ids,
                         req_id,

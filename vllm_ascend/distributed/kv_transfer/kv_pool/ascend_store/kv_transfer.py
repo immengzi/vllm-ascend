@@ -606,6 +606,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         ready_event: threading.Event | None = None,
         group_uses_align_state: list[bool] | None = None,
         enable_kv_event: bool = False,
+        worker: Any = None,
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, tp_size, dcp_size, ready_event, name="KVCacheSendingThread"
@@ -617,6 +618,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.enable_kv_event = enable_kv_event
         self.completed_events_lock = threading.Lock()
         self.completed_events: dict[int, int] = {}
+        self.worker = worker
+
+    def is_stored_request(self, req_id: str) -> bool:
+        with self.done_task_lock:
+            return req_id in self.stored_requests
+
+    def get_stored_request_count(self, req_id: str) -> int | None:
+        with self.done_task_lock:
+            return self.stored_requests.get(req_id)
+
+    def get_stored_requests_snapshot(self) -> dict[str, int]:
+        with self.done_task_lock:
+            return dict(self.stored_requests)
 
     def delete_finished_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -640,6 +654,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self.request_queue.task_done()
 
     def _handle_request(self, req_meta: ReqMeta):
+        if self.worker is not None and getattr(self.worker, "tp_mismatch", False):
+            # v0.23.0 tracks store completion through the per-request counter: the
+            # default path below drops the entry and marks the request finished once
+            # the counter reaches zero. _store_kv_tp_mismatch() already decrements it,
+            # so mirror that bookkeeping here -- otherwise the scheduler would never
+            # release the delayed blocks of a tp-mismatch store request.
+            req_id = req_meta.req_id
+            try:
+                self.worker._store_kv_tp_mismatch(req_meta)
+            finally:
+                if self.try_finish_and_delete_stored_request(req_id):
+                    self.set_finished_request(req_id)
+                self.request_queue.task_done()
+            return
         req_id = req_meta.req_id
         tracked_request = False
         try:
@@ -853,6 +881,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         ready_event: threading.Event | None = None,
         invalid_block_ids: set[int] | None = None,
         invalid_block_ids_lock: threading.Lock | None = None,
+        worker: Any = None,
     ):
         super().__init__(
             m_store,
@@ -866,114 +895,136 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         )
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
+        self.worker = worker
 
     def _handle_request(self, req_meta: ReqMeta):
-        token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
-        req_id = req_meta.req_id
-        addr_list = []
-        size_list = []
-        key_list = []
-        block_id_list: list[int] = []
-        group_ids = req_meta.kv_cache_group_ids or [0]
-        grouped_hash_cache: GroupedBlockHashCache = {}
-        load_masks = self.token_database.load_mask(
-            req_meta.block_hashes,
-            token_len,
-            grouped_hash_cache=grouped_hash_cache,
-        )
-        for group_id in group_ids:
-            block_ids = req_meta.block_ids_by_group[group_id]
-            group_block_size = self._get_block_size(group_id)
-            mask_num = (
-                req_meta.load_spec.vllm_cached_tokens  # type: ignore[union-attr]
-                // group_block_size
-                * group_block_size
-            )
+        try:
+            load_spec = req_meta.load_spec
+            req_id = req_meta.req_id
+            if load_spec is None:
+                logger.error("KV pool async recv request %s has no load spec; skip load.", req_id)
+                self.set_finished_request(req_id)
+                return
+            if self.worker is not None and getattr(self.worker, "tp_mismatch", False):
+                # tp_mismatch is restricted to non-hybrid -> single dense KV group.
+                group_block_size = self._get_block_size(0)
+                mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
+                self.worker._load_kv_tp_mismatch(
+                    req_meta.block_hashes,
+                    req_meta.block_ids_by_group[0],
+                    load_spec.token_len,
+                    mask_num,
+                )
+                self.set_finished_request(req_id)
+                return
 
-            def chunk_filter(start: int, group_id=group_id) -> bool:
-                return self.token_database.mask_allows_chunk(load_masks, group_id, start)
-
-            for start, end, key, _block_hash, block_id in self.token_database.process_token_key_strings_with_block_ids(
-                token_len,
+            token_len = load_spec.token_len
+            addr_list = []
+            size_list = []
+            key_list = []
+            block_id_list: list[int] = []
+            group_ids = req_meta.kv_cache_group_ids or [0]
+            grouped_hash_cache: GroupedBlockHashCache = {}
+            load_masks = self.token_database.load_mask(
                 req_meta.block_hashes,
-                block_ids,
-                mask_num,
-                kv_cache_group_id=group_id,
-                skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
-                chunk_filter=chunk_filter,
+                token_len,
                 grouped_hash_cache=grouped_hash_cache,
-            ):
-                addr, size, block_id = self._prepare_value(
+            )
+            for group_id in group_ids:
+                block_ids = req_meta.block_ids_by_group[group_id]
+                group_block_size = self._get_block_size(group_id)
+                mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
+
+                def chunk_filter(start: int, group_id=group_id) -> bool:
+                    return self.token_database.mask_allows_chunk(load_masks, group_id, start)
+
+                for (
                     start,
                     end,
+                    key,
+                    _block_hash,
+                    block_id,
+                ) in self.token_database.process_token_key_strings_with_block_ids(
+                    token_len,
+                    req_meta.block_hashes,
                     block_ids,
+                    mask_num,
                     kv_cache_group_id=group_id,
-                    block_id=block_id,
+                    skip_null_blocks=self._skip_null_blocks(req_meta, group_id),
+                    chunk_filter=chunk_filter,
+                    grouped_hash_cache=grouped_hash_cache,
+                ):
+                    addr, size, block_id = self._prepare_value(
+                        start,
+                        end,
+                        block_ids,
+                        kv_cache_group_id=group_id,
+                        block_id=block_id,
+                    )
+                    key_list.append(key)
+                    addr_list.append(addr)
+                    size_list.append(size)
+                    block_id_list.append(block_id)
+            if not key_list:
+                self.set_finished_request(req_id)
+                return
+            key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
+            addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
+            size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
+            block_id_list_c = (
+                block_id_list[self.tp_rank % len(block_id_list) :] + block_id_list[: self.tp_rank % len(block_id_list)]
+            )
+            logger.debug(
+                "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+                req_id,
+                token_len,
+                req_meta.kv_cache_group_ids or [0],
+                len(key_list_c),
+                key_list_c[:3],
+            )
+            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if ret is not None and any(r != 0 for r in ret):
+                missing_block_ids = record_failed_blocks(
+                    block_id_list_c,
+                    ret,
                 )
-                key_list.append(key)
-                addr_list.append(addr)
-                size_list.append(size)
-                block_id_list.append(block_id)
-        if not key_list:
+                if len(req_meta.block_ids_by_group) == 1:
+                    with self._invalid_block_ids_lock:
+                        self._invalid_block_ids.update(missing_block_ids)
+                elif missing_block_ids:
+                    logger.error(
+                        "KV load failed for hybrid request %s. "
+                        "Skip invalid-block fallback to avoid scheduler crash. "
+                        "failed_blocks=%s",
+                        req_id,
+                        missing_block_ids,
+                    )
+            elif ret is None:
+                missing_block_ids = record_failed_blocks(
+                    block_id_list_c,
+                    [1] * len(block_id_list_c),
+                )
+                if len(req_meta.block_ids_by_group) == 1:
+                    with self._invalid_block_ids_lock:
+                        self._invalid_block_ids.update(missing_block_ids)
+                elif missing_block_ids:
+                    logger.error(
+                        "KV load failed for hybrid request %s. "
+                        "Skip invalid-block fallback to avoid scheduler crash. "
+                        "failed_blocks=%s",
+                        req_id,
+                        missing_block_ids,
+                    )
+            logger.debug(
+                "KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
+                req_id,
+                token_len,
+                req_meta.kv_cache_group_ids or [0],
+                len(key_list_c),
+            )
             self.set_finished_request(req_id)
+        finally:
             self.request_queue.task_done()
-            return
-        key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
-        addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
-        size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
-        block_id_list_c = (
-            block_id_list[self.tp_rank % len(block_id_list) :] + block_id_list[: self.tp_rank % len(block_id_list)]
-        )
-        logger.debug(
-            "KV pool async recv calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
-            req_id,
-            token_len,
-            req_meta.kv_cache_group_ids or [0],
-            len(key_list_c),
-            key_list_c[:3],
-        )
-        ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
-        if ret is not None and any(r != 0 for r in ret):
-            missing_block_ids = record_failed_blocks(
-                block_id_list_c,
-                ret,
-            )
-            if len(req_meta.block_ids_by_group) == 1:
-                with self._invalid_block_ids_lock:
-                    self._invalid_block_ids.update(missing_block_ids)
-            elif missing_block_ids:
-                logger.error(
-                    "KV load failed for hybrid request %s. "
-                    "Skip invalid-block fallback to avoid scheduler crash. "
-                    "failed_blocks=%s",
-                    req_id,
-                    missing_block_ids,
-                )
-        elif ret is None:
-            missing_block_ids = record_failed_blocks(
-                block_id_list_c,
-                [1] * len(block_id_list_c),
-            )
-            if len(req_meta.block_ids_by_group) == 1:
-                with self._invalid_block_ids_lock:
-                    self._invalid_block_ids.update(missing_block_ids)
-            elif missing_block_ids:
-                logger.error(
-                    "KV load failed for hybrid request %s. "
-                    "Skip invalid-block fallback to avoid scheduler crash. "
-                    "failed_blocks=%s",
-                    req_id,
-                    missing_block_ids,
-                )
-        logger.debug(
-            "KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
-            req_id,
-            token_len,
-            req_meta.kv_cache_group_ids or [0],
-            len(key_list_c),
-        )
-        self.set_finished_request(req_id)
-        self.request_queue.task_done()
 
 
 class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
