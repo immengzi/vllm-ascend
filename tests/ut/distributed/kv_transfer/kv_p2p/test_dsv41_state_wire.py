@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Actual Mooncake MessagePack codec checks; requires msgspec, no vLLM/NPU.
 
-Only vLLM marker base classes are stubbed. Dataclass definitions and validation
-come directly from metadata.py; the real typed msgspec decoder is exercised.
+Marker bases are stubbed; BlockIds mirrors the fixed vLLM alias. Dataclass
+definitions and validation come from metadata.py. Handshakes use the real typed
+msgspec decoder; the request check does not stand in for full vLLM IPC.
 """
 
 import ast
@@ -36,7 +37,7 @@ def metadata_types():
     module = types.ModuleType("dsv41_wire_metadata")
     module.KVConnectorHandshakeMetadata = object
     module.KVConnectorMetadata = object
-    module.BlockIds = tuple[tuple[int, ...], ...]
+    module.BlockIds = tuple[list[int], ...] | list[list[int]]
     sys.modules[module.__name__] = module
     exec(compile(tree, str(source), "exec"), module.__dict__)
     return module
@@ -168,9 +169,12 @@ class WireTests(unittest.TestCase):
         }
         request.add_new_req("request", ((14, 25), (5,), (9,)), 130, 129, params, ((14, 25), (5,), (9,)))
         value = request.requests["request"]
-        restored = msgspec.msgpack.Decoder(t.ReqMeta).decode(msgspec.msgpack.encode(value))
-        self.assertEqual(restored, value)
-        self.assertEqual(protocol.StateSnapshot.from_wire(restored.state_snapshot).boundary, 129)
+        # vLLM IPC is outside this isolated test. In particular its BlockIds
+        # alias is an array-like union, not a supported typed msgspec union.
+        restored = msgspec.msgpack.decode(msgspec.msgpack.encode(value))
+        self.assertEqual(restored["local_full_block_ids"], [[14, 25], [5], [9]])
+        self.assertEqual(restored["remote_block_ids"], [[81, 82], [7], [3]])
+        self.assertEqual(protocol.StateSnapshot.from_wire(restored["state_snapshot"]).boundary, 129)
 
 
 if __name__ == "__main__":

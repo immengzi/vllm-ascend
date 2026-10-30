@@ -294,7 +294,8 @@ P 快照稳定后该请求不再写其资源；其他请求仍可使用其他槽
 
 另有 `test_dsv41_state_wire.py`：使用与原镜像相同的 `msgspec==0.22.0`，
 对当前 metadata dataclass、嵌套 PP/PCP/TP 握手、HTTP 快照与控制消息进行 3 项真实 MessagePack 编解码检查。
-只替代 vLLM marker 基类，不替代 codec；这 3 项也已本地通过。
+替代 vLLM marker 基类，BlockIds 类型照固定 vLLM 定义，不替代 codec；这 3 项也已本地通过。
+握手使用 typed decoder；请求资源表使用通用编解码检查，不将其写成完整 vLLM IPC 验证。
 
 CPU oracle 使用简化投影检查交接语义，不是完整模型 BF16/NPU 数值证明。
 本地尚未安装可运行完整 vLLM UT 的 torch/NPU 环境，因此不把这些测试写成完整 UT 或端到端通过。
