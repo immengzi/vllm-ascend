@@ -1359,7 +1359,7 @@ def _reshape_kv_cache_v2(
                 block_stride = layer_tuple_strides[layer_name]
                 initial_offset = 0
                 kv_cache_shape = group.backend.get_kv_cache_shape(
-                    kv_cache_config.num_blocks,
+                    cache_rows(kv_cache_config, layer_name),
                     get_storage_block_size(kv_cache_spec),
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
@@ -1370,10 +1370,10 @@ def _reshape_kv_cache_v2(
                 if is_index:
                     source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
                     source_spec = layer_kv_cache_spec[source_name]
-                    initial_offset = source_spec.unpadded_page_size_bytes
+                    initial_offset = 0
                     kv_cache_shape_list.append(
                         group.backend.get_kv_cache_shape(
-                            kv_cache_config.num_blocks,
+                            cache_rows(kv_cache_config, layer_name),
                             get_storage_block_size(kv_cache_spec),
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.scale_dim,
@@ -1724,3 +1724,5 @@ def build_attn_metadata_factory(
         yield
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = raw  # restore
+
+from state_proto import cache_rows

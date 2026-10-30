@@ -272,3 +272,6 @@ def get_deepseek_v41_kv_cache_config(
         kv_cache_groups=groups,
         prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
     )
+
+from state_proto import install as _install_request_state
+_install_request_state()

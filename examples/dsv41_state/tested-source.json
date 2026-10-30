@@ -1,0 +1,13 @@
+{
+  "vllm_commit": "ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+  "ascend_parent_commit": "8fde6d4e335fe300e2b949aab0e31659cce0811d",
+  "implementation": "exact archived tested state implementation; no runtime changes",
+  "source_sha256": {
+    "vllm_ascend/attention/dsa_v41.py": "ab6c3ae82c792d23e7fcb7e82ed159b525e9844a3575f5cbf62f5587b5d423a2",
+    "vllm_ascend/worker/model_runner_v1.py": "4852899c558f4fb87d85a8d4a964decea573ffb47678659d57ab97f5d1913019",
+    "vllm_ascend/worker/v2/attn_utils.py": "48a6a2fc4e5a5d6a75b27ca8f87a56c755d13cfd5e8ce134540247780c28e596",
+    "vllm_ascend/models/deepseek_v41/cache_config.py": "51936a1c7b3f2609414cd57127a009e4d797fb55ac48696fe5633bcb6721b51f",
+    "examples/dsv41_state/state_proto.py": "cc400f678d613ddc7d5716f3892ffa7914b690f2ce99aa05c5c7e043c2a30764",
+    "examples/dsv41_state/state_kernels.py": "f404c6dc313c802d15626d9919cfadd4d7da68c2d50b279743844f24825523f3"
+  }
+}

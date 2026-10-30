@@ -147,6 +147,7 @@ class AscendDSAV41Metadata(AttentionMetadata):
     c2_metadata_group_id: int | None = None
     global_metadata: "AscendDSAV41Metadata | None" = None
     cp_token_range: tuple[int, int, int, int] | None = None
+    request_state: Any = None
 
 
 @dataclass(frozen=True)
@@ -1178,12 +1179,12 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     1,
                     head_dim,
                     cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
-                    seqused_ori_kv=seq_lens,
+                    seqused_ori_kv=state_swa_lengths(seq_lens, common.query_start_loc),
                     seqused_cmp_kv=cmp_seq_lens,
                     cmp_residual_kv=cmp_residual,
                     batch_size=num_reqs,
                     max_seqlen_q=int(getattr(common, "max_query_len", 0)),
-                    max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
+                    max_seqlen_ori_kv=min(int(getattr(common, "max_seq_len", 0)), int(getattr(common, "max_query_len", 0)) + 127),
                     max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
                     ori_topk=ori_sparse_indices.shape[-1] if ori_sparse_indices is not None else 0,
                     ori_topk_length=ori_topk_length,
@@ -1472,3 +1473,6 @@ class DeepseekV41CacheLayer(nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self):
         return DeepseekV41CacheBackend
+
+from state_proto import state_swa_lengths, install_attention
+install_attention()
