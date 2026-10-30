@@ -19,6 +19,8 @@ python3 tests/ut/distributed/kv_transfer/kv_p2p/test_dsv41_state_protocol.py
 
 第一个命令在 PD 分支校验父提交的六个归档文件，需要 Git 中保留该父提交；
 不会把当前 PD 实现标为“已测”。第二个命令只需标准 Python，直接检查当前协议及接入方法。
+固定镜像内还可执行 `python3 tests/ut/distributed/kv_transfer/kv_p2p/test_dsv41_state_wire.py`，
+使用 `msgspec==0.22.0` 验证 3 项真实消息编解码。该测试无需 torch/NPU。
 运行时代码已移入 `vllm_ascend/models/deepseek_v41/request_state.py` 和 `state_kernels.py`，
 examples 中不再保留第二套执行模块。当前 planner 只使用框架/CLI 的预算。
 
