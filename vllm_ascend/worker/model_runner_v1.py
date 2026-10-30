@@ -5438,8 +5438,7 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     if is_index:
                         source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                        source_spec = layer_kv_cache_spec[source_name]
-                        initial_offset = 0
+                        initial_offset = index_cache_offset(kv_cache_config, layer_kv_cache_spec[source_name])
                         kv_cache_shape_list.append(
                             attn_backend.get_kv_cache_shape(
                                 cache_rows(kv_cache_config, layer_name),
@@ -6593,6 +6592,10 @@ def update_pass_config(model_runner):
     finally:
         model_runner.compilation_config.pass_config.enable_sp = original_pass_config_sp
 
-from state_proto import cache_rows
-from state_proto import install_worker
+from vllm_ascend.models.deepseek_v41.request_state import (  # noqa: E402 - class initialization order
+    cache_rows,
+    index_cache_offset,
+    install_worker,
+)
+
 install_worker(NPUModelRunner)

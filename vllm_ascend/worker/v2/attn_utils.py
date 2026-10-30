@@ -1369,8 +1369,7 @@ def _reshape_kv_cache_v2(
                 is_index = isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.scale_dim
                 if is_index:
                     source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                    source_spec = layer_kv_cache_spec[source_name]
-                    initial_offset = 0
+                    initial_offset = index_cache_offset(kv_cache_config, layer_kv_cache_spec[source_name])
                     kv_cache_shape_list.append(
                         group.backend.get_kv_cache_shape(
                             cache_rows(kv_cache_config, layer_name),
@@ -1725,4 +1724,8 @@ def build_attn_metadata_factory(
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = raw  # restore
 
-from state_proto import cache_rows
+
+from vllm_ascend.models.deepseek_v41.request_state import (  # noqa: E402 - class initialization order
+    cache_rows,
+    index_cache_offset,
+)

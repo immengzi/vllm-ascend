@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Launch the preserved state prototype from an editable Ascend checkout."""
+
 import argparse
 import os
 import subprocess

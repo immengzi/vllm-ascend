@@ -1184,7 +1184,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     cmp_residual_kv=cmp_residual,
                     batch_size=num_reqs,
                     max_seqlen_q=int(getattr(common, "max_query_len", 0)),
-                    max_seqlen_ori_kv=min(int(getattr(common, "max_seq_len", 0)), int(getattr(common, "max_query_len", 0)) + 127),
+                    max_seqlen_ori_kv=min(
+                        int(getattr(common, "max_seq_len", 0)), int(getattr(common, "max_query_len", 0)) + 127
+                    ),
                     max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
                     ori_topk=ori_sparse_indices.shape[-1] if ori_sparse_indices is not None else 0,
                     ori_topk_length=ori_topk_length,
@@ -1474,5 +1476,10 @@ class DeepseekV41CacheLayer(nn.Module, AttentionLayerBase):
     def get_attn_backend(self):
         return DeepseekV41CacheBackend
 
-from state_proto import state_swa_lengths, install_attention
+
+from vllm_ascend.models.deepseek_v41.request_state import (  # noqa: E402 - install after the cache/model classes exist
+    install_attention,
+    state_swa_lengths,
+)
+
 install_attention()

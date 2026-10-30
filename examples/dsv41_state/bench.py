@@ -1,4 +1,5 @@
 """Official benchmark wrapper; CLI compatibility, telemetry and failure gates."""
+
 import argparse
 import json
 import math
@@ -26,17 +27,58 @@ def cases(config, suite):
 
 
 def command(config, case, seed, output_dir, filename):
-    cmd = ["vllm", "bench", "serve", "--backend", "openai", "--host", "127.0.0.1",
-           "--port", str(config["port"]), "--endpoint", "/v1/completions",
-           "--model", "/model", "--served-model-name", "dsv41", "--tokenizer", "/model",
-           "--dataset-name", "random", "--random-input-len", str(case["input"]),
-           "--random-output-len", str(case["output"]), "--random-range-ratio", "0",
-           "--random-prefix-len", "0", "--num-prompts", str(case["count"]),
-           "--max-concurrency", str(case["concurrency"]),
-           "--request-rate", str(case.get("rate", 1000)), "--seed", str(seed), "--skip-chat-template",
-           "--temperature", "0", "--ignore-eos", "--save-result", "--save-detailed",
-           "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,95,99,100",
-           "--result-dir", str(output_dir), "--result-filename", filename, "--disable-tqdm"]
+    cmd = [
+        "vllm",
+        "bench",
+        "serve",
+        "--backend",
+        "openai",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(config["port"]),
+        "--endpoint",
+        "/v1/completions",
+        "--model",
+        "/model",
+        "--served-model-name",
+        "dsv41",
+        "--tokenizer",
+        "/model",
+        "--dataset-name",
+        "random",
+        "--random-input-len",
+        str(case["input"]),
+        "--random-output-len",
+        str(case["output"]),
+        "--random-range-ratio",
+        "0",
+        "--random-prefix-len",
+        "0",
+        "--num-prompts",
+        str(case["count"]),
+        "--max-concurrency",
+        str(case["concurrency"]),
+        "--request-rate",
+        str(case.get("rate", 1000)),
+        "--seed",
+        str(seed),
+        "--skip-chat-template",
+        "--temperature",
+        "0",
+        "--ignore-eos",
+        "--save-result",
+        "--save-detailed",
+        "--percentile-metrics",
+        "ttft,tpot,itl,e2el",
+        "--metric-percentiles",
+        "50,95,99,100",
+        "--result-dir",
+        str(output_dir),
+        "--result-filename",
+        filename,
+        "--disable-tqdm",
+    ]
     if config.get("slo_ms"):
         cmd += ["--goodput", *[f"{k}:{v}" for k, v in config["slo_ms"].items()]]
     return cmd
@@ -52,8 +94,12 @@ def metric_totals(text):
     for line in text.splitlines():
         if line and not line.startswith("#"):
             name = line.split("{", 1)[0].split(" ", 1)[0]
-            if name in ("vllm:num_preemptions_total", "vllm:prefix_cache_hits_total",
-                        "vllm:num_requests_running", "vllm:num_requests_waiting"):
+            if name in (
+                "vllm:num_preemptions_total",
+                "vllm:prefix_cache_hits_total",
+                "vllm:num_requests_running",
+                "vllm:num_requests_waiting",
+            ):
                 value = float(line.rsplit(" ", 1)[1])
                 out[name] = out.get(name, 0) + value
     return out
@@ -66,7 +112,8 @@ def overlap_peak(data):
     events = [(s + t, 1) for s, t in zip(starts, firsts)] + [(s + t, -1) for s, t in zip(starts, latencies)]
     peak = active = 0
     for _, delta in sorted(events):
-        active += delta; peak = max(peak, active)
+        active += delta
+        peak = max(peak, active)
     return peak
 
 
@@ -102,6 +149,7 @@ def run_one(config, case, seed, directory, filename, deadline):
     assert not path.exists(), f"Refusing result overwrite: {path}"
     before = fetch(base, "/metrics")
     stop = threading.Event()
+
     def watch():
         previous = None
         with path.with_suffix(".metrics.jsonl").open("x") as stream:
@@ -113,6 +161,7 @@ def run_one(config, case, seed, directory, filename, deadline):
                 except Exception as error:
                     stream.write(json.dumps({"error": repr(error)}) + "\n")
                 stop.wait(1)
+
     observer = threading.Thread(target=watch, daemon=True)
     observer.start()
     cmd = command(config, case, seed, directory, filename)
@@ -121,15 +170,19 @@ def run_one(config, case, seed, directory, filename, deadline):
         # Whole-run deadline reserves time for shutdown; a per-request timeout
         # alone cannot bound a sequence of queued batches.
         with path.with_suffix(".log").open("x") as log:
-            subprocess.run(cmd, check=True, stdout=log, stderr=subprocess.STDOUT,
-                           timeout=max(1, deadline - time.time() - 90))
+            subprocess.run(
+                cmd, check=True, stdout=log, stderr=subprocess.STDOUT, timeout=max(1, deadline - time.time() - 90)
+            )
     finally:
-        stop.set(); observer.join(timeout=7)
+        stop.set()
+        observer.join(timeout=7)
     data = json.loads(path.read_text())
     assert data.get("completed") == case["count"] and data.get("failed", 0) == 0, "Benchmark failures"
     assert len(data.get("ttfts", [])) == case["count"] and data.get("output_lens"), "Missing detailed records"
-    assert all(isinstance(data.get(k), (int, float)) and math.isfinite(data[k]) and data[k] > 0
-               for k in ("output_throughput", "mean_ttft_ms", "mean_tpot_ms", "p95_tpot_ms", "p99_e2el_ms")), "Missing or invalid performance metrics"
+    assert all(
+        isinstance(data.get(k), (int, float)) and math.isfinite(data[k]) and data[k] > 0
+        for k in ("output_throughput", "mean_ttft_ms", "mean_tpot_ms", "p95_tpot_ms", "p99_e2el_ms")
+    ), "Missing or invalid performance metrics"
     # Save actual sampled lengths; never presume random token->text->token is exact.
     assert all(n == case["output"] for n in data["output_lens"]), "Unexpected output length"
     idle(base)
@@ -150,18 +203,35 @@ def run_one(config, case, seed, directory, filename, deadline):
         # Full observable overlap rules out a whole-completion-wave capacity
         # bottleneck for this batch. It does NOT prove zero admission waiting.
         eligible = peak is not None and peak >= case["concurrency"]
-        path.with_suffix(".eligibility.json").write_text(json.dumps({
-            "waiting_observed": queued, "overlap_peak": peak,
-            "full_overlap_verified": eligible,
-            "review": "Initial prefill waiting is normal. Missing full overlap needs queue/KV timeline review; this is not a kernel-only measurement."
-        }, indent=2))
-    path.with_suffix(".checks.json").write_text(json.dumps({
-        "passed": True, "counter_deltas": deltas, "case": case, "seed": seed,
-        "overlap_peak": peak,
-        "peak_server_waiting": max(v.get("vllm:num_requests_waiting", 0) for v in observed),
-        "peak_server_running": max(v.get("vllm:num_requests_running", 0) for v in observed),
-        "sampled_host_cpu_busy_peak_pct": max((s["host_cpu_busy_pct"] for s in samples if s.get("host_cpu_busy_pct") is not None), default=None)
-    }, indent=2))
+        path.with_suffix(".eligibility.json").write_text(
+            json.dumps(
+                {
+                    "waiting_observed": queued,
+                    "overlap_peak": peak,
+                    "full_overlap_verified": eligible,
+                    "review": "Initial prefill waiting is normal. Missing full overlap needs queue/KV timeline review; "
+                    "this is not a kernel-only measurement.",
+                },
+                indent=2,
+            )
+        )
+    path.with_suffix(".checks.json").write_text(
+        json.dumps(
+            {
+                "passed": True,
+                "counter_deltas": deltas,
+                "case": case,
+                "seed": seed,
+                "overlap_peak": peak,
+                "peak_server_waiting": max(v.get("vllm:num_requests_waiting", 0) for v in observed),
+                "peak_server_running": max(v.get("vllm:num_requests_running", 0) for v in observed),
+                "sampled_host_cpu_busy_peak_pct": max(
+                    (s["host_cpu_busy_pct"] for s in samples if s.get("host_cpu_busy_pct") is not None), default=None
+                ),
+            },
+            indent=2,
+        )
+    )
 
 
 def main():
@@ -173,6 +243,7 @@ def main():
     directory = Path(os.environ["MENGZI_RESULTS_DIR"]) / args.suite
     directory.mkdir(exist_ok=True)
     from datetime import datetime
+
     deadline = datetime.fromisoformat(config["deadline"]).timestamp()
     jobs = []
     for case in cases(config, args.suite):
@@ -182,7 +253,8 @@ def main():
         n = config["pressure_repeats"] if case["kind"] == "pressure" else config["repeats"]
         jobs.extend((case, r, f"{case['name']}-r{r}.json") for r in range(n))
     if args.plan_only:
-        print(json.dumps([command(config, c, s, directory, f) for c, s, f in jobs], indent=2)); return
+        print(json.dumps([command(config, c, s, directory, f) for c, s, f in jobs], indent=2))
+        return
     help_text = subprocess.check_output(["vllm", "bench", "serve", "--help=all"], text=True)
     for flag in ("--save-detailed", "--random-range-ratio", "--served-model-name", "--metric-percentiles"):
         assert flag in help_text, f"Target CLI lacks required option: {flag}"

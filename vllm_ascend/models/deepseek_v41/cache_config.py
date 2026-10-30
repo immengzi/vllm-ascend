@@ -273,5 +273,9 @@ def get_deepseek_v41_kv_cache_config(
         prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
     )
 
-from state_proto import install as _install_request_state
+
+from vllm_ascend.models.deepseek_v41.request_state import (  # noqa: E402 - class initialization order
+    install as _install_request_state,
+)
+
 _install_request_state()

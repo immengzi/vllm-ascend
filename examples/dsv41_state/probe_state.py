@@ -1,19 +1,17 @@
 """New-design requests and observed service metrics; never reruns union."""
+
 import argparse
 import asyncio
-from datetime import datetime
 import hashlib
 import json
-import os
-from pathlib import Path
 import time
 import urllib.request
+from datetime import datetime
+from pathlib import Path
 
 import aiohttp
-from tokenizers import Tokenizer
-
 from bench import metric_totals
-
+from tokenizers import Tokenizer
 
 ROOT = Path("/results/state")
 CONFIG = json.loads(Path("/results/config.json").read_text())
@@ -30,34 +28,69 @@ async def batch(length, output, count, tag):
     folder = ROOT / "probes" / tag
     folder.mkdir(parents=True, exist_ok=False)
     tokenizer = Tokenizer.from_file("/model/tokenizer.json")
-    body = tokenizer.encode("A different city and its history are discussed in this paragraph. ", add_special_tokens=False).ids
+    body = tokenizer.encode(
+        "A different city and its history are discussed in this paragraph. ", add_special_tokens=False
+    ).ids
     payloads = []
     for i in range(count):
-        prefix = tokenizer.encode(f"layout-validation-{length}-{i}-" + hashlib.sha256(str(i).encode()).hexdigest() * 12, add_special_tokens=False).ids
+        prefix = tokenizer.encode(
+            f"layout-validation-{length}-{i}-" + hashlib.sha256(str(i).encode()).hexdigest() * 12,
+            add_special_tokens=False,
+        ).ids
         tokens = (prefix + body * (length // len(body) + 1))[:length]
-        payloads.append((hashlib.sha256(json.dumps(tokens).encode()).hexdigest(), json.dumps({
-            "model": "dsv41", "prompt": tokens, "max_tokens": output, "temperature": 0,
-            "seed": 20261022, "ignore_eos": True, "stream": True, "return_token_ids": True,
-            "stream_options": {"include_usage": True}}).encode()))
+        payloads.append(
+            (
+                hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
+                json.dumps(
+                    {
+                        "model": "dsv41",
+                        "prompt": tokens,
+                        "max_tokens": output,
+                        "temperature": 0,
+                        "seed": 20261022,
+                        "ignore_eos": True,
+                        "stream": True,
+                        "return_token_ids": True,
+                        "stream_options": {"include_usage": True},
+                    }
+                ).encode(),
+            )
+        )
     timeout = min(CONFIG["request_timeout_s"], max(1, DEADLINE - time.time() - 10))
     base = f"http://127.0.0.1:{CONFIG['port']}"
     rows = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), read_bufsize=4 * 1024 * 1024) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=timeout), read_bufsize=4 * 1024 * 1024
+    ) as session:
+
         async def metrics(label):
             async with session.get(base + "/metrics") as response:
                 response.raise_for_status()
                 body = await response.text()
                 (folder / f"metrics-{label}.txt").write_text(body)
                 return metric_totals(body)
+
         before = await metrics("before")
 
         async def request(i):
-            item = {"index": i, "dp": i % 3, "prompt_hash": payloads[i][0], "ids": [],
-                    "start": time.perf_counter(), "first": None, "last": None, "sse_token_times": [], "completed": False}
+            item = {
+                "index": i,
+                "dp": i % 3,
+                "prompt_hash": payloads[i][0],
+                "ids": [],
+                "start": time.perf_counter(),
+                "first": None,
+                "last": None,
+                "sse_token_times": [],
+                "completed": False,
+            }
             with (folder / f"request-{i}.jsonl").open("x", buffering=1) as raw:
                 try:
-                    async with session.post(base + "/v1/completions", data=payloads[i][1], headers={
-                            "Content-Type": "application/json", "X-data-parallel-rank": str(i % 3)}) as response:
+                    async with session.post(
+                        base + "/v1/completions",
+                        data=payloads[i][1],
+                        headers={"Content-Type": "application/json", "X-data-parallel-rank": str(i % 3)},
+                    ) as response:
                         response.raise_for_status()
                         usage = None
                         async for line in response.content:
@@ -99,18 +132,27 @@ async def batch(length, output, count, tag):
     assert "vllm:num_preemptions_total" in before and "vllm:num_preemptions_total" in after
     preempt = after["vllm:num_preemptions_total"] - before["vllm:num_preemptions_total"]
     ttft = [(r["first"] - r["start"]) * 1000 for r in completed]
-    tpot = [(r["last"] - r["first"]) / max(1, len(r["ids"])-1) * 1000 for r in completed]
-    result = {"tag": tag, "input_tokens": length, "output_tokens": output, "count": count,
-              "completed": len(completed), "failed": count-len(completed), "duration_s": duration,
-              "output_tokens_per_s": sum(len(r["ids"]) for r in completed) / duration,
-              "mean_ttft_ms": sum(ttft)/len(ttft) if ttft else None,
-              "mean_tpot_ms": sum(tpot)/len(tpot) if tpot else None,
-              "preemptions": preempt, "client_observed_generating_overlap": peak,
-              "server_counter_totals_before": before, "server_counter_totals_after": after,
-              "capacity_point_passed": len(completed) == count and peak == count and preempt == 0,
-              "execution": json.loads((ROOT / "state-service-status.json").read_text()).get("prototype_execution", "unknown"),
-              "service_command_sha256": hashlib.sha256((ROOT / "state-serve-command.json").read_bytes()).hexdigest(),
-              "comparison_to_union": "not_performed"}
+    tpot = [(r["last"] - r["first"]) / max(1, len(r["ids"]) - 1) * 1000 for r in completed]
+    result = {
+        "tag": tag,
+        "input_tokens": length,
+        "output_tokens": output,
+        "count": count,
+        "completed": len(completed),
+        "failed": count - len(completed),
+        "duration_s": duration,
+        "output_tokens_per_s": sum(len(r["ids"]) for r in completed) / duration,
+        "mean_ttft_ms": sum(ttft) / len(ttft) if ttft else None,
+        "mean_tpot_ms": sum(tpot) / len(tpot) if tpot else None,
+        "preemptions": preempt,
+        "client_observed_generating_overlap": peak,
+        "server_counter_totals_before": before,
+        "server_counter_totals_after": after,
+        "capacity_point_passed": len(completed) == count and peak == count and preempt == 0,
+        "execution": json.loads((ROOT / "state-service-status.json").read_text()).get("prototype_execution", "unknown"),
+        "service_command_sha256": hashlib.sha256((ROOT / "state-serve-command.json").read_bytes()).hexdigest(),
+        "comparison_to_union": "not_performed",
+    }
     save(folder / "summary.json", result)
     print(json.dumps(result), flush=True)
     if len(completed) != count:

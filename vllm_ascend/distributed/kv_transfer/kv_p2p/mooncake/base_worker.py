@@ -208,6 +208,12 @@ class MooncakeBaseConnectorWorker:
         kv_caches: dict[str, torch.Tensor | list[torch.Tensor]],
     ) -> None:
         """Register configured KV cache allocations and publish metadata."""
+        from dataclasses import replace
+
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import is_state_config
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.dsv41 import make_layout, pool_capacity
+
+        state_mode = is_state_config(self.kv_cache_config)
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
         self.kv_caches = kv_caches
@@ -257,7 +263,7 @@ class MooncakeBaseConnectorWorker:
                 caches = as_kv_cache_tensors(cache_or_caches)
                 shared_page_metadata = (
                     self._get_shared_page_metadata(caches)
-                    if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                    if not state_mode and isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
                     else None
                 )
                 if shared_page_metadata is not None:
@@ -276,7 +282,12 @@ class MooncakeBaseConnectorWorker:
                         block_strides.append(cache.stride(0) * element_size)
                         block_lens.append(math.prod(block_shape) * element_size)
                         block_shapes.append(block_shape)
-                        block_size_scales.append(tensor_num_blocks // self.num_blocks)
+                        logical_count = (
+                            pool_capacity(self.kv_cache_config, layer_name) if state_mode else self.num_blocks
+                        )
+                        if tensor_num_blocks < logical_count or tensor_num_blocks % logical_count:
+                            raise ValueError(f"Invalid logical capacity for {layer_name}")
+                        block_size_scales.append(tensor_num_blocks // logical_count)
 
                 layer_names.append(layer_name)
                 layer_block_size = spec.block_size
@@ -319,6 +330,9 @@ class MooncakeBaseConnectorWorker:
             handshake_port=self.handshake_port,
         )
         self.transfer_metadata = transfer_metadata
+        if state_mode:
+            transfer_metadata = replace(transfer_metadata, state_layout=make_layout(self))
+            self.transfer_metadata = transfer_metadata
         self.xfer_handshake_metadata = transfer_metadata
 
         logger.info(
