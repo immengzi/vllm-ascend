@@ -380,7 +380,7 @@ def _prepare_state_metadata(builder, common, result):
     n = result.num_reqs
     global_owner = getattr(getattr(builder, "_global_builder", None), "_request_state_last_result", None)
     global_query_max = global_owner.max_query_len if global_owner is not None else result.max_query_len
-    if _direct_decode and result.max_query_len <= 1 and global_query_max == 1:
+    if result.max_query_len <= 1 and global_query_max == 1:
         # The graph must retain addresses whose contents are updated per step.
         # The one-column state block table already belongs to the runner.
         assert common.block_table_tensor.shape[1] == 1
@@ -390,6 +390,26 @@ def _prepare_state_metadata(builder, common, result):
         torch.clamp(result.seq_lens, max=WINDOW, out=lengths)
         result.state_ids = common.block_table_tensor[:n, 0]
         result.state_stage_lengths = lengths
+        if not _direct_decode:
+            # Decode staging owns one fixed page per padded request row.
+            # Graph replay must keep lengths, row offsets and table addresses.
+            if not hasattr(builder, "_state_decode_rows"):
+                rows = torch.arange(builder._seq_lens.numel(), dtype=torch.int32, device=builder._seq_lens.device)
+                builder._state_decode_rows = rows * WINDOW
+                builder._state_decode_table = rows.view(-1, 1)
+            result.state_stage_row_starts = builder._state_decode_rows[:n]
+            result.state_stage_block_table = builder._state_decode_table[:n]
+            result.state_stage_rows_used = n * WINDOW
+            result.state_stage_max_seq_len = WINDOW
+            result.state_staging_capacity = (
+                (
+                    builder.vllm_config.scheduler_config.max_num_batched_tokens
+                    + builder.vllm_config.scheduler_config.max_num_seqs * 256
+                    + 127
+                )
+                // 128
+            ) * 128
+            assert result.state_stage_rows_used <= result.state_staging_capacity
         record_path("persistent_decode_metadata")
         return export_state(builder, result)
     qcpu = common.query_start_loc_cpu
