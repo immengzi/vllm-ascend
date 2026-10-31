@@ -62,11 +62,51 @@ def engram_dead_mask(
     return (token_ids == image_token_id) | (token_ids == image_pad_token_id)
 
 
-def create_engram_hash_state(vllm_config, config, swa_cache_layer) -> NgramHashState:
+def request_ring_slots(positions, query_start_loc, req_ids, ring_ids, block_size):
+    """Commit only each request chunk's final ring turn; padding writes nothing."""
+    req = req_ids.long()
+    begin = query_start_loc.index_select(0, req).long()
+    end = query_start_loc.index_select(0, req + 1).long()
+    first = positions.index_select(0, begin.clamp(max=positions.numel() - 1))
+    last = first + (end - begin) - 1
+    token = torch.arange(positions.numel(), device=positions.device)
+    blocks = ring_ids.index_select(0, req).long()
+    keep = (token >= begin) & (token < end) & (positions >= last - block_size + 1) & (blocks > 0)
+    slots = blocks * block_size + positions.remainder(block_size)
+    return torch.where(keep, slots, -1)
+
+
+def _commit_hash_cache(state, input_ids, dead_mask, slots):
+    _write_hash_cache_kernel[(triton.cdiv(input_ids.numel(), 256),)](
+        input_ids,
+        state.token_map,
+        dead_mask,
+        slots,
+        state._cache,
+        input_ids.numel(),
+        input_ids.stride(0),
+        dead_mask.stride(0),
+        slots.stride(0),
+        256,
+        DEAD_ID,
+    )
+
+
+def create_engram_hash_state(
+    vllm_config, config, swa_cache_layer, *, request_state_ring: bool = False
+) -> NgramHashState:
     """Bind the upstream hash state to the Ascend SWA cache."""
     layout = EngramLayout.from_config(config)
     assert layout is not None, "Engram hash state needs at least one Engram layer"
-    return AscendNgramHashState(vllm_config, layout, AscendEngramSlotCache(swa_cache_layer))
+    state = AscendNgramHashState(vllm_config, layout, AscendEngramSlotCache(swa_cache_layer))
+    state.request_state_virtual_blocks = None
+    if request_state_ring and state.use_slot_cache:
+        if state.lookback_depth > state.block_size:
+            raise ValueError("Engram lookback exceeds the request-state ring capacity")
+        state.request_state_virtual_blocks = (
+            vllm_config.model_config.max_model_len + state.block_size - 1
+        ) // state.block_size
+    return state
 
 
 class AscendNgramHashState(NgramHashState):
@@ -112,23 +152,20 @@ class AscendNgramHashState(NgramHashState):
             query_start_loc.stride(0),
             BLOCK_T=32,
         )
+        ring_blocks = getattr(self, "request_state_virtual_blocks", None)
+        ring_ids = None
         if self.use_slot_cache:
-            assert cache is not None and slot_mapping is not None
-            assert block_table is not None
-            # Finish writes before other thread blocks read fallback history.
-            _write_hash_cache_kernel[(triton.cdiv(num_tokens, 256),)](
-                input_ids,
-                self.token_map,
-                dead_mask,
-                slot_mapping,
-                cache,
-                num_tokens,
-                input_ids.stride(0),
-                dead_mask.stride(0),
-                slot_mapping.stride(0),
-                256,
-                DEAD_ID,
-            )
+            assert cache is not None and block_table is not None
+            if ring_blocks is None:
+                assert slot_mapping is not None
+                _commit_hash_cache(self, input_ids, dead_mask, slot_mapping)
+            else:
+                if block_table.shape[1] != 1:
+                    raise ValueError("Request-state Engram requires one state ID per request")
+                ring_ids = block_table[:, 0]
+                # Logical absolute pages alias one request ring. The existing
+                # hash kernel retains absolute position modulo block_size.
+                block_table = block_table.expand(-1, ring_blocks)
         from vllm_ascend.ops.triton.engram_hash import _hash_ids_kernel
 
         _hash_ids_kernel[(triton.cdiv(num_tokens, 32), num_layers)](
@@ -170,4 +207,9 @@ class AscendNgramHashState(NgramHashState):
             lookback_mask_col_stride=lookback_dead_mask.stride(1),
             num_warps=4,
         )
+        if ring_ids is not None:
+            # Reads must precede ring reuse: a long prefill's final turn must
+            # not overwrite the previous chunk's ngram tail before hashing.
+            slots = request_ring_slots(positions, query_start_loc, req_ids, ring_ids, self.block_size)
+            _commit_hash_cache(self, input_ids, dead_mask, slots)
         return output
