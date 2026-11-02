@@ -105,6 +105,85 @@ def runtime_sender():
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_connector_shutdown_keeps_timed_out_receiver_and_rejects_new_loads(self):
+        folder = ROOT / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake"
+        worker_cls = compile_methods(
+            folder / "pull_worker.py", "MooncakePullConnectorWorker", ["shutdown", "start_load_kv"], {}
+        )
+        worker = worker_cls()
+        receiver = Mock()
+        receiver.shutdown.side_effect = TimeoutError("in-flight DMA")
+        worker._recving_thread = receiver
+        facade_cls = compile_methods(folder / "connector.py", "MooncakeBaseConnector", ["shutdown"], {})
+        facade = facade_cls()
+        facade.connector_worker = worker
+        with self.assertRaises(TimeoutError):
+            facade.shutdown()
+        self.assertIs(worker._recving_thread, receiver)
+        with self.assertRaises(RuntimeError):
+            worker.start_load_kv(SimpleNamespace(requests={}))
+        receiver.shutdown.side_effect = None
+        facade.shutdown()
+        self.assertIsNone(worker._recving_thread)
+        facade.shutdown()
+        facade.connector_worker = None
+        facade.shutdown()
+
+    def test_actual_receive_shutdown_drains_inflight_before_releasing_references(self):
+        path = ROOT / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py"
+        env = {"threading": threading, "torch": SimpleNamespace(npu=SimpleNamespace(set_device=Mock()))}
+        cls = compile_methods(path, "MooncakePullRecvingThread", ["add_requests", "run", "shutdown"], env)
+
+        # Run the actual queue loop, replacing only DMA/device access.
+        class Receiver(cls, threading.Thread):
+            pass
+
+        receiver = Receiver.__new__(Receiver)
+        threading.Thread.__init__(receiver, daemon=True)
+        receiver.device = 0
+        receiver.ready_event = threading.Event()
+        receiver.request_queue = queue.Queue()
+        receiver.finished_requests = queue.SimpleQueue()
+        receiver._shutdown_lock = threading.Lock()
+        receiver._closing = False
+        receiver.engine = object()
+        receiver.executor = Mock()
+        receiver.state_caches = {"registered": object()}
+        receiver.can_report_invalid_block_ids = False
+        receiver._get_remote_endpoint = Mock(return_value=("source", 1))
+        started, release = threading.Event(), threading.Event()
+
+        def transfer(*args):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return set()
+
+        receiver._handle_requests = transfer
+        receiver.start()
+        try:
+            self.assertTrue(receiver.ready_event.wait(1))
+            req = SimpleNamespace(remote_host="source", remote_port=1)
+            receiver.add_requests("peer", {"r": req})
+            self.assertTrue(started.wait(1))
+            with self.assertRaises(TimeoutError):
+                receiver.shutdown(timeout=0.01)
+            self.assertIsNotNone(receiver.engine)
+            self.assertIsNotNone(receiver.state_caches)
+            receiver.executor.shutdown.assert_not_called()
+            with self.assertRaises(RuntimeError):
+                receiver.add_requests("peer", {"late": req})
+        finally:
+            release.set()
+            receiver.shutdown(timeout=1)
+        self.assertFalse(receiver.is_alive())
+        self.assertEqual(receiver.finished_requests.get_nowait(), ("r", False))
+        self.assertEqual(receiver.request_queue.unfinished_tasks, 0)
+        receiver.executor.shutdown.assert_called_with(wait=True)
+        self.assertIsNone(receiver.engine)
+        self.assertIsNone(receiver.state_caches)
+        receiver.shutdown(timeout=1)
+        self.assertEqual(receiver.request_queue.unfinished_tasks, 0)
+
     def test_native_index_offset_and_state_capacity_are_separate(self):
         path = ROOT / "vllm_ascend/models/deepseek_v41/request_state.py"
         tree = ast.parse(path.read_text())

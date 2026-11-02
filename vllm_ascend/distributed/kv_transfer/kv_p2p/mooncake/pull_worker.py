@@ -144,7 +144,9 @@ class MooncakePullRecvingThread(threading.Thread):
         # engine_id -> remote_pp_rank
         # -> [(local_layer_index, remote_layer_index), ...]
         self.remote_layer_index_pairs: SizedDict[str, dict[int, list[tuple[int, int]]]] = SizedDict()
-        self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]]] = queue.Queue()
+        self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]] | None] = queue.Queue()
+        self._shutdown_lock = threading.Lock()
+        self._closing = False
         self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
         self.invalid_block_ids: set[int] = set()
         self.invalid_block_ids_lock = threading.Lock()
@@ -157,7 +159,30 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> None:
         """Queue requests for one remote engine."""
         if requests:
-            self.request_queue.put((remote_engine_id, requests))
+            with self._shutdown_lock:
+                if self._closing:
+                    raise RuntimeError("Mooncake pull receiver is shutting down")
+                self.request_queue.put((remote_engine_id, requests))
+
+    def shutdown(self, timeout: float = 60.0) -> None:
+        """Drain accepted transfers before dropping SDK and cache references.
+
+        A timeout is not a DMA fence: keep all references intact so the caller
+        cannot mistake an incomplete shutdown for safe buffer reclamation.
+        """
+        with self._shutdown_lock:
+            if not self._closing:
+                self._closing = True
+                self.request_queue.put(None)
+        self.join(timeout=timeout)
+        if self.is_alive():
+            raise TimeoutError("Mooncake pull receiver still has unfinished transfers; buffers remain retained")
+        self.executor.shutdown(wait=True)
+        # A live daemon retaining the SDK until C++ static teardown can outlive
+        # the NPU runtime. Release this thread's references after it has joined.
+        # GlobalTE remains the owner of the process-wide registered engine.
+        self.engine = None
+        self.state_caches = None
 
     def get_and_clear_finished_requests(self) -> KVConnectorTransferResults:
         """Drain completion and failure together for each finished request."""
@@ -183,7 +208,11 @@ class MooncakePullRecvingThread(threading.Thread):
         torch.npu.set_device(self.device)
         self.ready_event.set()
         while True:
-            remote_engine_id, requests = self.request_queue.get()
+            item = self.request_queue.get()
+            if item is None:
+                self.request_queue.task_done()
+                break
+            remote_engine_id, requests = item
             failed_request_ids: set[str] = set()
             request_endpoints = {(request.remote_host, request.remote_port) for request in requests.values()}
             try:
@@ -1639,6 +1668,13 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self._recving_thread: MooncakePullRecvingThread | None = None
+        self._shutdown = False
+
+    def shutdown(self) -> None:
+        self._shutdown = True
+        if self._recving_thread is not None:
+            self._recving_thread.shutdown()
+            self._recving_thread = None
 
     def register_kv_caches(
         self,
@@ -1680,6 +1716,8 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""
+        if getattr(self, "_shutdown", False):
+            raise RuntimeError("Mooncake pull worker is shutting down")
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:

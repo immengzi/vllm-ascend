@@ -65,6 +65,10 @@ if TYPE_CHECKING:
 class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
     """Common facade for the Mooncake scheduler and worker implementations."""
 
+    def shutdown(self) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
+
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return True

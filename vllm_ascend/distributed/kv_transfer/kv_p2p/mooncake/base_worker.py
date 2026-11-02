@@ -64,6 +64,10 @@ if TYPE_CHECKING:
 class MooncakeBaseConnectorWorker:
     """Worker implementation shared by Mooncake transfer modes."""
 
+    def shutdown(self) -> None:
+        """Backend hook called before the NPU worker process is torn down."""
+        return None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
