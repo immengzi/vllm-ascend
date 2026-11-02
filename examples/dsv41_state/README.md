@@ -3,9 +3,11 @@
 原始 PD 实现保留在 `feat/dsv41-state-pd-mooncake`，父分支是
 [`feat/dsv41-history-request-state`](https://github.com/immengzi/vllm-ascend/tree/feat/dsv41-history-request-state)。
 父提交 `f77bee84a5299c2e62d749409a29352aaf7e48b9` 保存当时已测源码，不含后续数值修补。
-非 PD 对照入口是 `fix/dsv41-staged-runtime-validation`，模型运行文件与 `ab5957b` 相同，包含 staging 图元数据和 Engram 请求历史修补。
-实际 PD 调试使用 `fix/dsv41-pd-staged-runtime`，另包含 `69bac74` 的 READ 地址顺序和接收线程排空修补。
-这两个入口分开保留；原已测、原 PD 以及已有数值修补分支不改动。不要用旧 PD 代码替代上述 PD 调试入口。
+已测非 PD 入口为 `fix/dsv41-staged-runtime-validation`，模型运行文件与 `ab5957b` 相同；
+已有 PD 入口 `fix/dsv41-pd-staged-runtime` 另包含 `69bac74` 的 READ 地址顺序和接收线程排空修补。
+新增安全入口分别为 `fix/dsv41-staging-only-validation` 与 `fix/dsv41-pd-staging-only`，
+仅增加未通过直接环的启动拒绝、回归和说明；默认 staging 计算与原入口相同，新提交尚未上卡。
+这几个入口分开保留；原已测、原 PD 以及已有数值修补分支不改动。
 PD 仍需设备间验证；离线协议、hash 组件或非 PD 数值检查都不能代替真实 DMA 与完整模型 PD 验收。
 
 固定依赖：vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607`，
@@ -31,9 +33,12 @@ examples 中不再保留第二套执行模块。当前 planner 只使用框架/C
 
 在新建的、与固定镜像匹配的隔离容器中检出此分支；不要覆盖正在服务的安装。
 确认 Python 实际导入此 checkout，并保留镜像自身的 CANN/Python/HCCL 环境。
-launcher 会设置 MRV1 和可写审计目录。窗口执行默认使用时间顺序 staging
-（`MENGZI_STATE_DECODE_DIRECT=0`），并保留外部显式设置；设置为 `1` 才选择单 token 直接环。
-两条执行路径需要分别做数值与图门禁，不能仅根据存储布局相同推断它们数值一致。
+launcher 会设置 MRV1 和可写审计目录。当前交付仅支持时间顺序 staging
+（`MENGZI_STATE_DECODE_DIRECT=0`）。物理直接环未通过相同执行历史下的严格数值门禁，
+设置为 `1` 时 launcher 和运行模块都会明确报错，防止绕过 launcher 误启。
+这修复了未通过路径仍可被误用的边界，没有修复直接环的算子数值差异。
+原始源码与失败证据仍保留；直接环需要新的数值验收后才能重新启用。
+状态分离和环形存储仍保留，不能仅根据存储布局相同推断计算结果一致。
 首次对照使用 `HCCL_DETERMINISTIC=strict`、`LCCL_DETERMINISTIC=1`；
 这些设置不保证模型跨不同实际 batch 逐位一致，数值对照必须记录并控制实际 batch 和已处理 token 边界。
 

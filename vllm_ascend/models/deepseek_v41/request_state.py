@@ -27,6 +27,13 @@ _installed = False
 _attention_installed = False
 _workspace = {}
 _direct_decode = os.environ.get("MENGZI_STATE_DECODE_DIRECT", "0") == "1"
+if _direct_decode:
+    raise ValueError(
+        "MENGZI_STATE_DECODE_DIRECT=1 failed strict numerical equivalence: "
+        "physical ring row order changes BF16 attention results. "
+        "Use MENGZI_STATE_DECODE_DIRECT=0 (chronological staging). "
+        "The direct path requires new numerical qualification before use."
+    )
 _observed_paths = set()
 
 
@@ -535,9 +542,9 @@ def install_attention():
 
         owner = global_swa(metadata)
         if _direct_decode and metadata.swa.max_query_len == 1 and owner.max_query_len == 1:
-            # A single query observes the entire final <=128-row window.
-            # Once full, circular row order is immaterial to attention; overwrite
-            # only the row that has just left that window before the read.
+            # Retained for historical diagnosis; the startup guard rejects this
+            # path. Ring permutations are not bitwise invariant in the current
+            # BF16 operator and need new numerical qualification before use.
             record_path("single_token_direct_ring")
             current = attn._request_state_current_kv.contiguous()
             ring = attn.dsa_attn.swa_cache_layer.kv_cache[0]
