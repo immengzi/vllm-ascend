@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Launch the preserved state prototype from an editable Ascend checkout."""
+"""Launch the pinned history/request-state implementation."""
 
 import argparse
 import os
@@ -17,7 +17,7 @@ def main():
     example = Path(__file__).resolve().parent
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(example), env.get("PYTHONPATH")]))
     env["MENGZI_RESULTS_DIR"] = str(args.results_dir.resolve())
-    env["MENGZI_STATE_DECODE_DIRECT"] = "1"
+    env.setdefault("MENGZI_STATE_DECODE_DIRECT", "0")
     env["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     forwarded = args.vllm_args
     if forwarded[:1] == ["--"]:
