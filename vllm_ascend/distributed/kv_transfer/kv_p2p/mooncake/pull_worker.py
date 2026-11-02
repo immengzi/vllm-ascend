@@ -644,7 +644,7 @@ class MooncakePullRecvingThread(threading.Thread):
                 # Use the corresponding rank for every object, including FP32
                 # compressor state. Generic replicated-MLA rank selection is
                 # deliberately not applied to a stateful snapshot.
-                src, dst, sizes = transfer_addresses(
+                remote_sources, local_destinations, sizes = transfer_addresses(
                     snapshot,
                     self.local_metadata,
                     remote,
@@ -680,7 +680,9 @@ class MooncakePullRecvingThread(threading.Thread):
                 remote_tp = remote.metadata_by_pcp_rank[0].metadata_by_tp_rank[self.tp_rank]
                 session_id = f"{remote_tp.local_ip}:{remote_tp.te_rpc_port}"
                 start = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_read(session_id, src, dst, sizes)
+                # Mooncake READ's ABI is (session, local buffers, peer buffers,
+                # lengths). Remote sources must not be passed as local memory.
+                ret = self.engine.batch_transfer_sync_read(session_id, local_destinations, remote_sources, sizes)
                 if ret < 0:
                     raise RuntimeError(f"State READ failed with status {ret}")
                 logger.info(

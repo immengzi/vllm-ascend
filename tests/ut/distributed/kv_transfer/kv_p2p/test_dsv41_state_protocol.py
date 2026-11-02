@@ -431,9 +431,14 @@ class ProtocolTests(unittest.TestCase):
                         return data, address - base
                 raise AssertionError("Out-of-bounds DMA address")
 
-            def read(session, sources, destinations, sizes):
-                submitted.append((sources, destinations, sizes))
-                for src, dst, size in zip(sources, destinations, sizes):
+            def read(session, local_destinations, remote_sources, sizes):
+                # Mooncake READ follows (session, local, peer, lengths), not
+                # memcpy's (source, destination) convention. Disjoint address
+                # spaces make an accidental reversal fail registration checks.
+                self.assertTrue(all(address >= 200000000 for address in local_destinations))
+                self.assertTrue(all(address < 200000000 for address in remote_sources))
+                submitted.append((local_destinations, remote_sources, sizes))
+                for src, dst, size in zip(remote_sources, local_destinations, sizes):
                     source, lo = resolve(src, size)
                     destination, hi = resolve(dst, size)
                     destination[hi : hi + size] = source[lo : lo + size]
@@ -476,7 +481,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(receiver._handle_state_requests(remote, "test-host", 9000, {"r": meta}), set())
             self.assertEqual(len(submitted), 1)
             self.assertGreater(sum(submitted[0][2]), 0)
-            for address, size in zip(submitted[0][1], submitted[0][2]):
+            for address, size in zip(submitted[0][0], submitted[0][2]):
                 data, offset = resolve(address, size)
                 self.assertEqual(data[offset : offset + size], bytes([65]) * size)
             ring = decoder.kv_caches["m.swa_cache"]
