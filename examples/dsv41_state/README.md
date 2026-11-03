@@ -3,12 +3,22 @@
 原始 PD 实现保留在 `feat/dsv41-state-pd-mooncake`，父分支是
 [`feat/dsv41-history-request-state`](https://github.com/immengzi/vllm-ascend/tree/feat/dsv41-history-request-state)。
 父提交 `f77bee84a5299c2e62d749409a29352aaf7e48b9` 保存当时已测源码，不含后续数值修补。
-已测非 PD 入口为 `fix/dsv41-staged-runtime-validation`，模型运行文件与 `ab5957b` 相同；
-已有 PD 入口 `fix/dsv41-pd-staged-runtime` 另包含 `69bac74` 的 READ 地址顺序和接收线程排空修补。
-新增安全入口分别为 `fix/dsv41-staging-only-validation` 与 `fix/dsv41-pd-staging-only`，
-仅增加未通过直接环的启动拒绝、回归和说明；默认 staging 计算与原入口相同，新提交尚未上卡。
-这几个入口分开保留；原已测、原 PD 以及已有数值修补分支不改动。
-PD 仍需设备间验证；离线协议、hash 组件或非 PD 数值检查都不能代替真实 DMA 与完整模型 PD 验收。
+当前调试入口为 `fix/dsv41-padding-state-guard`（非 PD）和
+`fix/dsv41-pd-padding-state-guard`（PD）；分别保留各自既有调用链，不合并两条入口。
+两个入口均包含 Engram 请求历史、图元数据、直接环拒绝、Prefill 临时 KV 流生命周期和
+图补齐行无效访问保护。PD 入口另保留 `69bac74` 的 Mooncake READ 地址顺序及接收线程排空修补。
+
+11 月 3 日发现：query 长度为 1、序列长度为 0 的图补齐行，在旧状态提交 kernel 中
+会向窗口视图前方写一行。此缺陷已用实际 NPU 保护区复现，属于访问边界问题；
+此前特定输出/状态样例通过，不代表旧入口没有该缺陷。
+修补运行时 `09929c3` 已通过 CPU 回归和实际单卡保护区、窗口 Attention 图测试；
+`d298d94` 仅增加图尺寸测试案例。PD 的共同 kernel 与非 PD 修补逐字相同，
+这不代表完整模型 PD 已通过。
+
+此前 `fix/dsv41-prefill-stream-lifetime`、`fix/dsv41-pd-prefill-lifetime`，以及更早的
+runtime-validation/staging-only 分支作为历史复现入口保留，不再将其称为当前完整正确版本。
+原已测源码、原 PD 实现和实验数据不覆盖。完整模型、性能和 PD 验收均需依据精确版本的
+独立证据；离线协议、单卡组件或非 PD 数值检查不能代替真实 DMA 与完整模型 PD 验收。
 
 固定依赖：vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607`，
 Ascend 基线 `8fde6d4e335fe300e2b949aab0e31659cce0811d`，
