@@ -81,6 +81,36 @@ class TestCurrentKVLifetime(unittest.TestCase):
         calls, _ = self.run_case(copied=True)
         self.assertEqual([c[0] for c in calls], ["record", "record"])
 
+    def test_cache_only_uses_swa_metadata_contract(self):
+        source = Path(__file__).resolve().parents[3] / "vllm_ascend/models/deepseek_v41/request_state.py"
+        node = next(
+            n
+            for n in ast.walk(ast.parse(source.read_text()))
+            if isinstance(n, ast.FunctionDef) and n.name == "update_only"
+        )
+        # Supply the real wrapper's kernel import as a CPU spy. LayerMetadata
+        # exposes query bounds through swa, never on the outer bundle.
+        node.body = [n for n in node.body if not isinstance(n, ast.ImportFrom)]
+        for item in ast.walk(node):
+            if isinstance(item, ast.If):
+                item.body = [n for n in item.body if not isinstance(n, ast.ImportFrom)]
+        for query in [1, 4]:
+            calls = []
+            value = SimpleNamespace(contiguous=lambda: "current")
+            attn = SimpleNamespace(
+                _request_state_current_kv=value,
+                dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(kv_cache=["ring"])),
+            )
+            swa = SimpleNamespace(state_ids="ids", query_start_loc="qstart", seq_lens="seq", max_query_len=query)
+            scope = {
+                "original_update": lambda *a, sink=calls: sink.append("project"),
+                "commit": lambda *a, sink=calls: sink.append(a),
+                "_release_current_kv": lambda a, v, *, prefill, sink=calls: sink.append((v, prefill)),
+            }
+            exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
+            scope["update_only"](object(), attn, SimpleNamespace(shape=(1,)), SimpleNamespace(swa=swa))
+            self.assertEqual(calls, ["project", ("ring", "current", "ids", "qstart", "seq"), ("current", query > 1)])
+
     def test_failed_dependency_retains_tensor_and_producer(self):
         calls, paths = self.run_case(fail=True)
         self.assertEqual([c[0] for c in calls], ["producer_wait"])

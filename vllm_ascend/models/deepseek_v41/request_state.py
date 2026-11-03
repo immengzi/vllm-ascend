@@ -624,7 +624,7 @@ def install_attention():
             value = attn._request_state_current_kv.contiguous()
             ring = attn.dsa_attn.swa_cache_layer.kv_cache[0]
             commit(ring, value, metadata.swa.state_ids, metadata.swa.query_start_loc, metadata.swa.seq_lens)
-            _release_current_kv(attn, value, prefill=metadata.max_query_len > 1)
+            _release_current_kv(attn, value, prefill=metadata.swa.max_query_len > 1)
 
     mod.AscendDSAV41Impl._update_caches = update_only
 
