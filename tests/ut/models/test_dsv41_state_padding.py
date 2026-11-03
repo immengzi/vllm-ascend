@@ -78,7 +78,7 @@ class TestStatePadding(unittest.TestCase):
             type_ignores=[],
         )
         exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
-        for actual, padded in [(6, 8), (11, 12)]:
+        for actual, padded in [(6, 8), (11, 12), (11, 16), (12, 16)]:
             with self.subTest(actual=actual, padded=padded):
                 starts = np.full(65, -1, dtype=np.int32)
                 starts[: actual + 1] = np.arange(actual + 1)
