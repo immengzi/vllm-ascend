@@ -44,6 +44,40 @@ def record_path(path):
         target.write_text(json.dumps({"paths": sorted(_observed_paths), "single_token_direct_enabled": _direct_decode}))
 
 
+def _release_current_kv(attn, current, *, prefill):
+    """Return eager-prefill uses to the producing stream before KV reuse.
+
+    The supported unpacked producer invokes defer_write on the stream that
+    allocates normalized KV. Joining the consumer back to that producer lets
+    its caching allocator reuse the block with stream ordering, instead of
+    parking one projected KV per layer on record_stream events. Keep the
+    original protection for decode/capture and unknown or copied producers.
+    """
+    value = attn._request_state_current_kv
+    producer = getattr(attn, "_request_state_current_kv_stream", None)
+    consumer = torch.npu.current_stream()
+    if (
+        prefill
+        and producer is not None
+        and producer != consumer
+        and producer.device == consumer.device
+        and current is value
+        and getattr(attn, "packed_cache_ops", None) is None
+        and not torch.npu.is_current_stream_capturing()
+    ):
+        # This is a GPU dependency, not a CPU/device synchronize. It is queued
+        # before either reference is dropped; failures retain both references.
+        producer.wait_stream(consumer)
+        record_path("prefill_producer_return_dependency")
+    else:
+        current.record_stream(consumer)
+        if value is not current:
+            value.record_stream(consumer)
+        record_path("current_kv_record_stream_fallback")
+    attn._request_state_current_kv = None
+    attn._request_state_current_kv_stream = None
+
+
 @dataclass(frozen=True, kw_only=True)
 class RequestWindowSpec(AscendSlidingWindowMLASpec):
     @property
@@ -528,6 +562,9 @@ def install_attention():
             # Existing projection code joins its auxiliary stream before the
             # attention call. Hold the projected rows until stage and commit.
             attn._request_state_current_kv = value
+            # In the supported unpacked path this callback executes on the
+            # stream that creates the normalized KV tensor.
+            attn._request_state_current_kv_stream = torch.npu.current_stream()
         else:
             original_write(attn, metadata, value)
 
@@ -555,8 +592,7 @@ def install_attention():
             swa.seq_lens = swa.state_stage_lengths
             replacement = replace(metadata, swa=swa)
             output = original_forward(self, attn, q, replacement, compressed_indices, **kwargs)
-            current.record_stream(torch.npu.current_stream())
-            attn._request_state_current_kv = None
+            _release_current_kv(attn, current, prefill=False)
             return output
         record_path("multi_token_staging")
         ring, current, staging = _stage(attn, metadata)
@@ -574,8 +610,7 @@ def install_attention():
         finally:
             layer.kv_cache = old_cache
         commit(ring, current, owner.state_ids, owner.query_start_loc, owner.seq_lens)
-        current.record_stream(torch.npu.current_stream())
-        attn._request_state_current_kv = None
+        _release_current_kv(attn, current, prefill=owner.max_query_len > 1)
         return output
 
     mod.AscendDSAV41Impl._forward_attention = forward
@@ -589,8 +624,7 @@ def install_attention():
             value = attn._request_state_current_kv.contiguous()
             ring = attn.dsa_attn.swa_cache_layer.kv_cache[0]
             commit(ring, value, metadata.swa.state_ids, metadata.swa.query_start_loc, metadata.swa.seq_lens)
-            value.record_stream(torch.npu.current_stream())
-            attn._request_state_current_kv = None
+            _release_current_kv(attn, value, prefill=metadata.max_query_len > 1)
 
     mod.AscendDSAV41Impl._update_caches = update_only
 
