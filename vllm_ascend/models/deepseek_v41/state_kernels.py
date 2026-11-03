@@ -15,8 +15,12 @@ def _assemble(
     end = tl.load(QSTART + req + 1)
     length = end - first
     computed = tl.load(SEQLEN + req) - length
-    old = tl.minimum(computed, WINDOW - 1)
     state = tl.load(IDS + req)
+    # FIA graph padding can have a positive query length with seq_len zero.
+    # Keep valid null-slot graph capture, but never read invalid padding KV.
+    valid = (state >= 0) & (length > 0) & (computed >= 0)
+    old = tl.where(valid, tl.minimum(computed, WINDOW - 1), 0)
+    length = tl.where(valid, length, 0)
     base = tl.load(BASE + req)
     old_slot = (computed - old + row) % WINDOW
     previous = tl.load(
@@ -39,10 +43,12 @@ def _commit(RING, CURRENT, IDS, QSTART, SEQLEN, WIDTH: tl.constexpr, WINDOW: tl.
     first = tl.load(QSTART + req)
     end = tl.load(QSTART + req + 1)
     length = end - first
-    count = tl.minimum(length, WINDOW)
     computed = tl.load(SEQLEN + req) - length
-    absolute = computed + length - count + row
     state = tl.load(IDS + req)
+    # Do not read padded CURRENT rows or form a live store before the ring.
+    valid = (state >= 0) & (length > 0) & (computed >= 0)
+    count = tl.where(valid, tl.minimum(length, WINDOW), 0)
+    absolute = computed + length - count + row
     value = tl.load(CURRENT + (end - count + row[:, None]) * WIDTH + dim[None, :], mask=(row < count)[:, None], other=0)
     tl.store(
         RING + (state * WINDOW + absolute[:, None] % WINDOW) * WIDTH + dim[None, :], value, mask=(row < count)[:, None]
@@ -75,16 +81,16 @@ def _assemble_cp(
     lfirst = tl.load(LQ + req)
     lend = tl.load(LQ + req + 1)
     length = lend - lfirst
-    if length > 0:
-        local_computed = tl.load(LSEQ + req) - length
+    state = tl.load(IDS + req)
+    local_computed = tl.load(LSEQ + req) - length
+    global_first = tl.load(GQ + req)
+    global_end = tl.load(GQ + req + 1)
+    global_computed = tl.load(GSEQ + req) - (global_end - global_first)
+    if (state >= 0) & (length > 0) & (local_computed >= 0) & (global_computed >= 0):
         old = tl.minimum(local_computed, WINDOW - 1)
-        global_first = tl.load(GQ + req)
-        global_end = tl.load(GQ + req + 1)
-        global_computed = tl.load(GSEQ + req) - (global_end - global_first)
         absolute = local_computed - old + row
         live = (length > 0) & (row < old + length)
         from_old = absolute < global_computed
-        state = tl.load(IDS + req)
         base = tl.load(BASE + req)
         previous = tl.load(
             RING + (state * WINDOW + absolute[:, None] % WINDOW) * WIDTH + dim[None, :],
