@@ -5,6 +5,7 @@
 import queue
 import threading
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,12 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
+    STATE_ACQUIRE_MSG,
+    STATE_DONE_MSG,
+    SourceLease,
+    StateSnapshot,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     MooncakeBaseConnectorScheduler,
 )
@@ -113,6 +120,9 @@ class MooncakeSchedulerSendingThread(threading.Thread):
         self.early_finished_requests: set[str] = set()
         self.finished_request_ids: set[str] = set()
         self.state_lock = threading.Lock()
+        self.state_leases: dict[str, SourceLease] = {}
+        self.completed_state_leases: OrderedDict[str, str | None] = OrderedDict()
+        self.quarantined_state_leases: set[str] = set()
 
     def _merge_metadata_by_pp_rank(
         self,
@@ -192,7 +202,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 for tp_rank, worker_metadata in workers_by_tp_rank.items():
                     mismatched_fields = [
                         field_name
-                        for field_name in ("block_size", "num_blocks")
+                        for field_name in ("block_size", "num_blocks", "state_layout")
                         if getattr(worker_metadata, field_name) != getattr(reference, field_name)
                     ]
                     if mismatched_fields:
@@ -308,6 +318,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 block_shapes=block_shapes,
                 block_size_scales=block_size_scales,
                 metadata_by_pcp_rank=metadata_by_pcp_rank,
+                state_layout=reference.state_layout,
             )
         return merged
 
@@ -317,6 +328,58 @@ class MooncakeSchedulerSendingThread(threading.Thread):
             if request_id in self.early_finished_requests:
                 self.early_finished_requests.remove(request_id)
                 self._mark_finished_locked(request_id)
+
+    def add_state_lease(self, snapshot: StateSnapshot, delay_start_time: float, block_ids: BlockIds) -> None:
+        with self.state_lock:
+            if snapshot.transfer_id in self.state_leases or any(
+                x.snapshot.source_request_id == snapshot.source_request_id for x in self.state_leases.values()
+            ):
+                raise ValueError("Duplicate state transfer generation")
+            self.state_leases[snapshot.transfer_id] = SourceLease(
+                snapshot,
+                delay_start_time + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                tuple(tuple(group) for group in block_ids),
+            )
+            # A later logical request may reuse an external request ID. Its
+            # UUID generation, not that external ID, identifies this lease.
+            self.finished_request_ids.discard(snapshot.source_request_id)
+            self.early_finished_requests.discard(snapshot.source_request_id)
+            self.delayed_free_requests[snapshot.source_request_id] = delay_start_time
+
+    def _state_control(self, msg: tuple) -> bytes:
+        with self.state_lock:
+            if msg[0] == STATE_ACQUIRE_MSG and len(msg) == 6:
+                _, transfer_id, consumer, rank, snapshot_wire, remote_ids = msg
+                lease = self.state_leases.get(transfer_id)
+                if (
+                    lease is None
+                    or lease.snapshot.to_wire() != snapshot_wire
+                    or lease.resource_ids != tuple(tuple(group) for group in remote_ids)
+                ):
+                    return b"REJECT"
+                return ACK_MSG if lease.acquire(transfer_id, consumer, rank, time.time()) else b"REJECT"
+            if msg[0] == STATE_DONE_MSG and len(msg) == 3:
+                _, transfer_id, consumer = msg
+                lease = self.state_leases.get(transfer_id)
+                if lease is not None and lease.complete(transfer_id, consumer):
+                    self._mark_finished_locked(lease.snapshot.source_request_id)
+                    self._retire_state_lease(transfer_id, consumer)
+                    return ACK_MSG
+                if transfer_id in self.completed_state_leases:
+                    previous = self.completed_state_leases[transfer_id]
+                    return ACK_MSG if previous in (None, consumer) else b"REJECT"
+                # Old tombstones are bounded. A DONE for an unknown UUID is an
+                # idempotent no-op; it can never release a different live lease.
+                return ACK_MSG
+            return b"REJECT"
+
+    def _retire_state_lease(self, transfer_id: str, consumer: str | None) -> None:
+        self.state_leases.pop(transfer_id, None)
+        self.quarantined_state_leases.discard(transfer_id)
+        self.completed_state_leases[transfer_id] = consumer
+        # Bounded retry tombstones; generations are UUIDs and never reused.
+        while len(self.completed_state_leases) > 16000:
+            self.completed_state_leases.popitem(last=False)
 
     def get_and_clear_finished_requests(self) -> set[str]:
         finished: set[str] = set()
@@ -358,6 +421,8 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 msg = decoder.decode(payload[0])
                 if msg and msg[0] == GET_META_MSG:
                     sock.send_multipart((identity, b"", self.encoded_metadata))
+                elif msg and msg[0] in (STATE_ACQUIRE_MSG, STATE_DONE_MSG):
+                    sock.send_multipart((identity, b"", self._state_control(msg)))
                 elif msg[0] == DONE_RECVING_MSG and len(msg) == 2:
                     self._handle_finished_request(str(msg[1]))
                     sock.send_multipart((identity, b"", ACK_MSG))
@@ -368,6 +433,10 @@ class MooncakeSchedulerSendingThread(threading.Thread):
 
     def _handle_finished_request(self, request_id: str) -> None:
         with self.state_lock:
+            # Legacy ACKs lack a generation and must never release state DMA.
+            if any(lease.snapshot.source_request_id == request_id for lease in self.state_leases.values()):
+                logger.error("Rejected generation-free ACK for state transfer %s", request_id)
+                return
             if request_id in self.finished_request_ids:
                 return
             if request_id in self.delayed_free_requests:
@@ -384,11 +453,26 @@ class MooncakeSchedulerSendingThread(threading.Thread):
 
     def _retrieve_expired_requests_locked(self) -> None:
         current_time = time.time()
-        while self.delayed_free_requests:
-            request_id = next(iter(self.delayed_free_requests))
-            delay_start_time = self.delayed_free_requests[request_id]
+        state_by_request = {lease.snapshot.source_request_id: lease for lease in self.state_leases.values()}
+        for request_id, delay_start_time in list(self.delayed_free_requests.items()):
             if current_time - delay_start_time <= envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
-                break
+                continue
+            lease = state_by_request.get(request_id)
+            if lease is not None:
+                if not lease.may_expire(current_time):
+                    # A lost peer may still have outstanding DMA. Keep this
+                    # bounded allocation quarantined until aggregate completion
+                    # or explicit engine teardown; a timer is not a DMA fence.
+                    if lease.snapshot.transfer_id not in self.quarantined_state_leases:
+                        self.quarantined_state_leases.add(lease.snapshot.transfer_id)
+                        logger.error(
+                            "State transfer %s timed out after acquisition; resources quarantined "
+                            "until DMA completion or engine teardown",
+                            lease.snapshot.transfer_id,
+                        )
+                    continue
+                lease.finished = True
+                self._retire_state_lease(lease.snapshot.transfer_id, None)
 
             self._mark_finished_locked(request_id)
             logger.error(
@@ -404,14 +488,16 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
     def __init__(self, ready_event: threading.Event) -> None:
         super().__init__(daemon=True, name="MooncakeSchedulerRecvingThread")
         self.ready_event = ready_event
-        self.request_queue: queue.Queue[tuple[str, int, str]] = queue.Queue()
+        self.request_queue: queue.Queue[tuple[str, int, str, str, str]] = queue.Queue()
         self.encoder = msgspec.msgpack.Encoder()
         self.remote_sockets: dict[str, deque[Any]] = defaultdict(deque)
         self.remote_sockets_lock = threading.Lock()
         self.zmq_context: Any | None = None
 
-    def add_request(self, remote_host: str, remote_port: int, request_id: str) -> None:
-        self.request_queue.put((remote_host, remote_port, request_id))
+    def add_request(
+        self, remote_host: str, remote_port: int, request_id: str, transfer_id: str = "", consumer: str = ""
+    ) -> None:
+        self.request_queue.put((remote_host, remote_port, request_id, transfer_id, consumer))
 
     def run(self) -> None:
         self.ready_event.set()
@@ -429,13 +515,17 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
             finally:
                 self.request_queue.task_done()
 
-    def _send_done_recving(self, remote_host: str, remote_port: int, request_id: str) -> None:
+    def _send_done_recving(
+        self, remote_host: str, remote_port: int, request_id: str, transfer_id: str = "", consumer: str = ""
+    ) -> None:
         path = make_zmq_path("tcp", remote_host, remote_port)
         sock = self._get_remote_socket(path)
         try:
             ensure_zmq_send(
                 sock,
-                self.encoder.encode((DONE_RECVING_MSG, request_id)),
+                self.encoder.encode(
+                    (STATE_DONE_MSG, transfer_id, consumer) if transfer_id else (DONE_RECVING_MSG, request_id)
+                ),
                 path,
             )
             response = ensure_zmq_recv(sock, path)
@@ -488,7 +578,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
         # D request -> (P scheduler host, port, P request id).
-        self._reqs_recv_info: dict[str, tuple[str, int, str]] = {}
+        self._reqs_recv_info: dict[str, tuple] = {}
         self._sending_thread: MooncakeSchedulerSendingThread | None = None
         self._recving_thread: MooncakeSchedulerRecvingThread | None = None
 
@@ -536,6 +626,17 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if params is not None and params.get("do_remote_prefill"):
             token_ids = request.prompt_token_ids or []
             actual = self._state_prefill_token_count(len(token_ids))
+            if self.state_mode:
+                snapshot = StateSnapshot.from_wire(params.get("dsv41_state_snapshot", {}))
+                if (
+                    snapshot.model_id != self.state_model_id
+                    or snapshot.tp_size != self.tp_size
+                    or snapshot.original_prompt_tokens != len(token_ids)
+                    or snapshot.boundary != actual
+                    or num_computed_tokens != 0
+                ):
+                    raise ValueError("State PD requires a complete cold handoff at T=N-1")
+                params["dsv41_state_consumer"] = f"{self.engine_id}/{request.request_id}"
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
@@ -575,6 +676,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                     params["remote_port"],
                     params["remote_request_id"],
                 )
+                if self.state_mode:
+                    snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
+                    remote += (snapshot.transfer_id, params["dsv41_state_consumer"])
                 if num_external_tokens > 0:
                     self._reqs_need_recv[request.request_id] = (
                         request,
@@ -635,10 +739,36 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             or not params.get("do_remote_decode")
             or request.status != RequestStatus.FINISHED_LENGTH_CAPPED
         ):
+            if self.state_mode and params is not None and params.get("do_remote_prefill"):
+                # Rejected/cancelled before D admission: no worker can yet own
+                # these destinations, so release the unconsumed P generation.
+                snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
+                assert self._recving_thread is not None
+                consumer = params.get("dsv41_state_consumer", f"{self.engine_id}/{request.request_id}")
+                self._recving_thread.add_request(
+                    params["remote_host"],
+                    params["remote_port"],
+                    params["remote_request_id"],
+                    snapshot.transfer_id,
+                    consumer,
+                )
+                params["do_remote_prefill"] = False
             return False, None
 
         prompt_token_ids = request.prompt_token_ids or []
         prompt_len = len(prompt_token_ids)
+        snapshot = None
+        if self.state_mode:
+            if request.num_computed_tokens != prompt_len or request.num_in_flight_tokens:
+                raise ValueError("P state snapshot is not at a completed immutable token boundary")
+            snapshot = StateSnapshot.create(
+                uuid.uuid4().hex,
+                request.request_id,
+                self.state_model_id,
+                prompt_len,
+                params.get("_dsv41_original_prompt_tokens", 0),
+                self.tp_size,
+            )
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
         delay_free_blocks = num_computed_blocks > 0
@@ -652,10 +782,10 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = delay_start_time
             if self._sending_thread is None:
                 raise RuntimeError("Mooncake scheduler metadata has not been initialized")
-            self._sending_thread.add_delayed_request(
-                request.request_id,
-                delay_start_time,
-            )
+            if snapshot is not None:
+                self._sending_thread.add_state_lease(snapshot, delay_start_time, computed_block_ids)
+            else:
+                self._sending_thread.add_delayed_request(request.request_id, delay_start_time)
 
         return delay_free_blocks, {
             "do_remote_prefill": True,
@@ -667,6 +797,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             "remote_host": self.side_channel_host,
             "remote_port": self.side_channel_port,
             "last_token_id": request.output_token_ids[-1],
+            **({"dsv41_state_snapshot": snapshot.to_wire()} if snapshot is not None else {}),
         }
 
     def update_connector_output(

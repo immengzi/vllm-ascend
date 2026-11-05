@@ -5425,7 +5425,7 @@ class NPUModelRunner(GPUModelRunner):
                     block_stride = layer_tuple_strides[layer_name]
                     initial_offset = 0
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
-                        kv_cache_config.num_blocks,
+                        cache_rows(kv_cache_config, layer_name),
                         get_storage_block_size(current_kv_cache_spec),
                         current_kv_cache_spec.num_kv_heads,
                         current_kv_cache_spec.head_size,
@@ -5438,11 +5438,10 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     if is_index:
                         source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                        source_spec = layer_kv_cache_spec[source_name]
-                        initial_offset = source_spec.unpadded_page_size_bytes
+                        initial_offset = index_cache_offset(kv_cache_config, layer_kv_cache_spec[source_name])
                         kv_cache_shape_list.append(
                             attn_backend.get_kv_cache_shape(
-                                kv_cache_config.num_blocks,
+                                cache_rows(kv_cache_config, layer_name),
                                 get_storage_block_size(current_kv_cache_spec),
                                 current_kv_cache_spec.num_kv_heads,
                                 current_kv_cache_spec.scale_dim,
@@ -6592,3 +6591,11 @@ def update_pass_config(model_runner):
         yield
     finally:
         model_runner.compilation_config.pass_config.enable_sp = original_pass_config_sp
+
+from vllm_ascend.models.deepseek_v41.request_state import (  # noqa: E402 - class initialization order
+    cache_rows,
+    index_cache_offset,
+    install_worker,
+)
+
+install_worker(NPUModelRunner)

@@ -30,8 +30,13 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
     is_circular_kv_cache_spec,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import STATE_ACQUIRE_MSG, StateSnapshot
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.dsv41 import (
+    transfer_addresses,
+    zero_state_destination,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
@@ -78,6 +83,7 @@ class MooncakePullRecvingThread(threading.Thread):
         dcp_size: int,
         device: Any,
         ready_event: threading.Event,
+        state_caches: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(daemon=True, name="MooncakePullRecvingThread")
         self.engine = engine
@@ -88,6 +94,7 @@ class MooncakePullRecvingThread(threading.Thread):
         self.layer_name_to_group_index = layer_name_to_group_index
         self.layer_name_to_spec_index = layer_name_to_spec_index
         self.local_metadata = local_metadata
+        self.state_caches = state_caches
 
         self.block_size = local_metadata.block_size
         self.layer_names = local_metadata.layer_names
@@ -532,6 +539,8 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> set[str]:
         """Build and execute transfer buckets for one producer engine."""
         remote_metadata = self._get_remote_metadata(remote_engine_id, remote_host, remote_port)
+        if self.local_metadata.state_layout is not None:
+            return self._handle_state_requests(remote_metadata, remote_host, remote_port, requests)
         tp_rank_groups_by_pp_rank = self.remote_tp_rank_groups[remote_engine_id]
         layer_pairs_by_pp_rank = self.remote_layer_index_pairs[remote_engine_id]
         # Cache block mappings for this producer-engine batch:
@@ -604,6 +613,93 @@ class MooncakePullRecvingThread(threading.Thread):
         if submission_error is not None:
             raise submission_error
         return failed_request_ids
+
+    def _handle_state_requests(
+        self,
+        remote_metadata: MooncakeTransferMetadataGroups,
+        remote_host: str,
+        remote_port: int,
+        requests: dict[str, ReqMeta],
+    ) -> set[str]:
+        """Same-TP request-state transfer using the existing READ/completion path."""
+        if (remote_metadata.pp_size, remote_metadata.pcp_size, remote_metadata.dcp_size) != (1, 1, 1):
+            raise ValueError("State PD requires PP=PCP=DCP=1 on both peers")
+        if remote_metadata.tp_size != self.tp_size or remote_metadata.use_kv_pp:
+            raise ValueError("State PD requires equal TP and no KVPP")
+        remote = remote_metadata.metadata_by_pp_rank[0]
+        failed = set()
+        for request_id, meta in requests.items():
+            try:
+                if meta.state_snapshot is None or not meta.state_consumer:
+                    raise ValueError("State snapshot and consumer identity are required")
+                snapshot = StateSnapshot.from_wire(meta.state_snapshot)
+                if (
+                    meta.num_computed_tokens != 0
+                    or meta.num_external_tokens != snapshot.boundary
+                    or meta.local_num_prompt_tokens != snapshot.original_prompt_tokens
+                    or meta.remote_num_prompt_tokens != snapshot.boundary
+                    or meta.remote_request_id != snapshot.source_request_id
+                ):
+                    raise ValueError("Worker received inconsistent state boundary metadata")
+                # Use the corresponding rank for every object, including FP32
+                # compressor state. Generic replicated-MLA rank selection is
+                # deliberately not applied to a stateful snapshot.
+                src, dst, sizes = transfer_addresses(
+                    snapshot,
+                    self.local_metadata,
+                    remote,
+                    self.tp_rank,
+                    meta.local_full_block_ids,
+                    meta.remote_block_ids,
+                )
+                path = make_zmq_path("tcp", remote_host, remote_port)
+                with zmq_ctx(zmq.REQ, path) as sock:
+                    sock.setsockopt(zmq.SNDTIMEO, 1000)
+                    sock.setsockopt(zmq.RCVTIMEO, 1000)
+                    ensure_zmq_send(
+                        sock,
+                        self.encoder.encode(
+                            (
+                                STATE_ACQUIRE_MSG,
+                                snapshot.transfer_id,
+                                meta.state_consumer,
+                                self.tp_rank,
+                                snapshot.to_wire(),
+                                meta.remote_block_ids,
+                            )
+                        ),
+                        path,
+                    )
+                    if ensure_zmq_recv(sock, path) != b"ACK":
+                        raise RuntimeError("Producer rejected expired, stale, or competing state snapshot")
+                assert self.state_caches is not None
+                assert self.local_metadata.state_layout is not None
+                zero_state_destination(self.state_caches, meta.local_full_block_ids, self.local_metadata.state_layout)
+                # Allocation/reset writes must complete before external DMA.
+                torch.npu.current_stream().synchronize()
+                remote_tp = remote.metadata_by_pcp_rank[0].metadata_by_tp_rank[self.tp_rank]
+                session_id = f"{remote_tp.local_ip}:{remote_tp.te_rpc_port}"
+                start = time.perf_counter()
+                ret = self.engine.batch_transfer_sync_read(session_id, src, dst, sizes)
+                if ret < 0:
+                    raise RuntimeError(f"State READ failed with status {ret}")
+                logger.info(
+                    "DSV4.1 state READ complete: request=%s transfer=%s boundary=%d rank=%d "
+                    "ranges=%d bytes=%d elapsed_ms=%.3f; no D recompute",
+                    request_id,
+                    snapshot.transfer_id,
+                    snapshot.boundary,
+                    self.tp_rank,
+                    len(sizes),
+                    sum(sizes),
+                    (time.perf_counter() - start) * 1000,
+                )
+            except Exception:
+                failed.add(request_id)
+                logger.exception("DSV4.1 state handoff failed for request %s", request_id)
+        # The existing receiver publishes failure/completion together, and D
+        # scheduler aggregates every TP worker before ACK or slot reclamation.
+        return failed
 
     def _build_transfer_block_buckets(
         self,
@@ -1514,6 +1610,9 @@ class MooncakePullRecvingThread(threading.Thread):
 
         transfer_metadata = self.decoder.decode(metadata_bytes)
         self._validate_remote_metadata(transfer_metadata, remote_engine_id)
+        if self.local_metadata.state_layout is not None:
+            self.remote_metadata[remote_engine_id] = transfer_metadata
+            return transfer_metadata
         remote_tp_rank_groups, remote_layer_index_pairs = self._build_remote_transfer_layout(transfer_metadata)
         self.remote_metadata[remote_engine_id] = transfer_metadata
         self.remote_tp_rank_groups[remote_engine_id] = remote_tp_rank_groups
@@ -1569,6 +1668,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 dcp_size=self.dcp_size,
                 device=torch.npu.current_device(),
                 ready_event=ready_event,
+                state_caches=self.kv_caches,
             )
             self._recving_thread.start()
             if not ready_event.wait(timeout=10):

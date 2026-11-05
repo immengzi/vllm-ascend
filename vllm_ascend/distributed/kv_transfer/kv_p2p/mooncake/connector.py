@@ -222,7 +222,14 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         """MooncakeConnector does not save KV cache explicitly."""
 
     def wait_for_save(self) -> None:
-        """MooncakeConnector does not save KV cache explicitly."""
+        """Publish a stable state snapshot before P can report completion."""
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import is_state_config
+
+        if self.kv_transfer_config.is_kv_producer and is_state_config(self.kv_cache_config):
+            # DSA projection auxiliary streams are joined before the model's
+            # state consumers/commits. This conservative first implementation
+            # fences the resulting main stream outside graph capture.
+            torch.npu.current_stream().synchronize()
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """Return this worker's out-of-band transfer handshake metadata."""
