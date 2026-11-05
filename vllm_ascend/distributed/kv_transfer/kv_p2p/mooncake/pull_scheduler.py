@@ -530,7 +530,19 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
             )
             response = ensure_zmq_recv(sock, path)
             if response != ACK_MSG:
-                raise RuntimeError(f"Unexpected Mooncake scheduler completion response: {response!r}")
+                if transfer_id and response == b"REJECT":
+                    # A retired generation can reject a different consumer's
+                    # completion. Retrying that immutable identity cannot make
+                    # it valid and otherwise creates an unbounded busy loop.
+                    # This is not evidence that any live source lease was freed.
+                    logger.warning(
+                        "Producer rejected state completion: transfer_id=%s, request_id=%s; "
+                        "notification retired without retry; source ownership unchanged",
+                        transfer_id,
+                        request_id,
+                    )
+                else:
+                    raise RuntimeError(f"Unexpected Mooncake scheduler completion response: {response!r}")
         except Exception:
             sock.close(linger=0)
             raise
