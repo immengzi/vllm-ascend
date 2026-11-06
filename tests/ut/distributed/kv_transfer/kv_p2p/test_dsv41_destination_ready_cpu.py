@@ -60,6 +60,7 @@ class PublicationTests(unittest.TestCase):
         worker = cls()
         worker.kv_transfer_config = SimpleNamespace(is_kv_consumer=True)
         receiver = SimpleNamespace(state_caches={}, local_metadata=SimpleNamespace(state_layout={}))
+        receiver.raise_if_unfenced_state_dma = Mock()
         receiver.add_requests = Mock(side_effect=lambda *args, **kwargs: trace.append("queue"))
         worker._recving_thread = receiver
         return worker, trace
@@ -150,6 +151,7 @@ class PublicationTests(unittest.TestCase):
         cls = methods("MooncakePullRecvingThread", {"_handle_state_requests"}, env)
         receiver = cls()
         receiver.tp_rank, receiver.tp_size = 0, 4
+        receiver.raise_if_unfenced_state_dma = Mock()
         receiver.engine, receiver.state_caches = sdk, {}
         receiver.encoder = SimpleNamespace(encode=lambda x: x)
         receiver.local_metadata = SimpleNamespace(state_layout={})

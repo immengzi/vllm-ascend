@@ -54,6 +54,14 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
 )
 
 
+class UnfencedStateTransferError(RuntimeError):
+    """The SDK returned without proving that state DMA is terminal.
+
+    This is an instance-fatal error, not an ordinary failed receive. Keep both
+    endpoints' allocations retained until the affected engine is retired.
+    """
+
+
 class MooncakePullRecvingThread(threading.Thread):
     """D-side execution thread for Mooncake pull requests.
 
@@ -147,6 +155,7 @@ class MooncakePullRecvingThread(threading.Thread):
         self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]] | None] = queue.Queue()
         self._shutdown_lock = threading.Lock()
         self._closing = False
+        self._unfenced_state_requests: dict[str, ReqMeta] = {}
         self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
         self.invalid_block_ids: set[int] = set()
         self.invalid_block_ids_lock = threading.Lock()
@@ -181,6 +190,9 @@ class MooncakePullRecvingThread(threading.Thread):
         self.join(timeout=timeout)
         if self.is_alive():
             raise TimeoutError("Mooncake pull receiver still has unfinished transfers; buffers remain retained")
+        # A joined Python thread does not drain work the SDK retained after a
+        # timeout. Do not drop cache/engine references or claim safe shutdown.
+        self.raise_if_unfenced_state_dma()
         self.executor.shutdown(wait=True)
         # A live daemon retaining the SDK until C++ static teardown can outlive
         # the NPU runtime. Release this thread's references after it has joined.
@@ -190,6 +202,7 @@ class MooncakePullRecvingThread(threading.Thread):
 
     def get_and_clear_finished_requests(self) -> KVConnectorTransferResults:
         """Drain completion and failure together for each finished request."""
+        self.raise_if_unfenced_state_dma()
         results = KVConnectorTransferResults()
         while True:
             try:
@@ -200,8 +213,32 @@ class MooncakePullRecvingThread(threading.Thread):
             if failed:
                 results.failed_recving.add(request_id)
 
+    def _quarantine_state_dma(self, request_id: str, metadata: ReqMeta) -> None:
+        with self._shutdown_lock:
+            self._unfenced_state_requests[request_id] = metadata
+            self._closing = True
+
+    def raise_if_unfenced_state_dma(self) -> None:
+        """Escalate on the model thread before publication or another step.
+
+        Without finished_recving, vLLM keeps WAITING_FOR_REMOTE_KVS blocks
+        retained on cancellation. P's acquired SourceLease also cannot expire
+        without aggregate DONE. Instance retirement, not retry or a timer, is
+        required because the synchronous SDK API exposes no drain handle.
+        """
+        if self.state_caches is None:
+            return
+        with self._shutdown_lock:
+            request_ids = tuple(self._unfenced_state_requests)
+        if request_ids:
+            raise UnfencedStateTransferError(
+                "State READ did not establish a terminal DMA fence; stop and retire this engine. "
+                f"No receive completion or source DONE may be published; requests={request_ids}"
+            )
+
     def get_and_clear_invalid_block_ids(self) -> set[int]:
         """Drain local block IDs affected by failed pull attempts."""
+        self.raise_if_unfenced_state_dma()
         with self.invalid_block_ids_lock:
             invalid_block_ids = self.invalid_block_ids
             self.invalid_block_ids = set()
@@ -242,9 +279,19 @@ class MooncakePullRecvingThread(threading.Thread):
                     exc,
                 )
             finally:
-                for request_id in requests:
-                    self.finished_requests.put((request_id, request_id in failed_request_ids))
+                with self._shutdown_lock:
+                    unfenced = bool(self._unfenced_state_requests)
+                    if unfenced:
+                        # Retain the whole accepted batch. Publishing even a
+                        # failed completion would let the scheduler reuse its
+                        # destinations and notify P while DMA may still run.
+                        self._unfenced_state_requests.update(requests)
+                if not unfenced:
+                    for request_id in requests:
+                        self.finished_requests.put((request_id, request_id in failed_request_ids))
                 self.request_queue.task_done()
+            if unfenced:
+                return
 
     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
         if not self.can_report_invalid_block_ids:
@@ -662,6 +709,7 @@ class MooncakePullRecvingThread(threading.Thread):
         remote = remote_metadata.metadata_by_pp_rank[0]
         failed = set()
         for request_id, meta in requests.items():
+            self.raise_if_unfenced_state_dma()
             try:
                 if meta.state_snapshot is None or not meta.state_consumer:
                     raise ValueError("State snapshot and consumer identity are required")
@@ -713,9 +761,16 @@ class MooncakePullRecvingThread(threading.Thread):
                 start = time.perf_counter()
                 # Mooncake READ's ABI is (session, local buffers, peer buffers,
                 # lengths). Remote sources must not be passed as local memory.
-                ret = self.engine.batch_transfer_sync_read(session_id, local_destinations, remote_sources, sizes)
-                if ret < 0:
-                    raise RuntimeError(f"State READ failed with status {ret}")
+                try:
+                    ret = self.engine.batch_transfer_sync_read(session_id, local_destinations, remote_sources, sizes)
+                except BaseException:
+                    # An exception after entering the SDK is equally unable to
+                    # prove that submitted work has terminated.
+                    self._quarantine_state_dma(request_id, meta)
+                    raise
+                if ret != 0:
+                    self._quarantine_state_dma(request_id, meta)
+                    raise UnfencedStateTransferError(f"State READ returned unfenced status {ret}")
                 logger.info(
                     "DSV4.1 state READ complete: request=%s transfer=%s boundary=%d rank=%d "
                     "ranges=%d bytes=%d elapsed_ms=%.3f; no D recompute",
@@ -1720,6 +1775,8 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         """Start the pull operations described by scheduler metadata."""
         if getattr(self, "_shutdown", False):
             raise RuntimeError("Mooncake pull worker is shutting down")
+        if self.kv_transfer_config.is_kv_consumer and self._recving_thread is not None:
+            self._recving_thread.raise_if_unfenced_state_dma()
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:

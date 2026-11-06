@@ -36,7 +36,12 @@ def compile_methods(path, class_name, names, env):
     cls.bases = []
     cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     code = ast.Module(
-        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls], type_ignores=[]
+        body=[
+            ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+            *[n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "UnfencedStateTransferError"],
+            cls,
+        ],
+        type_ignores=[],
     )
     exec(compile(ast.fix_missing_locations(code), str(path), "exec"), env)
     return env[class_name]
@@ -132,7 +137,9 @@ class ProtocolTests(unittest.TestCase):
     def test_actual_receive_shutdown_drains_inflight_before_releasing_references(self):
         path = ROOT / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py"
         env = {"threading": threading, "torch": SimpleNamespace(npu=SimpleNamespace(set_device=Mock()))}
-        cls = compile_methods(path, "MooncakePullRecvingThread", ["add_requests", "run", "shutdown"], env)
+        cls = compile_methods(
+            path, "MooncakePullRecvingThread", ["add_requests", "run", "shutdown", "raise_if_unfenced_state_dma"], env
+        )
 
         # Run the actual queue loop, replacing only DMA/device access.
         class Receiver(cls, threading.Thread):
@@ -146,6 +153,7 @@ class ProtocolTests(unittest.TestCase):
         receiver.finished_requests = queue.SimpleQueue()
         receiver._shutdown_lock = threading.Lock()
         receiver._closing = False
+        receiver._unfenced_state_requests = {}
         receiver.engine = object()
         receiver.executor = Mock()
         receiver.state_caches = {"registered": object()}
@@ -551,8 +559,13 @@ class ProtocolTests(unittest.TestCase):
                 "logger": Mock(),
             }
             receiver = compile_methods(
-                directory / "pull_worker.py", "MooncakePullRecvingThread", {"_handle_state_requests"}, wenv
+                directory / "pull_worker.py",
+                "MooncakePullRecvingThread",
+                {"_handle_state_requests", "raise_if_unfenced_state_dma", "_quarantine_state_dma"},
+                wenv,
             )()
+            receiver._shutdown_lock = threading.Lock()
+            receiver._unfenced_state_requests = {}
             receiver.local_metadata, receiver.tp_size, receiver.tp_rank = decoder.transfer_metadata, 4, 0
             receiver.encoder = SimpleNamespace(encode=lambda x: x)
             receiver.engine = SimpleNamespace(batch_transfer_sync_read=read)
@@ -589,11 +602,18 @@ class ProtocolTests(unittest.TestCase):
             # A failed data operation may not publish success or release a
             # source while another worker may still be reading it.
             self.assertNotIn(broken_snapshot.source_request_id, sender.finished_request_ids)
-            sender._state_control((protocol.STATE_DONE_MSG, broken_snapshot.transfer_id, "D/r"))
-            # Aggregate completion retires the source. The same descriptor
-            # cannot issue another READ after a destination slot is reused.
+            self.assertIs(receiver._unfenced_state_requests["partial"], broken)
+            with self.assertRaisesRegex(RuntimeError, "terminal DMA fence"):
+                receiver._handle_state_requests(remote, "test-host", 9000, {"r": meta})
+            # Only the earlier successful operation can be retired. Do not
+            # invent aggregate DONE for the SDK-timeout generation.
             sender._state_control((protocol.STATE_DONE_MSG, state.transfer_id, "D/r"))
-            self.assertEqual(receiver._handle_state_requests(remote, "test-host", 9000, {"r": meta}), {"r"})
+            replacement = type(receiver)()
+            vars(replacement).update(vars(receiver))
+            replacement._unfenced_state_requests = {}
+            replacement._closing = False
+            self.assertEqual(replacement._handle_state_requests(remote, "test-host", 9000, {"r": meta}), {"r"})
+            self.assertIn(broken_snapshot.transfer_id, sender.state_leases)
             self.assertEqual(len(submitted), 1)
 
     def test_wire_roundtrip_and_inconsistent_boundaries(self):
