@@ -14,6 +14,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
     build_copy_plan,
     cache_kind,
     decode_planes,
+    validate_ids,
     validate_pd_config,
 )
 
@@ -108,9 +109,14 @@ def transfer_addresses(
 
 def zero_state_destination(caches: dict[str, Any], local_ids: Any, layout: dict[str, Any]) -> None:
     """Clear only unused receiver ring contents before loading; never afterward."""
+    destinations = []
     for plane in decode_planes(layout):
         if plane.kind == "history":
             continue
+        destination = validate_ids(local_ids[plane.group], plane.capacity, 1, single=True)[0]
         values = caches[plane.name]
         tensor = values[plane.cache_index] if isinstance(values, (tuple, list)) else values
-        tensor[local_ids[plane.group][0]].zero_()
+        destinations.append(tensor[destination])
+    # Validate every state slot before submitting any reset kernel.
+    for destination in destinations:
+        destination.zero_()

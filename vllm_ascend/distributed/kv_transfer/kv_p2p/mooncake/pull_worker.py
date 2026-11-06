@@ -156,9 +156,13 @@ class MooncakePullRecvingThread(threading.Thread):
         self,
         remote_engine_id: str,
         requests: dict[str, ReqMeta],
+        *,
+        state_destination_ready: bool = False,
     ) -> None:
         """Queue requests for one remote engine."""
         if requests:
+            if any(meta.state_snapshot is not None for meta in requests.values()) and not state_destination_ready:
+                raise RuntimeError("State destinations must be ready before publishing a pull request")
             with self._shutdown_lock:
                 if self._closing:
                     raise RuntimeError("Mooncake pull receiver is shutting down")
@@ -701,11 +705,9 @@ class MooncakePullRecvingThread(threading.Thread):
                     )
                     if ensure_zmq_recv(sock, path) != b"ACK":
                         raise RuntimeError("Producer rejected expired, stale, or competing state snapshot")
-                assert self.state_caches is not None
-                assert self.local_metadata.state_layout is not None
-                zero_state_destination(self.state_caches, meta.local_full_block_ids, self.local_metadata.state_layout)
-                # Allocation/reset writes must complete before external DMA.
-                torch.npu.current_stream().synchronize()
+                # start_load_kv cleared the destinations and completed its
+                # bounded event before publishing this batch. Do not submit
+                # device work on a default stream shared with dummy/MoE here.
                 remote_tp = remote.metadata_by_pcp_rank[0].metadata_by_tp_rank[self.tp_rank]
                 session_id = f"{remote_tp.local_ip}:{remote_tp.te_rpc_port}"
                 start = time.perf_counter()
@@ -1722,13 +1724,32 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             return
         if self.kv_transfer_config.is_kv_consumer:
             assert self._recving_thread is not None
+            state_requests = [meta for meta in metadata.requests.values() if meta.state_snapshot is not None]
+            if state_requests:
+                assert self._recving_thread.state_caches is not None
+                assert self._recving_thread.local_metadata.state_layout is not None
+                # This runs on the model execution thread before any following
+                # dummy/forward work. Keep reset writes out of the receiver;
+                # wait only for this event, not an open-ended shared stream.
+                for meta in state_requests:
+                    zero_state_destination(
+                        self._recving_thread.state_caches,
+                        meta.local_full_block_ids,
+                        self._recving_thread.local_metadata.state_layout,
+                    )
+                destination_ready = torch.npu.Event()
+                destination_ready.record(torch.npu.current_stream())
+                destination_ready.synchronize()
             request_groups: dict[str, dict[str, ReqMeta]] = {}
             for request_id, request_metadata in metadata.requests.items():
                 requests = request_groups.setdefault(request_metadata.remote_engine_id, {})
                 requests[request_id] = request_metadata
 
             for remote_engine_id, requests in request_groups.items():
-                self._recving_thread.add_requests(remote_engine_id, requests)
+                if state_requests:
+                    self._recving_thread.add_requests(remote_engine_id, requests, state_destination_ready=True)
+                else:
+                    self._recving_thread.add_requests(remote_engine_id, requests)
 
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Return completed receives, including their failure status."""

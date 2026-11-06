@@ -162,7 +162,7 @@ class ProtocolTests(unittest.TestCase):
         receiver.start()
         try:
             self.assertTrue(receiver.ready_event.wait(1))
-            req = SimpleNamespace(remote_host="source", remote_port=1)
+            req = SimpleNamespace(remote_host="source", remote_port=1, state_snapshot=None)
             receiver.add_requests("peer", {"r": req})
             self.assertTrue(started.wait(1))
             with self.assertRaises(TimeoutError):
@@ -557,6 +557,11 @@ class ProtocolTests(unittest.TestCase):
             receiver.encoder = SimpleNamespace(encode=lambda x: x)
             receiver.engine = SimpleNamespace(batch_transfer_sync_read=read)
             receiver.state_caches = decoder.kv_caches
+            # The execution thread now prepares destinations before enqueue;
+            # this test invokes the receiver directly after that preparation.
+            adapter.zero_state_destination(
+                decoder.kv_caches, meta.local_full_block_ids, decoder.transfer_metadata.state_layout
+            )
             self.assertEqual(receiver._handle_state_requests(remote, "test-host", 9000, {"r": meta}), set())
             self.assertEqual(len(submitted), 1)
             self.assertGreater(sum(submitted[0][2]), 0)
@@ -566,7 +571,7 @@ class ProtocolTests(unittest.TestCase):
             ring = decoder.kv_caches["m.swa_cache"]
             ring_data = memory[ring.base]
             self.assertEqual(ring_data[:1024], bytes([37]) * 1024)
-            stream.synchronize.assert_called_once()
+            stream.synchronize.assert_not_called()
             broken = copy.copy(meta)
             broken.state_snapshot = {
                 **state.to_wire(),
