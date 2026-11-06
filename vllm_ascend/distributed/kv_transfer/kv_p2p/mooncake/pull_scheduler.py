@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 ACK_MSG = b"ACK"
+STATE_RECEIVE_COMPLETION_HISTORY_SIZE = 16000
 
 
 class MooncakeSchedulerSendingThread(threading.Thread):
@@ -591,6 +592,11 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_in_batch: set[str] = set()
         # D request -> (P scheduler host, port, P request id).
         self._reqs_recv_info: dict[str, tuple] = {}
+        # A frontend ErrorResponse may also submit an abort_immediately
+        # request using its external HTTP id. Once worker aggregation has
+        # queued completion, that queue owns notification and transport retry.
+        # Retain only bounded generation/peer history, never resource handles.
+        self._state_receive_completions: OrderedDict[tuple[str, int, str], None] = OrderedDict()
         self._sending_thread: MooncakeSchedulerSendingThread | None = None
         self._recving_thread: MooncakeSchedulerRecvingThread | None = None
 
@@ -756,6 +762,14 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 # these destinations, so release the unconsumed P generation.
                 snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
                 assert self._recving_thread is not None
+                completion_key = (params["remote_host"], params["remote_port"], snapshot.transfer_id)
+                if getattr(request, "abort_immediately", False) and completion_key in self._state_receive_completions:
+                    # This is the frontend's synthetic cleanup after a real
+                    # admitted receive, not a new consumer of the generation.
+                    # Do not send a second DONE with an invented external-id
+                    # owner. The aggregate queue still owns ACK/retry/reject.
+                    params["do_remote_prefill"] = False
+                    return False, None
                 consumer = params.get("dsv41_state_consumer", f"{self.engine_id}/{request.request_id}")
                 self._recving_thread.add_request(
                     params["remote_host"],
@@ -824,6 +838,12 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 if self._recving_thread is None:
                     raise RuntimeError("Producer Mooncake scheduler received a receive-completion event")
                 self._recving_thread.add_request(*remote)
+                if self.state_mode:
+                    completion_key = (remote[0], remote[1], remote[3])
+                    self._state_receive_completions[completion_key] = None
+                    self._state_receive_completions.move_to_end(completion_key)
+                    while len(self._state_receive_completions) > STATE_RECEIVE_COMPLETION_HISTORY_SIZE:
+                        self._state_receive_completions.popitem(last=False)
                 if req_id in connector_output.failed_recving:
                     logger.error(
                         "Mooncake D receive failed after worker aggregation: request_id=%s, "
