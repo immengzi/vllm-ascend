@@ -15,6 +15,8 @@ WINDOW_ROWS = 128
 COMPRESSOR_ROWS = 32
 STATE_ACQUIRE_MSG = b"dsv41_state_acquire_v1"
 STATE_DONE_MSG = b"dsv41_state_done_v1"
+# Bound newly combined descriptors; this is not a claimed SDK maximum.
+MAX_COALESCED_RANGE_BYTES = 16 * 1024 * 1024
 
 
 def cache_kind(name: str) -> str:
@@ -233,6 +235,45 @@ class CopyRange:
     source_offset: int
     destination_offset: int
     nbytes: int
+
+
+def coalesce_copy_ranges(
+    ranges: tuple[CopyRange, ...], max_range_bytes: int = MAX_COALESCED_RANGE_BYTES
+) -> tuple[CopyRange, ...]:
+    """Combine byte-adjacent mappings within one request and registered plane.
+
+    Both source and destination must be contiguous in the same direction.
+    Descending block allocation is common, so contiguous reverse runs are
+    supported too. Never sort, bridge padding, or enlarge the byte coverage.
+    Existing descriptors larger than the cap are retained without expansion.
+    """
+    if max_range_bytes <= 0:
+        raise ValueError("Coalesced range limit must be positive")
+    result: list[CopyRange] = []
+    for current in ranges:
+        if current.nbytes <= 0 or min(current.source_offset, current.destination_offset) < 0:
+            raise ValueError("Invalid copy range")
+        if result:
+            previous = result[-1]
+            size = previous.nbytes + current.nbytes
+            same_plane = (previous.name, previous.cache_index) == (current.name, current.cache_index)
+            if same_plane and size <= max_range_bytes:
+                forward = (
+                    previous.source_offset + previous.nbytes == current.source_offset
+                    and previous.destination_offset + previous.nbytes == current.destination_offset
+                )
+                reverse = (
+                    current.source_offset + current.nbytes == previous.source_offset
+                    and current.destination_offset + current.nbytes == previous.destination_offset
+                )
+                if forward or reverse:
+                    first = previous if forward else current
+                    result[-1] = CopyRange(
+                        first.name, first.cache_index, first.source_offset, first.destination_offset, size
+                    )
+                    continue
+        result.append(current)
+    return tuple(result)
 
 
 def validate_ids(ids: Any, capacity: int, required: int, *, single: bool = False) -> tuple[int, ...]:

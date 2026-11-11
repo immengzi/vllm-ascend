@@ -13,6 +13,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
     StateSnapshot,
     build_copy_plan,
     cache_kind,
+    coalesce_copy_ranges,
     decode_planes,
     validate_ids,
     validate_pd_config,
@@ -91,7 +92,9 @@ def transfer_addresses(
     snapshot: StateSnapshot, local: Any, remote: Any, rank: int, local_ids: Any, remote_ids: Any
 ) -> tuple[list[int], list[int], list[int]]:
     """Build all addresses first; caller submits one synchronous Mooncake READ."""
-    plan = build_copy_plan(snapshot, local.state_layout, remote.state_layout, local_ids, remote_ids)
+    plan = coalesce_copy_ranges(
+        build_copy_plan(snapshot, local.state_layout, remote.state_layout, local_ids, remote_ids)
+    )
     remote_tp = remote.metadata_by_pcp_rank[0].metadata_by_tp_rank[rank]
     local_indices = {n: i for i, n in enumerate(local.layer_names)}
     remote_indices = {n: i for i, n in enumerate(remote.layer_names)}
