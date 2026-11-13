@@ -74,12 +74,21 @@ at least 100 requests per round and a stable measurement interval.
 - `models/deepseek_v41/cache_config.py`: model geometry and memory budget.
 - `core/kv_cache_interface.py`: declared pool capacities and cache-group ownership.
 - `core/request_state_manager.py`: pool creation, joint admission and rollback.
-- `models/deepseek_v41/request_state.py`: window metadata and attention execution.
+- `models/deepseek_v41/window_state.py`: typed window metadata and runner-owned staging.
+- `models/deepseek_v41/request_state.py`: window assembly, attention and state commit.
 - `models/deepseek_v41/state_kernels.py`: window assembly and state updates.
 
 P/D adds transfer ownership and device synchronization to this local allocation
 contract; see the [P/D design](../../docs/source/developer_guide/Design_Documents/dsv41_state_pd.md).
 Local pool tests do not establish cross-machine transfer or numerical correctness.
+
+Model runner V1 binds one staging workspace to all request-window layers before
+warmup and graph capture. Sequential layers reuse that workspace; separate runners
+own separate allocations. The workspace is not resized or freed per request.
+Decode metadata buffers retain their addresses while their contents change.
+Context-parallel metadata copies retain the typed window state and the global KV
+owner. Device graph replay and stream ordering still require hardware validation
+after changes to these ownership boundaries.
 
 The other diagnostic scripts and `tested-source.json` in this directory describe
 historical experiments. Some require the old container mount layout or historical

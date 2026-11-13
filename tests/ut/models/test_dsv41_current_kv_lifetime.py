@@ -84,7 +84,7 @@ class TestCurrentKVLifetime(unittest.TestCase):
         node = next(
             n
             for n in ast.walk(ast.parse(source.read_text()))
-            if isinstance(n, ast.FunctionDef) and n.name == "update_only"
+            if isinstance(n, ast.FunctionDef) and n.name == "commit_request_window"
         )
         # Supply the real wrapper's kernel import as a CPU spy. LayerMetadata
         # exposes query bounds through swa, never on the outer bundle.
@@ -99,15 +99,19 @@ class TestCurrentKVLifetime(unittest.TestCase):
                 _request_state_current_kv=value,
                 dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(kv_cache=["ring"])),
             )
-            swa = SimpleNamespace(state_ids="ids", query_start_loc="qstart", seq_lens="seq", max_query_len=query)
+            swa = SimpleNamespace(
+                request_state=SimpleNamespace(state_ids="ids"),
+                query_start_loc="qstart",
+                seq_lens="seq",
+                max_query_len=query,
+            )
             scope = {
-                "original_update": lambda *a, sink=calls: sink.append("project"),
                 "commit": lambda *a, sink=calls: sink.append(a),
                 "_release_current_kv": lambda a, v, *, prefill, sink=calls: sink.append((v, prefill)),
             }
             exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
-            scope["update_only"](object(), attn, SimpleNamespace(shape=(1,)), SimpleNamespace(swa=swa))
-            self.assertEqual(calls, ["project", ("ring", "current", "ids", "qstart", "seq"), ("current", query > 1)])
+            scope["commit_request_window"](attn, SimpleNamespace(swa=swa))
+            self.assertEqual(calls, [("ring", "current", "ids", "qstart", "seq"), ("current", query > 1)])
 
     def test_failed_dependency_retains_tensor_and_producer(self):
         calls = self.run_case(fail=True)

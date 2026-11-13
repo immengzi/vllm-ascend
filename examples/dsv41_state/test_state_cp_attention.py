@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from vllm_ascend.models.deepseek_v41.state_kernels import assemble_cp
+from vllm_ascend.models.deepseek_v41.window_state import RequestWindowMetadata
 from vllm_ascend.utils import bootstrap_custom_op_env, enable_custom_op
 
 
@@ -92,7 +93,15 @@ sample = AscendDSAV41Metadata(
     compress_ratio=0,
     storage_block_size=128,
     is_compressor_state=False,
-    request_state={"state_ids": "contract-preserved"},
+    request_state=RequestWindowMetadata(
+        state_ids=torch.zeros(1, dtype=torch.int32),
+        row_starts=torch.zeros(1, dtype=torch.int32),
+        lengths=torch.ones(1, dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        rows_used=128,
+        max_seq_len=1,
+        capacity=128,
+    ),
 )
 assert replace(sample, cp_token_range=(0, 1, 1, 1)).request_state is sample.request_state
 results = []

@@ -4633,6 +4633,15 @@ class NPUModelRunner(GPUModelRunner):
             kernel_block_sizes=kernel_block_sizes,
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
+        # One runner-owned window workspace is shared by sequential layers.
+        # Bind before warmup/capture and outside discardable KV backing memory.
+        from vllm_ascend.models.deepseek_v41.window_state import bind_window_staging_workspace
+
+        self.request_state_workspace = bind_window_staging_workspace(
+            kv_cache_config,
+            self.compilation_config.static_forward_context,
+            getattr(self, "request_state_workspace", None),
+        )
         # Cache layouts are final and bound now; prepare on disposable
         # scratch storage before any warmup forward, graph capture or request.
         from vllm_ascend.ops.kda_state_copy_plan import initialize_kda_state_copy

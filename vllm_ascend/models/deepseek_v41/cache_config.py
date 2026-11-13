@@ -264,6 +264,11 @@ def history_bytes(groups):
     )
 
 
+def get_window_staging_rows(max_tokens: int, max_requests: int) -> int:
+    """Keep the planner and metadata builder on the same window allowance."""
+    return ((max_tokens + max_requests * (2 * WINDOW) + WINDOW - 1) // WINDOW) * WINDOW
+
+
 def get_deepseek_v41_kv_cache_config(
     vllm_config: VllmConfig, groups: list[KVCacheGroupSpec], available_memory: int
 ) -> AscendKVCacheConfig:
@@ -292,7 +297,7 @@ def get_deepseek_v41_kv_cache_config(
         if isinstance(spec, (RequestWindowSpec, CircularBufferSpec))
     )
     # One shared, main-stream SWA staging arena plus metadata allowance.
-    staging_rows = ((batch + maximum * 256 + 127) // 128) * 128
+    staging_rows = get_window_staging_rows(batch, maximum)
     staging = staging_rows * ROW_BYTES + 2**20
     usable = available_memory - fixed - staging
     assert usable > page
