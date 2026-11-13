@@ -71,6 +71,10 @@ at least 100 requests per round and a stable measurement interval.
 
 ## Code and validation boundaries
 
+The [pool design and validation status](../../docs/source/developer_guide/Design_Documents/request_state_pools.md)
+describes the current explicit interfaces, full-budget rank planning and
+remaining hardware gates.
+
 - `models/deepseek_v41/cache_config.py`: model geometry and memory budget.
 - `core/kv_cache_interface.py`: declared pool capacities and cache-group ownership.
 - `core/request_state_manager.py`: pool creation, joint admission and rollback.
