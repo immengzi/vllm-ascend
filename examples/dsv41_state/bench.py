@@ -1,4 +1,4 @@
-"""Official benchmark wrapper; CLI compatibility, telemetry and failure gates."""
+"""Benchmark wrapper for the pinned runtime, with explicit artifact paths."""
 
 import argparse
 import json
@@ -40,11 +40,11 @@ def command(config, case, seed, output_dir, filename):
         "--endpoint",
         "/v1/completions",
         "--model",
-        "/model",
+        config["model"],
         "--served-model-name",
-        "dsv41",
+        config.get("served_model_name", "dsv41"),
         "--tokenizer",
-        "/model",
+        config.get("tokenizer", config["model"]),
         "--dataset-name",
         "random",
         "--random-input-len",
@@ -236,12 +236,14 @@ def run_one(config, case, seed, directory, filename, deadline):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--results-dir", type=Path, required=True)
     parser.add_argument("--suite", choices=["core", "diagnostic"], default="core")
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    config = json.loads(Path("/results/config.json").read_text())
-    directory = Path(os.environ["MENGZI_RESULTS_DIR"]) / args.suite
-    directory.mkdir(exist_ok=True)
+    config = json.loads(args.config.read_text())
+    directory = args.results_dir / args.suite
+    directory.mkdir(parents=True, exist_ok=True)
     from datetime import datetime
 
     deadline = datetime.fromisoformat(config["deadline"]).timestamp()

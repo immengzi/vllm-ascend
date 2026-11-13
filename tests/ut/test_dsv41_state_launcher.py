@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Standalone launcher regression; no model, server or accelerator is started."""
+"""Standalone CLI checks; no model, server or accelerator is started."""
 
-import ast
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -10,69 +12,89 @@ from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location("dsv41_state_launcher", ROOT / "examples/dsv41_state/launch.py")
-assert SPEC is not None and SPEC.loader is not None
-launcher = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(launcher)
+
+
+def load_example(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / f"examples/dsv41_state/{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+launcher = load_example("launch")
+benchmark = load_example("bench")
 
 
 class TestStateLauncher(unittest.TestCase):
-    def test_default_and_explicit_window_protocol(self):
-        for requested, expected in [(None, "0"), ("0", "0")]:
-            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as tmp:
-                environment = {} if requested is None else {"MENGZI_STATE_DECODE_DIRECT": requested}
-                args = ["launch.py", "--results-dir", tmp, "--", "/model", "--tensor-parallel-size", "4"]
-                with (
-                    patch.dict(os.environ, environment, clear=True),
-                    patch("sys.argv", args),
-                    patch.object(launcher.subprocess, "call", return_value=0) as call,
-                ):
-                    with self.assertRaises(SystemExit) as result:
-                        launcher.main()
-                    self.assertEqual(result.exception.code, 0)
-                    self.assertEqual(call.call_args.args[0], ["vllm", "serve", "/model", "--tensor-parallel-size", "4"])
-                    self.assertEqual(call.call_args.kwargs["env"]["MENGZI_STATE_DECODE_DIRECT"], expected)
-                    self.assertEqual(os.environ.get("MENGZI_STATE_DECODE_DIRECT"), requested)
+    def test_launch_forwards_arguments_and_preserves_environment(self):
+        environment = {"PATH": "/bin", "PYTHONPATH": "/installed", "VLLM_USE_V2_MODEL_RUNNER": "1"}
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("sys.argv", ["launch.py", "--", "/weights", "--tensor-parallel-size", "4"]),
+            patch.object(launcher.subprocess, "call", return_value=7) as call,
+        ):
+            with self.assertRaises(SystemExit) as result:
+                launcher.main()
+            self.assertEqual(result.exception.code, 7)
+            self.assertEqual(call.call_args.args[0], ["vllm", "serve", "/weights", "--tensor-parallel-size", "4"])
+            self.assertEqual(call.call_args.kwargs["env"], {**environment, "VLLM_USE_V2_MODEL_RUNNER": "0"})
+            self.assertEqual(dict(os.environ), environment)
 
-    def test_rejects_unqualified_direct_ring_before_launch(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            args = ["launch.py", "--results-dir", tmp, "--", "/model"]
-            with (
-                patch.dict(os.environ, {"MENGZI_STATE_DECODE_DIRECT": "1"}, clear=True),
-                patch("sys.argv", args),
-                patch.object(launcher.subprocess, "call") as call,
-            ):
-                with self.assertRaises(SystemExit) as result:
-                    launcher.main()
-                self.assertEqual(result.exception.code, 2)
-                call.assert_not_called()
+    def test_missing_server_arguments_does_not_launch(self):
+        with patch("sys.argv", ["launch.py"]), patch.object(launcher.subprocess, "call") as call:
+            with self.assertRaises(SystemExit) as result:
+                launcher.main()
+            self.assertEqual(result.exception.code, 2)
+            call.assert_not_called()
 
-    def test_runtime_also_rejects_direct_ring_without_launcher(self):
-        source = ROOT / "vllm_ascend/models/deepseek_v41/request_state.py"
-        module = ast.parse(source.read_text())
-        # Execute the actual module-level mode selection/guard without importing
-        # torch or vLLM. This verifies the bypass-launcher contract on CPU only.
-        nodes = [
-            node
-            for node in module.body
-            if (
-                isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id == "_direct_decode" for target in node.targets)
+    def test_benchmark_plan_uses_explicit_paths_without_starting_server(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            config = directory / "config.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "port": 8000,
+                        "model": "/weights",
+                        "tokenizer": "/tokenizer",
+                        "served_model_name": "example-model",
+                        "repeats": 1,
+                        "pressure_repeats": 2,
+                        "deadline": "2030-01-01T00:00:00+08:00",
+                    }
+                )
             )
-            or (isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "_direct_decode")
-        ]
-        selection = compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec")
-        for requested in [None, "0", "1"]:
-            with self.subTest(requested=requested):
-                environment = {} if requested is None else {"MENGZI_STATE_DECODE_DIRECT": requested}
-                with patch.dict(os.environ, environment, clear=True):
-                    scope = {"os": os}
-                    if requested == "1":
-                        with self.assertRaisesRegex(ValueError, "failed strict numerical equivalence"):
-                            exec(selection, scope)
-                    else:
-                        exec(selection, scope)
-                        self.assertFalse(scope["_direct_decode"])
+            output = directory / "nested/results"
+            printed = io.StringIO()
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "bench.py",
+                        "--config",
+                        str(config),
+                        "--results-dir",
+                        str(output),
+                        "--suite",
+                        "diagnostic",
+                        "--plan-only",
+                    ],
+                ),
+                patch.object(benchmark, "run_one") as run,
+                patch.object(benchmark.subprocess, "check_output") as command,
+                contextlib.redirect_stdout(printed),
+            ):
+                benchmark.main()
+            jobs = json.loads(printed.getvalue())
+            self.assertEqual(len(jobs), 4)
+            for job in jobs:
+                self.assertEqual(job[job.index("--result-dir") + 1], str(output / "diagnostic"))
+                self.assertEqual(job[job.index("--model") + 1], "/weights")
+                self.assertEqual(job[job.index("--tokenizer") + 1], "/tokenizer")
+                self.assertEqual(job[job.index("--served-model-name") + 1], "example-model")
+            run.assert_not_called()
+            command.assert_not_called()
 
 
 if __name__ == "__main__":

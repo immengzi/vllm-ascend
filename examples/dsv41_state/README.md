@@ -1,81 +1,27 @@
-# DeepSeek V4.1 历史/请求状态分离与 PD 调试
+# DeepSeek V4.1 history and request-state caches
 
-原始 PD 实现保留在 `feat/dsv41-state-pd-mooncake`，父分支是
-[`feat/dsv41-history-request-state`](https://github.com/immengzi/vllm-ascend/tree/feat/dsv41-history-request-state)。
-父提交 `f77bee84a5299c2e62d749409a29352aaf7e48b9` 保存当时已测源码，不含后续数值修补。
-当前调试入口为 `fix/dsv41-padding-state-guard`（非 PD）和
-`fix/dsv41-pd-padding-state-guard`（PD）；分别保留各自既有调用链，不合并两条入口。
-两个入口均包含 Engram 请求历史、图元数据、直接环拒绝、Prefill 临时 KV 流生命周期和
-图补齐行无效访问保护。PD 入口另保留 `69bac74` 的 Mooncake READ 地址顺序及接收线程排空修补。
+This prototype separates token-growing history from fixed SWA and compressor
+state. The scheduler reserves one slot per request in each state pool. The
+remaining cache budget supplies history pages. Decode assembles the window in
+chronological order before attention.
 
-11 月 3 日发现：query 长度为 1、序列长度为 0 的图补齐行，在旧状态提交 kernel 中
-会向窗口视图前方写一行。此缺陷已用实际 NPU 保护区复现，属于访问边界问题；
-此前特定输出/状态样例通过，不代表旧入口没有该缺陷。
-修补运行时 `09929c3` 已通过 CPU 回归和实际单卡保护区、窗口 Attention 图测试；
-`d298d94` 仅增加图尺寸测试案例。PD 的共同 kernel 与非 PD 修补逐字相同，
-这不代表完整模型 PD 已通过。
+The current integration targets vLLM
+`ced6857afa0ea7b2e3f0846a62e1394e90f15607` and model runner V1. These commands are
+configuration examples, not validation results for a new checkout or runtime.
+Prefix caching, speculative decoding and pipeline parallelism are outside the
+supported scope. Model runner V2 requires separate integration and validation.
 
-非 PD 补充对照固定 Flash1017 W8A8、TP4/DP4/EP16、异步与生成图、内部 DSA CP。
-同 24 条 100K 输入各生成 1536 token：匹配完整 CPU 调度历史后，状态版两次共 48 条
-自然 token IDs 均与原生一致；原生在同一服务、固定预算内切换两种 Prefill 历史，
-各重复两次的 96 条输出也分别复现两版已有输出。相同稳态 Decode 批次不能代替完整
-Prefill/Decode 历史相同；这组差异属于可复现的执行历史敏感性，未用浮点容差放过。
-调度预算重放仅用于诊断，生产实现继续使用自己的联合准入。以上是指定输入的自然输出
-与 CPU 轨迹证据，不是所有 worker 输入、原始 logits、任意负载或完整模型 PD 的证明。
-099 运行时另在完整模型通过 886 项门禁：实际批次 1/2 的原始 logits、有效状态、
-层输出，以及 49 条长短请求、4 次取消和两波共 392 请求的状态槽工作负载，
-四个 DP 的三个池返回空闲。392 是请求数，不是独立复用事件数。
-这些指定条件的通过与上述自然输出历史诊断分开记录，不能扩展为任意批次不变性。
-干净性能需使用自己的结果，不迁移旧分支的性能数字。
+## Start a colocated service
 
-此前 `fix/dsv41-prefill-stream-lifetime`、`fix/dsv41-pd-prefill-lifetime`，以及更早的
-runtime-validation/staging-only 分支作为历史复现入口保留，不再将其称为当前完整正确版本。
-原已测源码、原 PD 实现和实验数据不覆盖。完整模型、性能和 PD 验收均需依据精确版本的
-独立证据；离线协议、单卡组件或非 PD 数值检查不能代替真实 DMA 与完整模型 PD 验收。
-
-固定依赖：vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607`，
-Ascend 基线 `8fde6d4e335fe300e2b949aab0e31659cce0811d`，
-原镜像 ID `sha256:ce42d65b2403992ad2e2b06c61f4f048babb57e455cfe307b018345e36c5e98b`。
-不要求为了这次调试升级主线或重编译原有算子。
-
-## 先做离线检查
+Use an isolated environment with the matching Ascend runtime and install this
+checkout. Set the model path and parallelism for the available hardware. The
+launcher selects model runner V1 and forwards arguments to `vllm serve`; it does
+not modify `PYTHONPATH` or write diagnostic artifacts.
 
 ```bash
-python3 examples/dsv41_state/check_preserved_source.py
-python3 tests/ut/distributed/kv_transfer/kv_p2p/test_dsv41_state_protocol.py
-```
-
-第一个命令在 PD 分支校验父提交的六个归档文件，需要 Git 中保留该父提交；
-不会把当前 PD 实现标为“已测”。第二个命令只需标准 Python，直接检查当前协议及接入方法。
-固定镜像内还可执行 `python3 tests/ut/distributed/kv_transfer/kv_p2p/test_dsv41_state_wire.py`，
-使用 `msgspec==0.22.0` 验证 3 项真实消息编解码。该测试无需 torch/NPU。
-运行时代码已移入 `vllm_ascend/models/deepseek_v41/request_state.py` 和 `state_kernels.py`，
-examples 中不再保留第二套执行模块。当前 planner 只使用框架/CLI 的预算。
-
-## 在新环境调试
-
-在新建的、与固定镜像匹配的隔离容器中检出此分支；不要覆盖正在服务的安装。
-确认 Python 实际导入此 checkout，并保留镜像自身的 CANN/Python/HCCL 环境。
-launcher 会设置 MRV1 和可写审计目录。当前交付仅支持时间顺序 staging
-（`MENGZI_STATE_DECODE_DIRECT=0`）。物理直接环未通过相同执行历史下的严格数值门禁，
-设置为 `1` 时 launcher 和运行模块都会明确报错，防止绕过 launcher 误启。
-这修复了未通过路径仍可被误用的边界，没有修复直接环的算子数值差异。
-原始源码与失败证据仍保留；直接环需要新的数值验收后才能重新启用。
-状态分离和环形存储仍保留，不能仅根据存储布局相同推断计算结果一致。
-首次对照使用 `HCCL_DETERMINISTIC=strict`、`LCCL_DETERMINISTIC=1`；
-这些设置不保证模型跨不同实际 batch 逐位一致，数值对照必须记录并控制实际 batch 和已处理 token 边界。
-
-```bash
-export HCCL_DETERMINISTIC=strict
-export LCCL_DETERMINISTIC=1
-export MENGZI_STATE_DECODE_DIRECT=0
-```
-
-启动示例：
-
-```bash
-python3 examples/dsv41_state/launch.py --results-dir /results/state -- \
+python3 examples/dsv41_state/launch.py -- \
   /path/to/DeepSeek-V4.1-Flash-W8A8 \
+  --served-model-name dsv41 \
   --tensor-parallel-size 4 --data-parallel-size 3 --enable-expert-parallel \
   --block-size 128 --kv-cache-memory-bytes 3576615936 \
   --max-num-seqs 48 --max-num-batched-tokens 8192 --max-model-len 150000 \
@@ -83,46 +29,59 @@ python3 examples/dsv41_state/launch.py --results-dir /results/state -- \
   --tokenizer-mode deepseek_v41 --reasoning-parser deepseek_v41 \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --engram-config '{"cpu_offload":true,"dp_shared_memory":true}' \
-  --additional-config '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false},"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_dsa_cp":true,"enable_flashcomm1":true,"enable_shared_expert_dp":true}' \
-  --kv-transfer-config '{"kv_connector":"MooncakePullConnector","kv_role":"kv_producer","kv_port":14500,"kv_load_failure_policy":"fail","kv_connector_extra_config":{"dsv41_state_pd":true,"state_model_id":"REPLACE_WITH_IDENTICAL_WEIGHT_MANIFEST_SHA"}}'
+  --additional-config '{"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":false},"enable_cpu_binding":true,"enable_fused_mc2":1,"enable_dsa_cp":true,"enable_flashcomm1":true,"enable_shared_expert_dp":true}'
 ```
 
-这是服务参数示例，尚未运行 PD。D 端使用相同模型、精度、布局和 TP，
-改 `kv_role` 为 `kv_consumer`，使用自身未占用的端口及结果目录。
-`state_model_id` 必须由双方设置成相同的真实权重身份；配置相同不能证明权重相同。
-复用仓库 `examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py` 的 V2 pull 代理，
-它转发交接 metadata，保留原始 D prompt，并丢弃 P 的占位采样结果。
-不要使用 layerwise 代理、AscendStore 或旧 V1 connector。
+`--kv-cache-memory-bytes` specifies the per-worker cache budget.
+`--max-num-seqs` determines the request-state reservation. Increasing it reserves
+more state memory and leaves fewer bytes for history. The three pools have fixed
+capacities and do not borrow memory from one another. The chronological staging
+workspace is included in planning; it is not a fourth request resource pool.
 
-先用同一 PD 分支、不带 `--kv-transfer-config` 的服务建立非 PD 数值对照。
-第一组优先使用本轮完整集成非 PD 已加载的每侧 TP4/DP4/EP16，两侧合计 32 张卡。
-前面 12 卡参数例子保留供历史配置对照；历史 TP4/DP3/EP12 的显存结果不能代替新版本在新环境的装载检查。
-更小拓扑或两份完整模型能否共存须重新验证，不能仅按卡数推定。设备、网络、时间窗应由新环境所有者自行确认。
+## Benchmark artifacts
 
-## 必须看到的证据
-
-- 真实 source/destination ID 不同，注册的历史容量与状态容量可不同。
-- 每个接收 rank 有 `DSV4.1 state READ complete`，记录 transfer、边界、字节、范围和耗时。
-- `kv_load_failure_policy=fail`，收到完整 READ 完成后才允许首次 D forward；不得回退重算 prompt。
-- N 为原始 prompt 长度。交接 T=N−1 的状态，D 处理最后一个 prompt token 后产生第一个真实输出。
-- 对照首步和连续 Decode 的输出及窗口、索引、压缩状态；HTTP 200 不能替代这些检查。
-- 比较 127/128/129 步和更长续算，覆盖窗口环和压缩状态边界；含探针服务不能用于正式性能。
-- 取消、部分失败、超时和复用期间，不得提前回收任何一端的在途资源。
-
-`test_state_kernels.py`、`test_state_cp_attention.py`、`test_state_graph_replay.py` 需要 NPU。
-Engram 交接历史的单卡组件检查可运行：
+The optional `bench.py` wrapper requires explicit configuration and output paths:
 
 ```bash
-python3 tests/e2e/pull_request/one_card/aclgraph/test_dsv41_pd_engram_history.py
+python3 examples/dsv41_state/bench.py \
+  --config /path/to/benchmark.json --results-dir /path/to/results \
+  --suite core --plan-only
 ```
 
-它调用实际 MRV1 prompt-lookback 方法和 hash kernel，比较本地连续执行与接收端新环；
-覆盖不同本地状态 ID、短长边界、DEAD 标记及 151 步续算，使用合成 hash 参数，不执行 connector 或 DMA。
-该恢复方式要求 T=N−1、D 保留与 P 对应的完整原 prompt；初始 D 环里的旧 prompt 部分无效，
-后续未知生成位置只读取 D 已写入的环。不能据此支持在 P 生成若干 token 后再交接。
+The configuration contains `port`, `model`, `served_model_name`, `repeats`,
+`pressure_repeats`, and a timezone-qualified `deadline`. `tokenizer` defaults to
+`model`; `served_model_name` defaults to `dsv41`. For example:
 
-历史生命周期客户端要求 `/model`、`/results/config.json` 和 `/results/state` 布局，
-应使用新的截止时间配置，不能复用旧实验目录。
+```json
+{
+  "port": 8000,
+  "model": "/path/to/DeepSeek-V4.1-Flash-W8A8",
+  "served_model_name": "dsv41",
+  "repeats": 2,
+  "pressure_repeats": 2,
+  "deadline": "2030-01-01T09:00:00+08:00"
+}
+```
 
-完整的交接流程、兼容边界、异常处理和硬件验证门禁见
-[PD 适配设计](../../docs/source/developer_guide/Design_Documents/dsv41_state_pd.md)。
+Replace the example deadline with the authorized test deadline. `--plan-only`
+prints benchmark commands without contacting a server. Remove it to run against
+an already running local service. Existing result files are not overwritten.
+Short diagnostic cases are not throughput qualification; formal comparisons need
+at least 100 requests per round and a stable measurement interval.
+
+## Code and validation boundaries
+
+- `models/deepseek_v41/cache_config.py`: model geometry and memory budget.
+- `core/kv_cache_interface.py`: declared pool capacities and cache-group ownership.
+- `core/request_state_manager.py`: pool creation, joint admission and rollback.
+- `models/deepseek_v41/request_state.py`: window metadata and attention execution.
+- `models/deepseek_v41/state_kernels.py`: window assembly and state updates.
+
+P/D adds transfer ownership and device synchronization to this local allocation
+contract; see the [P/D design](../../docs/source/developer_guide/Design_Documents/dsv41_state_pd.md).
+Local pool tests do not establish cross-machine transfer or numerical correctness.
+
+The other diagnostic scripts and `tested-source.json` in this directory describe
+historical experiments. Some require the old container mount layout or historical
+Git objects. They are not a portable acceptance suite for the refactored runtime.
+The community cleanup of those tools is separate from the service entry above.
