@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Standalone CLI checks; no model, server or accelerator is started."""
 
-import contextlib
 import importlib.util
-import io
-import json
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,7 +19,6 @@ def load_example(name):
 
 
 launcher = load_example("launch")
-benchmark = load_example("bench")
 
 
 class TestStateLauncher(unittest.TestCase):
@@ -47,54 +42,6 @@ class TestStateLauncher(unittest.TestCase):
                 launcher.main()
             self.assertEqual(result.exception.code, 2)
             call.assert_not_called()
-
-    def test_benchmark_plan_uses_explicit_paths_without_starting_server(self):
-        with tempfile.TemporaryDirectory() as folder:
-            directory = Path(folder)
-            config = directory / "config.json"
-            config.write_text(
-                json.dumps(
-                    {
-                        "port": 8000,
-                        "model": "/weights",
-                        "tokenizer": "/tokenizer",
-                        "served_model_name": "example-model",
-                        "repeats": 1,
-                        "pressure_repeats": 2,
-                        "deadline": "2030-01-01T00:00:00+08:00",
-                    }
-                )
-            )
-            output = directory / "nested/results"
-            printed = io.StringIO()
-            with (
-                patch(
-                    "sys.argv",
-                    [
-                        "bench.py",
-                        "--config",
-                        str(config),
-                        "--results-dir",
-                        str(output),
-                        "--suite",
-                        "diagnostic",
-                        "--plan-only",
-                    ],
-                ),
-                patch.object(benchmark, "run_one") as run,
-                patch.object(benchmark.subprocess, "check_output") as command,
-                contextlib.redirect_stdout(printed),
-            ):
-                benchmark.main()
-            jobs = json.loads(printed.getvalue())
-            self.assertEqual(len(jobs), 4)
-            for job in jobs:
-                self.assertEqual(job[job.index("--result-dir") + 1], str(output / "diagnostic"))
-                self.assertEqual(job[job.index("--model") + 1], "/weights")
-                self.assertEqual(job[job.index("--tokenizer") + 1], "/tokenizer")
-                self.assertEqual(job[job.index("--served-model-name") + 1], "example-model")
-            run.assert_not_called()
-            command.assert_not_called()
 
 
 if __name__ == "__main__":

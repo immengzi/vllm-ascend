@@ -60,8 +60,7 @@ History capacity also includes its null page, which cannot serve a request.
 The pinned upstream rank planner assumes that all cache bytes scale with block
 count. Its final rank reconciliation rebuilds larger ranks using only
 `min_blocks * bytes_per_block`. Passing that value to a fixed-state planner
-would deduct `F` a second time. In a CPU reproduction, ranks that should both
-have 8877 history pages instead returned 8877 and 8069.
+would deduct `F` a second time and produce inconsistent rank capacities.
 
 For identical worker specs, the adapter first normalizes the complete byte
 budgets to their minimum, then delegates grouping, admission, automatic maximum
@@ -103,38 +102,23 @@ replacement of attention methods is needed.
 
 ## Prefill/Decode integration
 
-The inherited Mooncake Pull path hands over history, indices, SWA and compressor
+The Mooncake Pull path hands over history, indices, SWA and compressor
 state at the same processed-token boundary. Prefill handles the first `N-1`
 prompt tokens. Decode reserves local IDs, READs the valid ranges, waits for all
 participating TP ranks and computes the last prompt token locally. Source
 leases and destination state cannot be reused while DMA completion is uncertain.
-See the [historical P/D design record](dsv41_state_pd.md) for the transfer protocol;
-its dated implementation and validation status should not be read as current
-head qualification.
 
-The pool/window refactor changes shared initialization and execution interfaces,
-so previous normal P/D results do not qualify this head automatically. Full-model
-recovery after an in-flight SDK failure also remains open.
+## Validation requirements
 
-## Validation status
-
-The refactor through `6bc0ea2` passed 126 local CPU tests: 95 pool, admission,
-window, lifetime and budget checks, plus 31 protocol and example-CLI checks.
-Twelve valid single-worker planning configurations retained all 51 backing
-descriptors and the staging reservation. Earlier window refactor checks compared
-512 metadata cases. Repository formatting checks passed.
-
-The offline harness used archived upstream specs/planning/scheduler functions
-with import, registry and pool/manager doubles where the full runtime was not
-available. These results do not establish full engine imports, worker IPC, NPU
-allocation, graph replay, numerical correctness or performance of this head.
-Unit tests live under `tests/ut/core/test_request_state_*.py` and
-`tests/ut/models/test_dsv41_*.py`; device regression entrypoints remain under
+CPU tests cover pool ownership, byte accounting, admission rollback and window
+metadata. They are under `tests/ut/core/test_request_state_*.py` and
+`tests/ut/models/test_dsv41_*.py`. Device regression entrypoints are under
 `tests/e2e/pull_request/one_card/aclgraph/`.
 
-Before hardware qualification, run the tests in the matching full software
-stack. Then check unequal-budget rank initialization, override and auto-fit,
-chronological staging graph replay, aligned first/continuous Decode numerics,
-slot cancellation/reuse, relevant CP execution and normal P/D handoff. Performance
-measurements follow those gates. Historical results in the RFC belong to the
-explicitly named tested commits, not this refactor.
+Changes to these interfaces require full-runtime initialization and IPC checks,
+unequal-budget rank allocation, override and automatic-length checks, staging
+graph replay, first and continuous Decode numerical comparison, cancellation
+and slot reuse. Applicable CP configurations and normal P/D handoff require
+separate device regression. Full-model recovery after an in-flight SDK transfer
+failure remains to be validated. Performance evaluation follows correctness
+and resource-lifetime validation.

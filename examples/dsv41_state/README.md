@@ -38,42 +38,10 @@ more state memory and leaves fewer bytes for history. The three pools have fixed
 capacities and do not borrow memory from one another. The chronological staging
 workspace is included in planning; it is not a fourth request resource pool.
 
-## Benchmark artifacts
-
-The optional `bench.py` wrapper requires explicit configuration and output paths:
-
-```bash
-python3 examples/dsv41_state/bench.py \
-  --config /path/to/benchmark.json --results-dir /path/to/results \
-  --suite core --plan-only
-```
-
-The configuration contains `port`, `model`, `served_model_name`, `repeats`,
-`pressure_repeats`, and a timezone-qualified `deadline`. `tokenizer` defaults to
-`model`; `served_model_name` defaults to `dsv41`. For example:
-
-```json
-{
-  "port": 8000,
-  "model": "/path/to/DeepSeek-V4.1-Flash-W8A8",
-  "served_model_name": "dsv41",
-  "repeats": 2,
-  "pressure_repeats": 2,
-  "deadline": "2030-01-01T09:00:00+08:00"
-}
-```
-
-Replace the example deadline with the authorized test deadline. `--plan-only`
-prints benchmark commands without contacting a server. Remove it to run against
-an already running local service. Existing result files are not overwritten.
-Short diagnostic cases are not throughput qualification; formal comparisons need
-at least 100 requests per round and a stable measurement interval.
-
 ## Code and validation boundaries
 
-The [pool design and validation status](../../docs/source/developer_guide/Design_Documents/request_state_pools.md)
-describes the current explicit interfaces, full-budget rank planning and
-remaining hardware gates.
+The [pool design](../../docs/source/developer_guide/Design_Documents/request_state_pools.md)
+describes the interfaces, full-budget rank planning and ownership contracts.
 
 - `models/deepseek_v41/cache_config.py`: model geometry and memory budget.
 - `core/kv_cache_interface.py`: declared pool capacities and cache-group ownership.
@@ -83,7 +51,7 @@ remaining hardware gates.
 - `models/deepseek_v41/state_kernels.py`: window assembly and state updates.
 
 P/D adds transfer ownership and device synchronization to this local allocation
-contract; see the [P/D design](../../docs/source/developer_guide/Design_Documents/dsv41_state_pd.md).
+contract. The pool design describes the handoff boundary and transfer ownership.
 Local pool tests do not establish cross-machine transfer or numerical correctness.
 
 Model runner V1 binds one staging workspace to all request-window layers before
@@ -93,8 +61,3 @@ Decode metadata buffers retain their addresses while their contents change.
 Context-parallel metadata copies retain the typed window state and the global KV
 owner. Device graph replay and stream ordering still require hardware validation
 after changes to these ownership boundaries.
-
-The other diagnostic scripts and `tested-source.json` in this directory describe
-historical experiments. Some require the old container mount layout or historical
-Git objects. They are not a portable acceptance suite for the refactored runtime.
-The community cleanup of those tools is separate from the service entry above.
