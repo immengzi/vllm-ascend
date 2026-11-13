@@ -160,10 +160,10 @@ def test_budget_variants_and_explicit_override(maximum, batch, override):
 def test_insufficient_budget_and_oversized_override_are_rejected():
     with patch.object(planner, "uses_a5_packed_cache", return_value=False):
         cfg, groups = model_fixture()
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             planner.get_deepseek_v41_kv_cache_config(cfg, groups, 1)
         cfg.cache_config.num_gpu_blocks_override = 1000000
-        with pytest.raises(AssertionError, match="exceeds"):
+        with pytest.raises(ValueError, match="exceeds"):
             planner.get_deepseek_v41_kv_cache_config(cfg, groups, 3576615936)
 
 

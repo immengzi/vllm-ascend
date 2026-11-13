@@ -19,6 +19,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
     CachePoolPlan,
+    RequestStateMemoryBudget,
     RequestStatePlan,
 )
 from vllm_ascend.device.hardware_profile import (
@@ -269,6 +270,35 @@ def get_window_staging_rows(max_tokens: int, max_requests: int) -> int:
     return ((max_tokens + max_requests * (2 * WINDOW) + WINDOW - 1) // WINDOW) * WINDOW
 
 
+def get_deepseek_v41_memory_budget(vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]) -> RequestStateMemoryBudget:
+    capacity = vllm_config.scheduler_config.max_num_seqs + 1
+    fixed = sum(
+        capacity * spec.unpadded_page_size_bytes
+        for spec in all_specs(groups).values()
+        if isinstance(spec, (RequestWindowSpec, CircularBufferSpec))
+    )
+    rows = get_window_staging_rows(
+        vllm_config.scheduler_config.max_num_batched_tokens, vllm_config.scheduler_config.max_num_seqs
+    )
+    return RequestStateMemoryBudget(history_bytes(groups), fixed, rows * ROW_BYTES + 2**20)
+
+
+def get_deepseek_v41_max_memory_usage(vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]) -> int:
+    """One full-length request plus all fixed reservations, excluding history null.
+
+    The upstream admission/auto-fit caller already removes one history page
+    from available memory. State capacities include their own null slots.
+    """
+    budget = get_deepseek_v41_memory_budget(vllm_config, groups)
+    pages = max(
+        (spec.max_memory_usage_bytes(vllm_config) + spec.page_size_bytes - 1) // spec.page_size_bytes
+        for group in groups
+        if classify(group.kv_cache_spec) == "history"
+        for spec in unwrap(group.kv_cache_spec).values()
+    )
+    return budget.bytes_for_history_blocks(pages)
+
+
 def get_deepseek_v41_kv_cache_config(
     vllm_config: VllmConfig, groups: list[KVCacheGroupSpec], available_memory: int
 ) -> AscendKVCacheConfig:
@@ -290,21 +320,20 @@ def get_deepseek_v41_kv_cache_config(
     batch = vllm_config.scheduler_config.max_num_batched_tokens
     capacity = maximum + 1
     specs = all_specs(groups)
-    page = history_bytes(groups)
-    fixed = sum(
-        capacity * spec.unpadded_page_size_bytes
-        for spec in specs.values()
-        if isinstance(spec, (RequestWindowSpec, CircularBufferSpec))
-    )
-    # One shared, main-stream SWA staging arena plus metadata allowance.
+    budget = get_deepseek_v41_memory_budget(vllm_config, groups)
+    page = budget.history_page_bytes
+    fixed = budget.request_state_bytes
     staging_rows = get_window_staging_rows(batch, maximum)
-    staging = staging_rows * ROW_BYTES + 2**20
-    usable = available_memory - fixed - staging
-    assert usable > page
-    count = usable // page
+    staging = budget.workspace_bytes
+    count = budget.history_capacity(available_memory)
+    if count < 2:
+        raise ValueError("Cache budget must cover fixed request state, staging, a null history page and a usable page")
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
-        assert override <= count, "Explicit override exceeds the state-separated byte budget"
+        if override < 2 or override > count:
+            raise ValueError(
+                "Explicit override exceeds the state-separated byte budget or leaves no usable history page"
+            )
         count = override
     tensors = []
     for name, spec in specs.items():

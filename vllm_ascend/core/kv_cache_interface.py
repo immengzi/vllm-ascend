@@ -26,6 +26,31 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 
 @dataclass(frozen=True)
+class RequestStateMemoryBudget:
+    """Separate token-growing bytes from fixed request/workspace reservations."""
+
+    history_page_bytes: int
+    request_state_bytes: int
+    workspace_bytes: int
+
+    def __post_init__(self):
+        if self.history_page_bytes <= 0 or min(self.request_state_bytes, self.workspace_bytes) < 0:
+            raise ValueError("Cache byte sizes must be nonnegative, with a positive history page size")
+
+    @property
+    def fixed_bytes(self) -> int:
+        return self.request_state_bytes + self.workspace_bytes
+
+    def bytes_for_history_blocks(self, num_blocks: int) -> int:
+        if num_blocks < 0:
+            raise ValueError("History block count must be nonnegative")
+        return self.fixed_bytes + num_blocks * self.history_page_bytes
+
+    def history_capacity(self, available_memory: int) -> int:
+        return max(0, (available_memory - self.fixed_bytes) // self.history_page_bytes)
+
+
+@dataclass(frozen=True)
 class CachePoolPlan:
     """Capacity includes the null block reserved by BlockPool."""
 
