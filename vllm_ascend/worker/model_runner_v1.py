@@ -275,7 +275,9 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    get_cache_group_capacity,
     get_kv_cache_compression_ratio,
+    get_request_state_plan,
     get_storage_block_size,
     requires_padded_page_layout,
 )
@@ -4631,6 +4633,15 @@ class NPUModelRunner(GPUModelRunner):
             kernel_block_sizes=kernel_block_sizes,
             kv_cache_allocation_context=kv_cache_allocation_context,
         )
+        # One runner-owned window workspace is shared by sequential layers.
+        # Bind before warmup/capture and outside discardable KV backing memory.
+        from vllm_ascend.models.deepseek_v41.window_state import bind_window_staging_workspace
+
+        self.request_state_workspace = bind_window_staging_workspace(
+            kv_cache_config,
+            self.compilation_config.static_forward_context,
+            getattr(self, "request_state_workspace", None),
+        )
         # Cache layouts are final and bound now; prepare on disposable
         # scratch storage before any warmup forward, graph capture or request.
         from vllm_ascend.ops.kda_state_copy_plan import initialize_kda_state_copy
@@ -5425,7 +5436,7 @@ class NPUModelRunner(GPUModelRunner):
                     block_stride = layer_tuple_strides[layer_name]
                     initial_offset = 0
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
-                        kv_cache_config.num_blocks,
+                        get_cache_group_capacity(kv_cache_config, group.kv_cache_group_id),
                         get_storage_block_size(current_kv_cache_spec),
                         current_kv_cache_spec.num_kv_heads,
                         current_kv_cache_spec.head_size,
@@ -5438,11 +5449,11 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     if is_index:
                         source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                        source_spec = layer_kv_cache_spec[source_name]
-                        initial_offset = source_spec.unpadded_page_size_bytes
+                        if get_request_state_plan(kv_cache_config) is None:
+                            initial_offset = layer_kv_cache_spec[source_name].unpadded_page_size_bytes
                         kv_cache_shape_list.append(
                             attn_backend.get_kv_cache_shape(
-                                kv_cache_config.num_blocks,
+                                get_cache_group_capacity(kv_cache_config, group.kv_cache_group_id),
                                 get_storage_block_size(current_kv_cache_spec),
                                 current_kv_cache_spec.num_kv_heads,
                                 current_kv_cache_spec.scale_dim,

@@ -35,6 +35,7 @@ class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
     block_size_scales: list[list[int]]
     local_ip: str = ""
     handshake_port: int = 0
+    state_layout: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         num_layers = len(self.layer_names)
@@ -105,6 +106,7 @@ class MooncakePPTransferMetadata:
     block_shapes: list[list[tuple[int, ...]]]
     block_size_scales: list[list[int]]
     metadata_by_pcp_rank: dict[int, MooncakePCPTransferMetadata]
+    state_layout: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,8 @@ class ReqMeta:
     remote_request_id: str
     remote_num_prompt_tokens: int
     local_full_block_ids: BlockIds
+    state_snapshot: dict[str, Any] | None = None
+    state_consumer: str = ""
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -168,6 +172,8 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_request_id=kv_transfer_params["remote_request_id"],
             remote_num_prompt_tokens=kv_transfer_params["remote_num_prompt_tokens"],
             local_full_block_ids=local_full_block_ids or tuple(),
+            state_snapshot=kv_transfer_params.get("dsv41_state_snapshot"),
+            state_consumer=kv_transfer_params.get("dsv41_state_consumer", ""),
         )
 
 

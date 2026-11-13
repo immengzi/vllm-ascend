@@ -1081,7 +1081,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             # Upstream owns the n-gram history; the adapter only hands it the
             # Ascend SWA slot metadata (see engram/hash_state.py).
             swa_cache_layer = self.layers[config.engram_layer_ids[0]].self_attn.dsa_attn.swa_cache_layer
-            self.engram_hash = create_engram_hash_state(vllm_config, config, swa_cache_layer)
+            self.engram_hash = create_engram_hash_state(vllm_config, config, swa_cache_layer, request_state_ring=True)
 
     def _make_empty_intermediate_tensors(self, batch_size, dtype, device):
         return IntermediateTensors(

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from copy import copy
 from dataclasses import replace
 
 import vllm.v1.core.kv_cache_utils
@@ -26,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
+    get_deepseek_v41_max_memory_usage,
+    get_deepseek_v41_memory_budget,
     get_deepseek_v41_pool_bytes_per_block,
     group_cache_specs,
     is_deepseek_v41_cache,
@@ -51,6 +54,7 @@ _orig_get_packed_kv_cache_groups = vllm.v1.core.kv_cache_utils._get_packed_kv_ca
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+_orig_get_kv_cache_configs = vllm.v1.core.kv_cache_utils.get_kv_cache_configs
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
 
     def _uniform_type_max_num_blocks_per_req(
@@ -559,11 +563,50 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
     return sum(page_sizes) * num_layer_tuples
 
 
+def _ascend_get_kv_cache_configs(
+    vllm_config: VllmConfig,
+    kv_cache_specs: list[dict[str, KVCacheSpec]],
+    available_memory: list[int],
+) -> list[KVCacheConfig]:
+    """Normalize full budgets before the pinned upstream rank planner.
+
+    Its final re-plan and override paths assume all bytes scale with block
+    count. For homogeneous request-state ranks, equal full budgets avoid that
+    re-plan while retaining upstream grouping, admission and auto-fit checks.
+    """
+    if not any(is_deepseek_v41_cache(specs) for specs in kv_cache_specs):
+        return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory)
+    if len(kv_cache_specs) != len(available_memory):
+        raise ValueError("Each request-state worker requires its own memory budget")
+    if vllm_config.parallel_config.pipeline_parallel_size != 1 or any(
+        specs != kv_cache_specs[0] for specs in kv_cache_specs[1:]
+    ):
+        raise ValueError("Request-state rank planning requires identical cache specs and PP=1")
+    groups = make_cache_groups(group_cache_specs(kv_cache_specs[0]))
+    budget = get_deepseek_v41_memory_budget(vllm_config, groups)
+    common_memory = min(available_memory)
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        if override < 2 or override > budget.history_capacity(common_memory):
+            raise ValueError("History override must fit every worker and leave a usable page beyond null")
+        common_memory = budget.bytes_for_history_blocks(override)
+        # Do not let upstream replace the full budget with history-only bytes.
+        # Copy only the config shell/cache options; auto-fit still updates the
+        # original model config, as the framework expects.
+        vllm_config = copy(vllm_config)
+        vllm_config.cache_config = copy(vllm_config.cache_config)
+        vllm_config.cache_config.num_gpu_blocks_override = None
+    logger.info("Request-state workers share a full cache budget of %d bytes", common_memory)
+    return _orig_get_kv_cache_configs(vllm_config, kv_cache_specs, [common_memory] * len(available_memory))
+
+
 def _ascend_max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
+    if is_deepseek_v41_cache(kv_cache_groups):
+        return get_deepseek_v41_max_memory_usage(vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -665,6 +708,7 @@ vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _get_glm5_next_kv_cache_groups
 KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )
+vllm.v1.core.kv_cache_utils.get_kv_cache_configs = _ascend_get_kv_cache_configs
 vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
 vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
 vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
@@ -673,3 +717,6 @@ vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+
+# engine/core.py may already hold its from-imported planner reference.
+vllm.v1.engine.core.get_kv_cache_configs = _ascend_get_kv_cache_configs

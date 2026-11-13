@@ -85,7 +85,11 @@ class MooncakeBaseConnectorScheduler:
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
         self.group_block_size = [group.kv_cache_spec.block_size for group in self.kv_cache_groups]
         self.group_unique_specs = [self._get_group_unique_specs(group) for group in self.kv_cache_groups]
-        self.need_truncate = self._needs_prefill_token_truncation()
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import is_state_config, validate_pd_config
+
+        self.state_mode = is_state_config(kv_cache_config)
+        self.state_model_id = validate_pd_config(vllm_config) if self.state_mode else ""
+        self.need_truncate = self.state_mode or self._needs_prefill_token_truncation()
 
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
 
@@ -181,6 +185,15 @@ class MooncakeBaseConnectorScheduler:
         # Truncate before local prefix-cache lookup so its hit count stays
         # consistent with the prompt length used by the scheduler.
         params = request.kv_transfer_params
+        if (
+            self.state_mode
+            and params is not None
+            and params.get("do_remote_decode")
+            and not params.get("_p_side_truncated")
+        ):
+            if request.num_prompt_tokens < 2:
+                raise ValueError("State PD initially requires at least two prompt tokens")
+            params.setdefault("_dsv41_original_prompt_tokens", request.num_prompt_tokens)
         if params is not None and params.get("do_remote_decode") and self.need_truncate:
             self._truncate_request_for_prefill(request)
 

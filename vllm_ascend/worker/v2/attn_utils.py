@@ -75,7 +75,9 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    get_cache_group_capacity,
     get_kv_cache_compression_ratio,
+    get_request_state_plan,
     get_storage_block_size,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -1359,7 +1361,7 @@ def _reshape_kv_cache_v2(
                 block_stride = layer_tuple_strides[layer_name]
                 initial_offset = 0
                 kv_cache_shape = group.backend.get_kv_cache_shape(
-                    kv_cache_config.num_blocks,
+                    get_cache_group_capacity(kv_cache_config, group.kv_cache_group_id),
                     get_storage_block_size(kv_cache_spec),
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
@@ -1369,11 +1371,11 @@ def _reshape_kv_cache_v2(
                 is_index = isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.scale_dim
                 if is_index:
                     source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                    source_spec = layer_kv_cache_spec[source_name]
-                    initial_offset = source_spec.unpadded_page_size_bytes
+                    if get_request_state_plan(kv_cache_config) is None:
+                        initial_offset = layer_kv_cache_spec[source_name].unpadded_page_size_bytes
                     kv_cache_shape_list.append(
                         group.backend.get_kv_cache_shape(
-                            kv_cache_config.num_blocks,
+                            get_cache_group_capacity(kv_cache_config, group.kv_cache_group_id),
                             get_storage_block_size(kv_cache_spec),
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.scale_dim,

@@ -8,6 +8,7 @@ before running the compressor, indexer and sparse-attention operators without
 moving cache or scheduler knowledge back into the model.
 """
 
+import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
@@ -37,6 +38,18 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.deepseek_v41.cache_config import RequestWindowSpec, get_window_staging_rows
+from vllm_ascend.models.deepseek_v41.request_state import (
+    commit_request_window,
+    defer_window_write,
+    forward_request_window,
+    state_swa_lengths,
+)
+from vllm_ascend.models.deepseek_v41.window_state import (
+    RequestWindowMetadata,
+    RequestWindowMetadataBuilder,
+    prepare_request_window_metadata,
+)
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -147,6 +160,7 @@ class AscendDSAV41Metadata(AttentionMetadata):
     c2_metadata_group_id: int | None = None
     global_metadata: "AscendDSAV41Metadata | None" = None
     cp_token_range: tuple[int, int, int, int] | None = None
+    request_state: RequestWindowMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -295,6 +309,9 @@ class AscendDSAV41Impl:
 
     @staticmethod
     def _write_swa_cache(attn, metadata, value):
+        if metadata.request_state is not None:
+            defer_window_write(attn, metadata, value)
+            return
         cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
         backend = getattr(attn, "packed_cache_ops", None)
         if backend is not None:
@@ -343,6 +360,8 @@ class AscendDSAV41Impl:
         AscendDSAV41Impl._write_swa_cache(attn, metadata.swa, kv)
         if self.role.is_kv_source:
             self._write_compressed_source(attn, hidden_states, positions, cos, sin, metadata)
+        if metadata.swa.request_state is not None:
+            commit_request_window(attn, metadata)
 
     def _prepare_inputs_and_caches(self, attn, hidden_states, metadata, metadata_by_prefix):
         return self._preprocess(attn, hidden_states, hidden_states, metadata, metadata)
@@ -611,6 +630,11 @@ class AscendDSAV41Impl:
         return shared.topk_indices[: hidden_states.shape[0]]
 
     def _forward_attention(self, attn, q, metadata, compressed_indices, *, source_cache=None):
+        if metadata.swa.request_state is not None:
+            return forward_request_window(self, attn, q, metadata, compressed_indices, source_cache=source_cache)
+        return self._forward_attention_impl(attn, q, metadata, compressed_indices, source_cache=source_cache)
+
+    def _forward_attention_impl(self, attn, q, metadata, compressed_indices, *, source_cache=None):
         """Run SparseFlashMla with the same PA metadata for both operator stages."""
         if source_cache is None and self.role.has_long_context:
             source_cache = get_forward_context().no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
@@ -771,6 +795,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
         self._flat_slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self.request_window_builder = (
+            RequestWindowMetadataBuilder(self._seq_lens, get_window_staging_rows(max_tokens, max_reqs))
+            if isinstance(kv_cache_spec, RequestWindowSpec)
+            else None
+        )
         self._max_tokens = max_tokens
         self._dspark_swa_indices = None
         self._dspark_swa_lengths = None
@@ -936,6 +965,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         self._device_metadata_tasks = ()
         spec = self.kv_cache_spec
         common = common_attn_metadata
+        if self.request_window_builder is not None:
+            common = copy.copy(common)
+            size = int(getattr(common, "num_input_tokens", common.slot_mapping.shape[0]))
+            common.slot_mapping = self._flat_slot_mapping[:size]
+            common.slot_mapping.fill_(-1)
         cache_kind = self._cache_kind
         is_compressor_state = cache_kind == "compressor_state"
         ratio = get_kv_cache_compression_ratio(spec)
@@ -1178,12 +1212,14 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     1,
                     head_dim,
                     cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
-                    seqused_ori_kv=seq_lens,
+                    seqused_ori_kv=state_swa_lengths(seq_lens, common.query_start_loc),
                     seqused_cmp_kv=cmp_seq_lens,
                     cmp_residual_kv=cmp_residual,
                     batch_size=num_reqs,
                     max_seqlen_q=int(getattr(common, "max_query_len", 0)),
-                    max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
+                    max_seqlen_ori_kv=min(
+                        int(getattr(common, "max_seq_len", 0)), int(getattr(common, "max_query_len", 0)) + 127
+                    ),
                     max_seqlen_cmp_kv=(coordinates["max_cache_seq_len"] if has_compressed else 0),
                     ori_topk=ori_sparse_indices.shape[-1] if ori_sparse_indices is not None else 0,
                     ori_topk_length=ori_topk_length,
@@ -1386,7 +1422,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 c2_source_cos = self._c2_source_cos[:num_input_tokens]
                 c2_source_sin = self._c2_source_sin[:num_input_tokens]
             c2_metadata_group_id = None if metadata_in_graph else id(self._c2_complete_mask)
-        return AscendDSAV41Metadata(
+        result = AscendDSAV41Metadata(
             block_table=common.block_table_tensor[:num_reqs],
             slot_mapping=slots,
             flat_slot_mapping=flat_slots,
@@ -1422,6 +1458,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
             c2_metadata_group_id=c2_metadata_group_id,
             **coordinates,
         )
+        return prepare_request_window_metadata(self, common, result)
 
 
 class DeepseekV41CacheBackend(AttentionBackend):
