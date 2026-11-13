@@ -19,7 +19,6 @@ from vllm_ascend.core.kv_cache_interface import (
     get_request_state_plan,
 )
 from vllm_ascend.models.deepseek_v41 import cache_config as planner
-from vllm_ascend.models.deepseek_v41.request_state import bind_platform_state_pools
 
 
 def sample_config():
@@ -123,37 +122,6 @@ def test_duplicate_group_and_invalid_marker_are_rejected():
     cfg.request_state_plan = "state"
     with pytest.raises(TypeError):
         get_request_state_plan(cfg)
-
-
-def test_pool_binding_uses_plan_and_is_idempotent():
-    cfg = sample_config()
-    history_pool = object()
-    old = [SimpleNamespace(kv_cache_group_id=i, block_pool=history_pool, block_size=128) for i in range(3)]
-    coordinator = SimpleNamespace(single_type_managers=tuple(old), scheduler_block_size=128)
-
-    class Pool:
-        def __init__(self, capacity, enable_caching, block_size):
-            self.capacity = capacity
-            self.free = capacity - 1  # BlockPool reserves one null block.
-
-    class Manager:
-        def __init__(self, spec, **kwargs):
-            self.__dict__.update(kwargs)
-            self.block_size = 128
-            self.req_to_blocks = {}
-
-    module = "vllm_ascend.models.deepseek_v41.request_state"
-    with patch(module + ".BlockPool", Pool), patch(module + ".FixedStateManager", Manager):
-        assert bind_platform_state_pools(coordinator, cfg)
-        managers = coordinator.single_type_managers
-        assert managers[0] is old[0]
-        assert [m.block_pool.free for m in managers[1:]] == [48, 32]
-        managers[1].req_to_blocks["live"] = [3]
-        assert bind_platform_state_pools(coordinator, cfg)
-        assert all(a is b for a, b in zip(managers, coordinator.single_type_managers))
-        assert managers[1].req_to_blocks == {"live": [3]}
-    native = KVCacheConfig(num_blocks=100, kv_cache_tensors=[], kv_cache_groups=cfg.kv_cache_groups)
-    assert not bind_platform_state_pools(coordinator, native)
 
 
 def test_budget_and_all_backing_sizes_match_measured_geometry_without_results_dir():

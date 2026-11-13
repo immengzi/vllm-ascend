@@ -32,7 +32,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.core.kv_cache_interface import get_request_state_plan, is_prefix_cacheable
+from vllm_ascend.core.request_state_manager import create_request_state_managers
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
@@ -172,20 +173,32 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         extra_mgr_kwargs: dict = {"scheduler_block_size": scheduler_block_size}
         extra_mgr_kwargs["needs_kv_cache_zeroing"] = kv_cache_config.needs_kv_cache_zeroing
-        self.single_type_managers = tuple(
-            get_manager_for_kv_cache_spec(
-                kv_cache_spec=_manager_spec(kv_cache_group.kv_cache_spec),
-                block_pool=self.block_pool,
-                enable_caching=enable_caching,
-                kv_cache_group_id=i,
+        if get_request_state_plan(kv_cache_config) is not None:
+            self.single_type_managers = create_request_state_managers(
+                kv_cache_config,
+                self.block_pool,
+                scheduler_block_size=scheduler_block_size,
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=1,
-                max_in_flight_tokens=token_budget,
                 max_model_len=max_model_len,
-                **extra_mgr_kwargs,
+                max_in_flight_tokens=token_budget,
             )
-            for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
-        )
+            self.group_block_sizes = tuple(manager.block_size for manager in self.single_type_managers)
+        else:
+            self.single_type_managers = tuple(
+                get_manager_for_kv_cache_spec(
+                    kv_cache_spec=_manager_spec(kv_cache_group.kv_cache_spec),
+                    block_pool=self.block_pool,
+                    enable_caching=enable_caching,
+                    kv_cache_group_id=i,
+                    dcp_world_size=dcp_world_size,
+                    pcp_world_size=1,
+                    max_in_flight_tokens=token_budget,
+                    max_model_len=max_model_len,
+                    **extra_mgr_kwargs,
+                )
+                for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+            )
         # vLLM #53614 aligns exported Mamba checkpoints with EAGLE replay.
         if use_eagle:
             for manager in self.single_type_managers:
@@ -529,6 +542,8 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
     )
     # vLLM main (#54736) added allow_partial_hash_hits.
     hybrid_kwargs["allow_partial_hash_hits"] = allow_partial_hash_hits
+    if get_request_state_plan(kv_cache_config) is not None:
+        return AscendHybridKVCacheCoordinator(**hybrid_kwargs)  # type: ignore[call-arg]
     # Private state blocks are excluded by the block-size resolver. Keep
     # their independent manager geometry when prefix caching is disabled too.
     num_cacheable_groups = sum(is_prefix_cacheable(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)

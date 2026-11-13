@@ -15,7 +15,7 @@ import struct
 import sys
 import threading
 import unittest
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -294,39 +294,6 @@ class ProtocolTests(unittest.TestCase):
             decoder._recving_thread.add_request.assert_called_once_with(
                 "host", 9999, request.request_id, handoff.transfer_id, f"D/{decode_request.request_id}"
             )
-
-    def test_actual_admission_wrapper_checks_both_state_pools(self):
-        path = ROOT / "vllm_ascend/models/deepseek_v41/request_state.py"
-        tree = ast.parse(path.read_text())
-        wrapper = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "allocate_slots")
-
-        class Fixed:
-            def __init__(self, free):
-                self.req_to_blocks = defaultdict(list)
-                self.block_pool = SimpleNamespace(get_num_free_blocks=lambda: free)
-
-        original = Mock(return_value="allocated")
-        env = {"FixedStateManager": Fixed, "original_allocate": original}
-        module = ast.Module(body=[wrapper], type_ignores=[])
-        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), env)
-        name = "vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state"
-        request = SimpleNamespace(request_id="r")
-        with patch.dict(sys.modules, {name: protocol}):
-            for free in [(0, 1), (1, 0), (0, 0)]:
-                managers = [Fixed(n) for n in free]
-                manager = SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=managers))
-                self.assertIsNone(env["allocate_slots"](manager, request, 1))
-                original.assert_not_called()
-            managers = [Fixed(1), Fixed(1)]
-            manager = SimpleNamespace(coordinator=SimpleNamespace(single_type_managers=managers))
-            self.assertEqual(env["allocate_slots"](manager, request, 1), "allocated")
-            self.assertEqual(original.call_count, 1)
-            # Already resident slots remain usable even when no spare slots exist.
-            managers = [Fixed(0), Fixed(0)]
-            for state in managers:
-                state.req_to_blocks["r"] = [9]
-            manager.coordinator.single_type_managers = managers
-            self.assertEqual(env["allocate_slots"](manager, request, 1), "allocated")
 
     def test_actual_registration_and_read_path_with_mock_transport(self):
         directory = ROOT / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake"
@@ -751,37 +718,6 @@ class ProtocolTests(unittest.TestCase):
         env["time"].time = lambda: 111
         sender._retrieve_expired_requests_locked()
         self.assertIn(fresh.source_request_id, sender.finished_request_ids)
-
-    def test_joint_allocation_failure_rolls_back_new_appends_only(self):
-        class Pool:
-            def __init__(self):
-                self.returned = []
-
-            def free_blocks(self, blocks):
-                self.returned.extend(blocks)
-
-        managers = [
-            SimpleNamespace(req_to_blocks=defaultdict(list), block_pool=Pool(), num_cached_block={}, new_block_ids=[])
-            for _ in range(3)
-        ]
-        managers[0].req_to_blocks["r"] = [11]
-        managers[0].num_cached_block["r"] = 7
-
-        def allocate():
-            for index, manager in enumerate(managers):
-                manager.req_to_blocks["r"].append(20 + index)
-                manager.num_cached_block["r"] = 100
-                manager.new_block_ids.append(20 + index)
-                if index == 1:
-                    raise RuntimeError("Injected second-state-pool allocation failure")
-
-        with self.assertRaises(RuntimeError):
-            protocol.reserve_append_only(managers, "r", allocate)
-        self.assertEqual(managers[0].req_to_blocks["r"], [11])
-        self.assertEqual(managers[0].num_cached_block["r"], 7)
-        self.assertNotIn("r", managers[1].req_to_blocks)
-        self.assertEqual([m.block_pool.returned for m in managers], [[20], [21], []])
-        self.assertTrue(all(not m.new_block_ids for m in managers))
 
 
 if __name__ == "__main__":

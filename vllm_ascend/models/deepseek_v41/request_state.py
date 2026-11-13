@@ -2,21 +2,16 @@
 """DSV4.1 history/request-state separation on the pinned runtime.
 
 No MTP or prefix reuse. DSA CP stages local query windows from replicated
-global KV; graph decode uses persistent lengths. Allocation hooks bridge the
-pinned upstream API; the PD data protocol belongs to the connector adapter.
-Replacing these hooks with the upstream builder/coordinator extension points
-is a separate integration step, not a requirement to rewrite PD transport.
+global KV; graph decode uses persistent lengths. Pool ownership and admission
+live in core.request_state_manager; this module handles window execution.
 """
 
 import copy
 from dataclasses import replace
 
 import torch
-from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
 
-from vllm_ascend.core.kv_cache_interface import get_request_state_plan
-from vllm_ascend.models.deepseek_v41.cache_config import RequestWindowSpec, unwrap
+from vllm_ascend.models.deepseek_v41.cache_config import RequestWindowSpec
 
 WINDOW = 128
 _attention_installed = False
@@ -53,109 +48,6 @@ def _release_current_kv(attn, current, *, prefill):
             value.record_stream(consumer)
     attn._request_state_current_kv = None
     attn._request_state_current_kv_stream = None
-
-
-class FixedStateManager(CircularBufferManager):
-    def get_num_blocks_to_allocate(self, request_id, *args, **kwargs):
-        if self.req_to_blocks.get(request_id):
-            return 0
-        # Fixed slots are checked explicitly by allocate_slots below. They
-        # must not be counted as history pages in the scalar history gate.
-        return 0
-
-
-def bind_platform_state_pools(coordinator, config):
-    # AscendHybridKVCacheCoordinator constructs managers directly and can bypass
-    # the upstream base initializer. Bind the declared pools after the actual
-    # platform factory has returned. Repeated binding keeps live managers.
-    plan = get_request_state_plan(config)
-    if plan is None:
-        return False
-    if len(coordinator.single_type_managers) != len(config.kv_cache_groups):
-        raise ValueError("Cache manager count does not match the pool plan groups")
-    managers = []
-    for group_id, (old, group) in enumerate(zip(coordinator.single_type_managers, config.kv_cache_groups)):
-        pool_plan = plan.pool_for_group(group_id)
-        if pool_plan.allocation_unit == "token_block" or isinstance(old, FixedStateManager):
-            managers.append(old)
-            continue
-        capacity = pool_plan.capacity
-        pool = BlockPool(capacity, False, coordinator.scheduler_block_size)
-        spec = next(iter(unwrap(group.kv_cache_spec).values()))
-        manager = FixedStateManager(
-            spec,
-            block_pool=pool,
-            enable_caching=False,
-            kv_cache_group_id=old.kv_cache_group_id,
-            scheduler_block_size=coordinator.scheduler_block_size,
-            dcp_world_size=1,
-            pcp_world_size=1,
-            needs_kv_cache_zeroing=False,
-        )
-        managers.append(manager)
-    coordinator.single_type_managers = tuple(managers)
-    coordinator.group_block_sizes = tuple(m.block_size for m in managers)
-    assert len({id(m.block_pool) for m in managers}) == len(plan.pools)
-    return True
-
-
-def install_coordinator():
-    from vllm.v1.core import kv_cache_coordinator as mod
-
-    original = mod.KVCacheCoordinator.__init__
-
-    def initialize(self, *args, **kwargs):
-        incoming = kwargs.get("kv_cache_config", args[0] if args else None)
-        state_config = incoming is not None and get_request_state_plan(incoming) is not None
-        if state_config:
-            # Managers need one representative retention spec per logical group;
-            # worker-side descriptors retain every layer's actual geometry.
-            incoming = copy.copy(incoming)
-            incoming.kv_cache_groups = [
-                replace(g, kv_cache_spec=next(iter(unwrap(g.kv_cache_spec).values()))) for g in incoming.kv_cache_groups
-            ]
-            if "kv_cache_config" in kwargs:
-                kwargs["kv_cache_config"] = incoming
-            else:
-                args = (incoming, *args[1:])
-        original(self, *args, **kwargs)
-        config = self.kv_cache_config
-        if not state_config:
-            return
-        assert not self.block_pool.enable_caching
-        bind_platform_state_pools(self, config)
-
-    mod.KVCacheCoordinator.__init__ = initialize
-    from vllm.v1.core.kv_cache_manager import KVCacheManager
-
-    original_cache_init = KVCacheManager.__init__
-
-    def initialize_cache(self, kv_cache_config, *args, **kwargs):
-        original_cache_init(self, kv_cache_config, *args, **kwargs)
-        bind_platform_state_pools(self.coordinator, kv_cache_config)
-
-    KVCacheManager.__init__ = initialize_cache
-    original_allocate = KVCacheManager.allocate_slots
-
-    def allocate_slots(self, request, *args, **kwargs):
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import reserve_append_only
-
-        managers = self.coordinator.single_type_managers
-        states = [m for m in managers if isinstance(m, FixedStateManager)]
-        if not states:
-            return original_allocate(self, request, *args, **kwargs)
-        # This is a single-threaded scheduler transaction. Existing history
-        # admission still applies; either state pool can independently defer it.
-        needs = [m for m in states if not m.req_to_blocks.get(request.request_id)]
-        if not needs:
-            return original_allocate(self, request, *args, **kwargs)
-        if any(not m.block_pool.get_num_free_blocks() for m in needs):
-            return None
-        return reserve_append_only(
-            managers, request.request_id, lambda: original_allocate(self, request, *args, **kwargs)
-        )
-
-    KVCacheManager.allocate_slots = allocate_slots
 
 
 def state_swa_lengths(seq_lens, query_start):

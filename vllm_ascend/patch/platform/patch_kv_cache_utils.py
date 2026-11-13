@@ -31,7 +31,6 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
     make_cache_groups,
 )
-from vllm_ascend.models.deepseek_v41.request_state import install_coordinator
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_config,
@@ -657,9 +656,6 @@ def _ascend_get_kv_cache_config_from_groups(
         kv_cache_config.dspark_draft_only_group_ids = tuple(draft_only_group_ids)
     return kv_cache_config
 
-
-# Pinned scheduler compatibility; allocation planning itself has no install hooks.
-install_coordinator()
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 assert _orig_get_packed_kv_cache_groups is not None
