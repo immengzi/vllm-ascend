@@ -1,6 +1,6 @@
 # History-page and request-state pools
 
-This MRV1 prototype implements the capacity split proposed in
+This implementation uses MRV1 and implements the capacity split proposed in
 [RFC #21324](https://github.com/vllm-project/vllm-ascend/issues/21324).
 DeepSeek V4.1 is the first model integration. The interfaces below are local
 implementation contracts, not finalized vLLM core or MRV2 APIs.
@@ -10,7 +10,7 @@ implementation contracts, not finalized vLLM core or MRV2 APIs.
 History KV and sparse indices grow with processed tokens. SWA and compressor
 state have bounded storage per request. Giving all of them one shared physical
 page stride leaves padding in history pages and couples their capacity limits.
-The prototype reserves fixed state slots and execution workspace first, then
+The planner reserves fixed state slots and execution workspace first, then
 uses the remaining budget for compact history pages.
 
 There are three resource pools: history, SWA and compressor. Each state pool

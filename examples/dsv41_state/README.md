@@ -1,6 +1,6 @@
 # DeepSeek V4.1 history and request-state caches
 
-This prototype separates token-growing history from fixed SWA and compressor
+This implementation separates token-growing history from fixed SWA and compressor
 state. The scheduler reserves one slot per request in each state pool. The
 remaining cache budget supplies history pages. Decode assembles the window in
 chronological order before attention.
