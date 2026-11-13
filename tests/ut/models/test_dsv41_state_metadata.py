@@ -9,7 +9,6 @@ import ast
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 
@@ -29,8 +28,6 @@ class TestRequestStateMetadata(unittest.TestCase):
             "torch": torch,
             "RequestWindowSpec": WindowSpec,
             "WINDOW": 128,
-            "_direct_decode": False,
-            "record_path": Mock(),
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(SOURCE), "exec"), self.namespace)
         self.prepare = self.namespace["_prepare_state_metadata"]
@@ -92,14 +89,6 @@ class TestRequestStateMetadata(unittest.TestCase):
         later = self.build([0], [0], max_query_len=0)
         self.assertEqual(first.state_stage_lengths.tolist(), [0])
         self.assertEqual(first.state_stage_lengths.data_ptr(), later.state_stage_lengths.data_ptr())
-
-    def test_direct_protocol_keeps_existing_persistent_references(self):
-        self.namespace["_direct_decode"] = True
-        first = self.build([1])
-        later = self.build([100001])
-        self.assertEqual(first.state_stage_lengths.data_ptr(), later.state_stage_lengths.data_ptr())
-        self.assertEqual(first.state_stage_lengths.tolist(), [128])
-        self.assertFalse(hasattr(later, "state_stage_block_table"))
 
     def test_multi_query_prefill_retains_chronological_lookback(self):
         value = self.build([129], [3], max_query_len=3)

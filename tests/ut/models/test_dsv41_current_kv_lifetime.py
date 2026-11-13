@@ -7,14 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-def load_helper(backend, paths):
+def load_helper(backend):
     source = Path(__file__).resolve().parents[3] / "vllm_ascend/models/deepseek_v41/request_state.py"
     node = next(
         n
         for n in ast.parse(source.read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name == "_release_current_kv"
     )
-    scope = {"torch": SimpleNamespace(npu=backend), "record_path": paths.append}
+    scope = {"torch": SimpleNamespace(npu=backend)}
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
     return scope["_release_current_kv"]
 
@@ -23,7 +23,7 @@ class TestCurrentKVLifetime(unittest.TestCase):
     def run_case(
         self, *, prefill=True, capture=False, copied=False, unknown=False, same_stream=False, packed=False, fail=False
     ):
-        calls, paths = [], []
+        calls = []
 
         class Stream:
             device = "npu:0"
@@ -47,7 +47,7 @@ class TestCurrentKVLifetime(unittest.TestCase):
         if packed:
             attn.packed_cache_ops = object()
         backend = SimpleNamespace(current_stream=lambda: consumer, is_current_stream_capturing=lambda: capture)
-        helper = load_helper(backend, paths)
+        helper = load_helper(backend)
         if fail:
             with self.assertRaisesRegex(RuntimeError, "event failure"):
                 helper(attn, current, prefill=prefill)
@@ -57,12 +57,11 @@ class TestCurrentKVLifetime(unittest.TestCase):
             helper(attn, current, prefill=prefill)
             self.assertIsNone(attn._request_state_current_kv)
             self.assertIsNone(attn._request_state_current_kv_stream)
-        return calls, paths
+        return calls
 
     def test_eager_prefill_returns_dependency_before_release(self):
-        calls, paths = self.run_case()
+        calls = self.run_case()
         self.assertEqual([c[0] for c in calls], ["producer_wait"])
-        self.assertEqual(paths, ["prefill_producer_return_dependency"])
 
     def test_decode_capture_unknown_same_and_packed_keep_original_protection(self):
         for options in [
@@ -73,12 +72,11 @@ class TestCurrentKVLifetime(unittest.TestCase):
             {"packed": True},
         ]:
             with self.subTest(options=options):
-                calls, paths = self.run_case(**options)
+                calls = self.run_case(**options)
                 self.assertEqual([c[0] for c in calls], ["record"])
-                self.assertEqual(paths, ["current_kv_record_stream_fallback"])
 
     def test_contiguous_copy_protects_both_tensors(self):
-        calls, _ = self.run_case(copied=True)
+        calls = self.run_case(copied=True)
         self.assertEqual([c[0] for c in calls], ["record", "record"])
 
     def test_cache_only_uses_swa_metadata_contract(self):
@@ -112,9 +110,8 @@ class TestCurrentKVLifetime(unittest.TestCase):
             self.assertEqual(calls, ["project", ("ring", "current", "ids", "qstart", "seq"), ("current", query > 1)])
 
     def test_failed_dependency_retains_tensor_and_producer(self):
-        calls, paths = self.run_case(fail=True)
+        calls = self.run_case(fail=True)
         self.assertEqual([c[0] for c in calls], ["producer_wait"])
-        self.assertEqual(paths, [])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import torch
 from typing_extensions import Self
@@ -13,6 +14,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, Slid
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -21,6 +23,95 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+
+@dataclass(frozen=True)
+class CachePoolPlan:
+    """Capacity includes the null block reserved by BlockPool."""
+
+    pool_id: str
+    capacity: int
+    group_ids: tuple[int, ...]
+    allocation_unit: Literal["token_block", "request_slot"]
+
+    def __post_init__(self):
+        if not self.pool_id or self.capacity < 1 or not self.group_ids:
+            raise ValueError("A cache pool requires an ID, capacity and cache groups")
+        if len(set(self.group_ids)) != len(self.group_ids) or min(self.group_ids) < 0:
+            raise ValueError("Cache group IDs must be distinct and nonnegative")
+        if self.allocation_unit not in ("token_block", "request_slot"):
+            raise ValueError(f"Unsupported allocation unit: {self.allocation_unit}")
+
+
+@dataclass(frozen=True)
+class RequestStatePlan:
+    """Pool ownership; tensor sizes and strides remain in KVCacheTensor."""
+
+    pools: tuple[CachePoolPlan, ...]
+    staging_rows: int
+    staging_allowance_bytes: int
+
+    def __post_init__(self):
+        ids = [pool.pool_id for pool in self.pools]
+        groups = [group_id for pool in self.pools for group_id in pool.group_ids]
+        if not ids or len(set(ids)) != len(ids) or len(set(groups)) != len(groups):
+            raise ValueError("Cache pools and their group ownership must be unique")
+        if any(len(pool.group_ids) != 1 for pool in self.pools):
+            raise ValueError("Request-state pools currently require one cache group per pool")
+        if self.staging_rows < 0 or self.staging_allowance_bytes < 0:
+            raise ValueError("Staging reservations must be nonnegative")
+
+    def pool_for_group(self, group_id: int) -> CachePoolPlan:
+        for pool in self.pools:
+            if group_id in pool.group_ids:
+                return pool
+        raise ValueError(f"No pool assigned to cache group {group_id}")
+
+    def validate(self, config: KVCacheConfig) -> None:
+        """Check the materialized worker layout before any allocation."""
+        groups = {group_id for pool in self.pools for group_id in pool.group_ids}
+        if groups != set(range(len(config.kv_cache_groups))):
+            raise ValueError("Pool plan must cover every cache group exactly once")
+        capacities = {}
+        for group_id, group in enumerate(config.kv_cache_groups):
+            pool = self.pool_for_group(group_id)
+            if pool.allocation_unit == "token_block" and pool.capacity != config.num_blocks:
+                raise ValueError("History pool capacity must match num_blocks")
+            for name in group.layer_names:
+                if name in capacities:
+                    raise ValueError(f"Duplicate cache layer: {name}")
+                capacities[name] = pool.capacity
+        allocated = set()
+        for tensor in config.kv_cache_tensors:
+            if len(tensor.layers) != 1 or tensor.offset != 0 or tensor.layer_stride != 0:
+                raise ValueError("Request-state layout requires a separate backing per cache layer")
+            name = tensor.layers[0]
+            if name not in capacities or name in allocated:
+                raise ValueError(f"Unknown or duplicate cache allocation: {name}")
+            if tensor.block_stride <= 0 or tensor.size != capacities[name] * tensor.block_stride:
+                raise ValueError(f"Cache allocation does not match pool capacity: {name}")
+            allocated.add(name)
+        if allocated != set(capacities):
+            raise ValueError("Missing cache tensor allocations")
+
+
+@dataclass(kw_only=True)
+class AscendKVCacheConfig(KVCacheConfig):
+    """Carry pool ownership through scheduler copies and worker serialization."""
+
+    request_state_plan: RequestStatePlan | None = None
+
+
+def get_request_state_plan(config: KVCacheConfig) -> RequestStatePlan | None:
+    plan = getattr(config, "request_state_plan", None)
+    if plan is not None and not isinstance(plan, RequestStatePlan):
+        raise TypeError("request_state_plan must be a RequestStatePlan")
+    return plan
+
+
+def get_cache_group_capacity(config: KVCacheConfig, group_id: int) -> int:
+    plan = get_request_state_plan(config)
+    return config.num_blocks if plan is None else plan.pool_for_group(group_id).capacity
 
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:

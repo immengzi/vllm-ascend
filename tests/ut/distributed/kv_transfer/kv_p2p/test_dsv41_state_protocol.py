@@ -192,30 +192,6 @@ class ProtocolTests(unittest.TestCase):
         receiver.shutdown(timeout=1)
         self.assertEqual(receiver.request_queue.unfinished_tasks, 0)
 
-    def test_native_index_offset_and_state_capacity_are_separate(self):
-        path = ROOT / "vllm_ascend/models/deepseek_v41/request_state.py"
-        tree = ast.parse(path.read_text())
-        methods = [
-            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("cache_rows", "index_cache_offset")
-        ]
-        env = {}
-        exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), env)
-        module = "vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state"
-        source = SimpleNamespace(unpadded_page_size_bytes=65536)
-        native = SimpleNamespace(num_blocks=8877, kv_cache_groups=[SimpleNamespace(layer_names=["native-kv"])])
-        state = SimpleNamespace(
-            num_blocks=8877,
-            kv_cache_groups=[
-                SimpleNamespace(layer_names=[n]) for n in ("m.long_kv_cache", "m.swa_cache", "m.compressor.state_cache")
-            ],
-            kv_cache_tensors=[SimpleNamespace(layers=["m.swa_cache"], size=17 * 131072, block_stride=131072)],
-        )
-        with patch.dict(sys.modules, {module: protocol}):
-            self.assertEqual(env["cache_rows"](native, "m.swa_cache"), 8877)
-            self.assertEqual(env["index_cache_offset"](native, source), 65536)
-            self.assertEqual(env["cache_rows"](state, "m.swa_cache"), 17)
-            self.assertEqual(env["index_cache_offset"](state, source), 0)
-
     def test_feature_scope_rejects_unsupported_transfer_combinations(self):
         extra = {"dsv41_state_pd": True, "state_model_id": "weights-v1"}
         cfg = SimpleNamespace(

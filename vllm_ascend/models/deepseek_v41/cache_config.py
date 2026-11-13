@@ -1,29 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Framework-side V4.1 layer-outermost cache placement and allocation."""
+"""DeepSeek V4.1 cache geometry and history/request-state allocation."""
 
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.core.kv_cache_utils import may_override_num_blocks
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
-    KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.core.kv_cache_interface import (
+    AscendKVCacheConfig,
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
+    CachePoolPlan,
+    RequestStatePlan,
 )
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
 
+WINDOW = 128
+ROW_BYTES = 1024
 STATE_RING_ROWS = 32
 
 # Fixed dimensions accepted by the packaged mixed-quant attention ABI.
@@ -178,56 +182,6 @@ def get_layer_tuples(specs):
     return page_sizes, layer_tuples
 
 
-def group_cache_specs(specs):
-    """Merge full-context resources and pad layer tuples without mutating inputs."""
-    page_sizes, layer_tuples = get_layer_tuples(specs)
-    padded = {}
-    for page_size, layer_tuple in zip(page_sizes, layer_tuples):
-        kv_name, index_name, *rest = layer_tuple
-        folded_name = index_name + "_folded"
-        has_folded = folded_name in rest
-        aliases = rest[1:] if has_folded else rest
-        kv_bytes = specs[kv_name].unpadded_page_size_bytes
-        index_bytes = specs[index_name].unpadded_page_size_bytes
-        padded[kv_name] = replace(specs[kv_name], page_size_padded=kv_bytes)
-        padded[index_name] = replace(
-            specs[index_name], page_size_padded=index_bytes if has_folded else page_size - kv_bytes
-        )
-        if has_folded:
-            padded[folded_name] = replace(specs[folded_name], page_size_padded=page_size - kv_bytes - index_bytes)
-        padded.update((name, replace(specs[name], page_size_padded=page_size)) for name in aliases)
-
-    mla_names = [name for name, spec in padded.items() if isinstance(spec, AscendMLAAttentionSpec)]
-    state_names = [name for name, spec in padded.items() if isinstance(spec, CircularBufferSpec)]
-    groups = [
-        UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in mla_names}),
-        UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in state_names}),
-    ]
-
-    # Transpose the physical tuples. Each scheduler SWA group takes one layer
-    # from every tuple, so its members use distinct slots at the same block ID.
-    swa_columns = [
-        [
-            name
-            for name in layer_tuple
-            if isinstance(padded[name], AscendSlidingWindowMLASpec) and ".mtp." not in f".{name}"
-        ]
-        for layer_tuple in layer_tuples
-    ]
-    for names in zip(*swa_columns):
-        groups.append(UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in names}))
-
-    draft_names = [
-        name
-        for layer_tuple in layer_tuples
-        for name in layer_tuple
-        if isinstance(padded[name], AscendSlidingWindowMLASpec) and ".mtp." in f".{name}"
-    ]
-    if draft_names:
-        groups.append(UniformTypeKVCacheSpecs.from_specs({name: padded[name] for name in draft_names}))
-    return groups
-
-
 def make_cache_groups(grouped_specs):
     return [KVCacheGroupSpec(layer_names=list(s.kv_cache_specs), kv_cache_spec=s) for s in grouped_specs]
 
@@ -240,42 +194,152 @@ def _specs_from_groups(groups):
     return specs
 
 
-def get_deepseek_v41_pool_bytes_per_block(groups):
-    page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
-    return sum(page_sizes)
+@dataclass(frozen=True, kw_only=True)
+class RequestWindowSpec(AscendSlidingWindowMLASpec):
+    @property
+    def uses_slot_mapping(self):
+        return False
+
+    @property
+    def block_table_token_alignment(self):
+        return None
+
+    def max_num_blocks_per_req(self, vllm_config, max_len):
+        return 1
+
+    def max_admission_blocks_per_request(self, **kwargs):
+        return 1
+
+    def max_memory_usage_bytes(self, vllm_config):
+        return self.page_size_bytes
+
+    @property
+    def prefix_cacheable(self):
+        return False
+
+
+def unwrap(spec):
+    return spec.kv_cache_specs if isinstance(spec, UniformTypeKVCacheSpecs) else {"representative": spec}
+
+
+def classify(spec):
+    values = list(unwrap(spec).values())
+    if all(isinstance(x, RequestWindowSpec) for x in values):
+        return "swa"
+    if all(isinstance(x, CircularBufferSpec) for x in values):
+        return "compressor"
+    return "history"
+
+
+def group_cache_specs(specs):
+    groups = [dict(), dict(), dict()]
+    for name, spec in specs.items():
+        spec = replace(spec, page_size_padded=None)
+        if isinstance(spec, AscendSlidingWindowMLASpec):
+            assert spec.block_size == WINDOW and spec.sliding_window == WINDOW and spec.dtype == torch.bfloat16
+            attrs = {f.name: getattr(spec, f.name) for f in fields(spec)}
+            spec = RequestWindowSpec(**attrs)
+            groups[1][name] = spec
+        elif isinstance(spec, CircularBufferSpec):
+            groups[2][name] = spec
+        else:
+            assert name.endswith((".long_kv_cache", ".indexer.k_cache")), name
+            groups[0][name] = spec
+    assert [len(g) for g in groups] == [8, 40, 3]
+    result = [UniformTypeKVCacheSpecs.from_specs(g) for g in groups]
+    assert all(g is not None for g in result)
+    return result
+
+
+def all_specs(groups):
+    return {n: s for g in groups for n, s in unwrap(g.kv_cache_spec).items()}
+
+
+def history_bytes(groups):
+    return sum(
+        spec.unpadded_page_size_bytes
+        for group in groups
+        if classify(group.kv_cache_spec) == "history"
+        for spec in unwrap(group.kv_cache_spec).values()
+    )
 
 
 def get_deepseek_v41_kv_cache_config(
-    vllm_config: VllmConfig,
-    groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> KVCacheConfig:
-    """Allocate four independent layer slots backed by one global block-ID pool."""
-    page_sizes, layer_tuples = get_layer_tuples(_specs_from_groups(groups))
-    capacity = max(available_memory // sum(page_sizes), 0)
-    num_blocks = may_override_num_blocks(vllm_config, capacity)
-    tensors: list[KVCacheTensor] = []
-    for page_size, layer_names in zip(page_sizes, layer_tuples):
-        size = num_blocks * page_size
-        tensors.append(
-            KVCacheTensor(
-                size=size,
-                layers=list(layer_names),
-                offset=0,
-                layer_stride=0,
-                block_stride=page_size,
+    vllm_config: VllmConfig, groups: list[KVCacheGroupSpec], available_memory: int
+) -> AscendKVCacheConfig:
+    """Reserve request state and staging, then budget the remaining history pages."""
+    assert vllm_config.speculative_config is None
+    if vllm_config.kv_transfer_config is not None:
+        from vllm import envs
+
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import validate_pd_config
+
+        validate_pd_config(vllm_config)
+        if envs.VLLM_USE_V2_MODEL_RUNNER:
+            raise ValueError("State PD initially requires Model Runner V1")
+    assert not vllm_config.cache_config.enable_prefix_caching
+    assert vllm_config.parallel_config.pipeline_parallel_size == 1
+    # The framework/CLI-provided budget is authoritative. No historical
+    # experiment file or diagnostic environment can change admission capacity.
+    maximum = vllm_config.scheduler_config.max_num_seqs
+    batch = vllm_config.scheduler_config.max_num_batched_tokens
+    capacity = maximum + 1
+    specs = all_specs(groups)
+    page = history_bytes(groups)
+    fixed = sum(
+        capacity * spec.unpadded_page_size_bytes
+        for spec in specs.values()
+        if isinstance(spec, (RequestWindowSpec, CircularBufferSpec))
+    )
+    # One shared, main-stream SWA staging arena plus metadata allowance.
+    staging_rows = ((batch + maximum * 256 + 127) // 128) * 128
+    staging = staging_rows * ROW_BYTES + 2**20
+    usable = available_memory - fixed - staging
+    assert usable > page
+    count = usable // page
+    override = vllm_config.cache_config.num_gpu_blocks_override
+    if override is not None:
+        assert override <= count, "Explicit override exceeds the state-separated byte budget"
+        count = override
+    tensors = []
+    for name, spec in specs.items():
+        n = capacity if isinstance(spec, (RequestWindowSpec, CircularBufferSpec)) else count
+        stride = spec.unpadded_page_size_bytes
+        tensors.append(KVCacheTensor(size=n * stride, layers=[name], offset=0, layer_stride=0, block_stride=stride))
+    plan = RequestStatePlan(
+        pools=tuple(
+            CachePoolPlan(
+                pool_id=classify(group.kv_cache_spec),
+                capacity=count if classify(group.kv_cache_spec) == "history" else capacity,
+                group_ids=(group_id,),
+                allocation_unit="token_block" if classify(group.kv_cache_spec) == "history" else "request_slot",
             )
-        )
-    return KVCacheConfig(
-        num_blocks=num_blocks,
+            for group_id, group in enumerate(groups)
+        ),
+        staging_rows=staging_rows,
+        staging_allowance_bytes=staging,
+    )
+    result = AscendKVCacheConfig(
+        request_state_plan=plan,
+        num_blocks=count,
         kv_cache_tensors=tensors,
         kv_cache_groups=groups,
         prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
     )
+    plan.validate(result)
+    assert sum(x.size for x in tensors) + staging <= available_memory
+    logger.info(
+        "DeepSeek V4.1 cache budget: %d bytes, history: %d blocks (%d bytes/block), "
+        "request slots: %d per state pool (including null), state: %d bytes, staging: %d bytes",
+        available_memory,
+        count,
+        page,
+        capacity,
+        fixed,
+        staging,
+    )
+    return result
 
 
-from vllm_ascend.models.deepseek_v41.request_state import (  # noqa: E402 - class initialization order
-    install as _install_request_state,
-)
-
-_install_request_state()
+def get_deepseek_v41_pool_bytes_per_block(groups):
+    return history_bytes(groups)
