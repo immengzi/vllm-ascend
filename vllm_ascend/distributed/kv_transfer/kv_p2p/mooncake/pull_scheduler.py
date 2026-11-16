@@ -5,6 +5,7 @@
 import queue
 import threading
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,13 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
+    STATE_ACQUIRE_MSG,
+    STATE_DONE_MSG,
+    STATE_META_MSG,
+    SourceLease,
+    StateSnapshot,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     GET_META_MSG,
     MooncakeBaseConnectorScheduler,
@@ -51,6 +59,9 @@ if TYPE_CHECKING:
 
 DONE_RECVING_MSG = b"done_recving_msg"
 ACK_MSG = b"ACK"
+STATE_COMPLETION_HISTORY_SIZE = 16000
+STATE_COMPLETION_ATTEMPTS = 3
+CompletionTarget = tuple[str, int, str] | tuple[str, int, str, str, str]
 PRODUCER_LEASE_CACHE_TTL_SECONDS = 600
 PRODUCER_LEASE_CACHE_MAX_SIZE = 1024
 
@@ -73,12 +84,68 @@ class MooncakeSchedulerSendingThread(MooncakeMetadataThread):
         kv_lease_duration: int = DEFAULT_KV_LEASE_DURATION,
     ) -> None:
         super().__init__(host, port, engine_id, metadata, tp_size, pp_size, pcp_size, dcp_size, use_kv_pp, ready_event)
+        self.state_mode = any(getattr(worker, "state_layout", None) is not None for worker in metadata.values())
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.renewed_requests: OrderedDict[str, float] = OrderedDict()
         self.kv_lease_duration = kv_lease_duration
         self.lease_extension = kv_lease_duration * 2 // 3
         self.finished_requests: queue.SimpleQueue[str] = queue.SimpleQueue()
         self.state_lock = threading.Lock()
+        self.state_leases: dict[str, SourceLease] = {}
+        self.completed_state_leases: OrderedDict[str, str | None] = OrderedDict()
+        self.quarantined_state_leases: set[str] = set()
+
+    def add_state_lease(self, snapshot: StateSnapshot, started: float, block_ids: BlockIds) -> None:
+        with self.state_lock:
+            if snapshot.transfer_id in self.state_leases:
+                raise ValueError("Duplicate state transfer generation")
+            self.state_leases[snapshot.transfer_id] = SourceLease(
+                snapshot, started + self.kv_lease_duration, tuple(tuple(group) for group in block_ids)
+            )
+
+    def _state_control(self, message: tuple) -> bytes:
+        with self.state_lock:
+            if message[0] == STATE_ACQUIRE_MSG and len(message) == 6:
+                _, transfer_id, consumer, rank, snapshot_wire, remote_ids = message
+                lease = self.state_leases.get(transfer_id)
+                if (
+                    lease is None
+                    or lease.snapshot.to_wire() != snapshot_wire
+                    or lease.resource_ids != tuple(tuple(group) for group in remote_ids)
+                ):
+                    return b"REJECT"
+                return ACK_MSG if lease.acquire(transfer_id, consumer, rank, time.monotonic()) else b"REJECT"
+            if message[0] == STATE_DONE_MSG and len(message) == 3:
+                _, transfer_id, consumer = message
+                lease = self.state_leases.get(transfer_id)
+                if lease is not None:
+                    if not lease.complete(transfer_id, consumer):
+                        return b"REJECT"
+                    self._retire_state_lease(lease, consumer)
+                    return ACK_MSG
+                # An unknown generation cannot release another live snapshot.
+                previous = self.completed_state_leases.get(transfer_id)
+                return ACK_MSG if previous in (None, consumer) else b"REJECT"
+            return b"REJECT"
+
+    def _retire_state_lease(self, lease: SourceLease, consumer: str | None) -> None:
+        transfer_id = lease.snapshot.transfer_id
+        del self.state_leases[transfer_id]
+        self.quarantined_state_leases.discard(transfer_id)
+        self.completed_state_leases[transfer_id] = consumer
+        while len(self.completed_state_leases) > STATE_COMPLETION_HISTORY_SIZE:
+            self.completed_state_leases.popitem(last=False)
+        self.finished_requests.put(lease.snapshot.source_request_id)
+
+    def _expire_state_leases_locked(self) -> None:
+        now = time.monotonic()
+        for lease in tuple(self.state_leases.values()):
+            if lease.may_expire(now):
+                self._retire_state_lease(lease, None)
+            elif now >= lease.expires_at and lease.snapshot.transfer_id not in self.quarantined_state_leases:
+                # Expiry is not a DMA fence once any TP worker starts reading.
+                self.quarantined_state_leases.add(lease.snapshot.transfer_id)
+                logger.error("Retaining acquired state transfer %s past its lease deadline", lease.snapshot.transfer_id)
 
     def add_delayed_request(self, request_id: str) -> None:
         with self.state_lock:
@@ -106,6 +173,7 @@ class MooncakeSchedulerSendingThread(MooncakeMetadataThread):
         finished: set[str] = set()
         with self.state_lock:
             self._retrieve_expired_requests_locked()
+            self._expire_state_leases_locked()
         while True:
             try:
                 finished.add(self.finished_requests.get_nowait())
@@ -119,6 +187,9 @@ class MooncakeSchedulerSendingThread(MooncakeMetadataThread):
         with self.state_lock:
             self.delayed_free_requests.clear()
             self.renewed_requests.clear()
+            self.state_leases.clear()
+            self.completed_state_leases.clear()
+            self.quarantined_state_leases.clear()
         while not self.finished_requests.empty():
             self.finished_requests.get_nowait()
 
@@ -151,8 +222,13 @@ class MooncakeSchedulerSendingThread(MooncakeMetadataThread):
 
             try:
                 msg = decoder.decode(payload[0])
-                if msg and msg[0] == GET_META_MSG:
-                    sock.send_multipart((identity, b"", self.encoded_metadata))
+                if msg and msg[0] in (GET_META_MSG, STATE_META_MSG):
+                    # Legacy peers must never receive source addresses for a
+                    # snapshot that requires generation acquisition before READ.
+                    metadata = self.encoded_metadata if self.state_mode == (msg[0] == STATE_META_MSG) else b""
+                    sock.send_multipart((identity, b"", metadata))
+                elif msg and msg[0] in (STATE_ACQUIRE_MSG, STATE_DONE_MSG):
+                    sock.send_multipart((identity, b"", self._state_control(msg)))
                 elif msg[0] == DONE_RECVING_MSG and len(msg) == 2:
                     self._handle_finished_request(str(msg[1]))
                     sock.send_multipart((identity, b"", ACK_MSG))
@@ -204,14 +280,20 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
         super().__init__(daemon=True, name="MooncakeSchedulerRecvingThread")
         self.ready_event = ready_event
         self.stop_event = threading.Event()
-        self.request_queue: queue.Queue[tuple[str, int, str] | None] = queue.Queue()
+        self.request_queue: queue.Queue[CompletionTarget | None] = queue.Queue()
         self.encoder = msgspec.msgpack.Encoder()
         self.remote_sockets: dict[str, deque[Any]] = defaultdict(deque)
         self.remote_sockets_lock = threading.Lock()
         self.zmq_context: Any | None = None
 
-    def add_request(self, remote_host: str, remote_port: int, request_id: str) -> None:
-        self.request_queue.put((remote_host, remote_port, request_id))
+    def add_request(
+        self, remote_host: str, remote_port: int, request_id: str, transfer_id: str = "", consumer: str = ""
+    ) -> None:
+        target = (remote_host, remote_port, request_id)
+        if transfer_id:
+            self.request_queue.put((*target, transfer_id, consumer))
+        else:
+            self.request_queue.put(target)
 
     def shutdown(self) -> None:
         if not self.stop_event.is_set():
@@ -239,15 +321,9 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
                 try:
                     if request is None or self.stop_event.is_set():
                         break
-                    self._send_done_recving(*request)
+                    self._notify_completion(request)
                 except Exception:
-                    # The socket helpers already retry. Let P's delayed-free
-                    # timeout reclaim blocks if this notification cannot arrive.
-                    logger.exception(
-                        "Failed to send Mooncake scheduler completion for request %s; "
-                        "producer cleanup will rely on its delayed-free timeout",
-                        request[2] if request is not None else None,
-                    )
+                    logger.exception("Failed to notify producer of Mooncake receive completion: %s", request)
                 finally:
                     self.request_queue.task_done()
         finally:
@@ -263,17 +339,35 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
                     self.zmq_context = None
             self._clear_pending_requests()
 
-    def _send_done_recving(self, remote_host: str, remote_port: int, request_id: str) -> None:
+    def _notify_completion(self, request: CompletionTarget) -> None:
+        attempts = STATE_COMPLETION_ATTEMPTS if len(request) == 5 else 1
+        for attempt in range(attempts):
+            try:
+                self._send_done_recving(*request)
+                return
+            except Exception:
+                if attempt == attempts - 1:
+                    raise
+                if self.stop_event.wait(0.25):
+                    return
+
+    def _send_done_recving(
+        self, remote_host: str, remote_port: int, request_id: str, transfer_id: str = "", consumer: str = ""
+    ) -> None:
         path = make_zmq_path("tcp", remote_host, remote_port)
         sock = self._get_remote_socket(path)
         try:
             ensure_zmq_send(
                 sock,
-                self.encoder.encode((DONE_RECVING_MSG, request_id)),
+                self.encoder.encode(
+                    (STATE_DONE_MSG, transfer_id, consumer) if transfer_id else (DONE_RECVING_MSG, request_id)
+                ),
                 path,
             )
             response = ensure_zmq_recv(sock, path)
-            if response != ACK_MSG:
+            if transfer_id and response == b"REJECT":
+                logger.warning("Producer rejected state completion for generation %s", transfer_id)
+            elif response != ACK_MSG:
                 raise RuntimeError(f"Unexpected Mooncake scheduler completion response: {response!r}")
         except Exception:
             sock.close(linger=0)
@@ -322,7 +416,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
         # D request -> (P scheduler host, port, P request id).
-        self._reqs_recv_info: dict[str, tuple[str, int, str]] = {}
+        self._reqs_recv_info: dict[str, CompletionTarget] = {}
+        self._active_state_receives: set[tuple[str, int, str]] = set()
+        self._state_receive_completions: OrderedDict[tuple[str, int, str], None] = OrderedDict()
         # Successful validations expire and have a bounded endpoint count.
         # Only the scheduler thread accesses this cache.
         self._validated_producer_leases: TTLCache[tuple[str, int], tuple[str, int]] = TTLCache(
@@ -344,8 +440,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             self._recving_thread = MooncakeSchedulerRecvingThread(recving_ready_event)
             self._recving_thread.start()
             recving_ready_event.wait()
-            self._heartbeat_thread = MooncakeHeartbeatThread(self._kv_lease_duration // 6)
-            self._heartbeat_thread.start()
+            if not self.state_mode:
+                self._heartbeat_thread = MooncakeHeartbeatThread(self._kv_lease_duration // 6)
+                self._heartbeat_thread.start()
 
     def on_new_request(self, request: "Request") -> None:
         """Track remote KV leases from scheduler admission until receive completion."""
@@ -397,6 +494,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_need_send.clear()
         self._reqs_in_batch.clear()
         self._reqs_recv_info.clear()
+        if self.state_mode:
+            self._active_state_receives.clear()
+            self._state_receive_completions.clear()
         self._validated_producer_leases.clear()
 
     def set_xfer_handshake_metadata_from_workers(
@@ -459,6 +559,15 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                     params["remote_port"],
                     params["remote_request_id"],
                 )
+                if self.state_mode:
+                    snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
+                    if num_external_tokens != snapshot.boundary:
+                        raise ValueError("State receive must reserve the entire transferred prefix")
+                    remote += (snapshot.transfer_id, params["dsv41_state_consumer"])
+                    key = (remote[0], remote[1], snapshot.transfer_id)
+                    if key in self._active_state_receives or key in self._state_receive_completions:
+                        raise ValueError("A state generation may be loaded only once at D")
+                    self._active_state_receives.add(key)
                 if num_external_tokens > 0:
                     self._reqs_need_recv[request.request_id] = (
                         request,
@@ -522,22 +631,26 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         )
 
         if params is not None and params.get("do_remote_prefill"):
-            # Allocation clears this flag before starting a READ. A rejected
-            # or cancelled request that still has it never started receiving,
-            # so notify P directly instead of leaving its blocks pinned.
+            # Allocation clears this flag before scheduling READ. A cancelled
+            # request that still has it can release an unconsumed generation.
             if params.get("remote_block_ids"):
                 required_remote_fields = ("remote_host", "remote_port", "remote_request_id")
                 if all(field in params for field in required_remote_fields):
                     if self._recving_thread is None:
                         raise RuntimeError("Producer Mooncake scheduler cannot acknowledge a receive request")
-                    self._recving_thread.add_request(
-                        params["remote_host"], params["remote_port"], params["remote_request_id"]
-                    )
+                    remote = (params["remote_host"], params["remote_port"], params["remote_request_id"])
+                    if self.state_mode:
+                        snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
+                        key = (remote[0], remote[1], snapshot.transfer_id)
+                        # A synthetic frontend abort must not invent another
+                        # consumer for a generation already owned by workers.
+                        if key not in self._active_state_receives and key not in self._state_receive_completions:
+                            consumer = params.get("dsv41_state_consumer", f"{self.engine_id}/{request.request_id}")
+                            self._recving_thread.add_request(*remote, snapshot.transfer_id, consumer)
+                    else:
+                        self._recving_thread.add_request(*remote)
                 else:
                     logger.warning("Got invalid KVTransferParams. params=%s.", params)
-            # Make repeated finish callbacks harmless, including zero-block
-            # requests. Transfers already handed to workers use their normal
-            # aggregated receive-completion notification instead.
             params["do_remote_prefill"] = False
             return False, None
 
@@ -550,6 +663,18 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
         prompt_token_ids = request.prompt_token_ids or []
         prompt_len = len(prompt_token_ids)
+        snapshot = None
+        if self.state_mode:
+            if request.num_computed_tokens != prompt_len or request.num_in_flight_tokens:
+                raise ValueError("P state snapshot is not at a completed immutable token boundary")
+            snapshot = StateSnapshot.create(
+                uuid.uuid4().hex,
+                request.request_id,
+                self.state_model_id,
+                prompt_len,
+                params.get("_dsv41_original_prompt_tokens", 0),
+                self.tp_size,
+            )
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
         delay_free_blocks = num_computed_blocks > 0
@@ -563,7 +688,10 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = delay_start_time
             if self._sending_thread is None:
                 raise RuntimeError("Mooncake scheduler metadata has not been initialized")
-            self._sending_thread.add_delayed_request(request.request_id)
+            if snapshot is None:
+                self._sending_thread.add_delayed_request(request.request_id)
+            else:
+                self._sending_thread.add_state_lease(snapshot, delay_start_time, computed_block_ids)
 
         return delay_free_blocks, {
             "do_remote_prefill": True,
@@ -576,6 +704,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             "remote_port": self.side_channel_port,
             "remote_kv_lease_duration": self._kv_lease_duration,
             "last_token_id": request.output_token_ids[-1],
+            **({"dsv41_state_snapshot": snapshot.to_wire()} if snapshot is not None else {}),
         }
 
     def update_connector_output(
@@ -592,6 +721,13 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 if self._recving_thread is None:
                     raise RuntimeError("Producer Mooncake scheduler received a receive-completion event")
                 self._recving_thread.add_request(*remote)
+                if len(remote) == 5:
+                    completion_key = (remote[0], remote[1], remote[3])
+                    self._active_state_receives.discard(completion_key)
+                    self._state_receive_completions[completion_key] = None
+                    self._state_receive_completions.move_to_end(completion_key)
+                    while len(self._state_receive_completions) > STATE_COMPLETION_HISTORY_SIZE:
+                        self._state_receive_completions.popitem(last=False)
                 if req_id in connector_output.failed_recving:
                     logger.error(
                         "Mooncake D receive failed after worker aggregation: request_id=%s, "

@@ -78,11 +78,14 @@ from vllm_ascend.attention.utils import (
     supports_strided_mla_cache,
 )
 from vllm_ascend.core.kv_cache_interface import (
+    KV_CACHE_BUFFER_ALIGNMENT,
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    get_cache_group_capacity,
     get_kv_cache_compression_ratio,
+    get_request_state_plan,
     get_storage_block_size,
     requires_padded_page_layout,
     supports_component_major_mla_pd,
@@ -683,6 +686,7 @@ def build_attn_metadata(
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,
                     skip_ring_state_update=skip_ring_state_update,
+                    request_state_pools=get_request_state_plan(kv_cache_config) is not None,
                     common_v41_metadata=common_v41_metadata,
                     common_v41_batch_metadata=common_v41_batch_metadata,
                     v41_prefill_override=v41_prefill_override,
@@ -1189,8 +1193,8 @@ def _allocate_kv_cache(
     is_dsv4_model = _is_dsv4_model(vllm_config)
     # init kv cache tensors
     kv_cache_raw_tensors: dict[str, Any] = {}
-    # prefill disaggregation need the addr of cache tensor be aligned with 2M
-    alignment = 2 * 1024 * 1024
+    # Mooncake registers 2 MiB-aligned cache backings.
+    alignment = KV_CACHE_BUFFER_ALIGNMENT
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     attn_layers: dict[str, AttentionLayerBase] | None = None
     # Gemma 4 full/sliding groups share one pool while retaining contiguous
@@ -1870,7 +1874,7 @@ def _reshape_kv_cache_v2(
                 block_stride = layer_tuple_strides[layer_name]
                 initial_offset = 0
                 kv_cache_shape = group.backend.get_kv_cache_shape(
-                    kv_cache_config.num_blocks,
+                    get_cache_group_capacity(kv_cache_config, group.kv_cache_group_id),
                     get_storage_block_size(kv_cache_spec),
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
@@ -1880,11 +1884,11 @@ def _reshape_kv_cache_v2(
                 is_index = isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.scale_dim
                 if is_index:
                     source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                    source_spec = layer_kv_cache_spec[source_name]
-                    initial_offset = source_spec.unpadded_page_size_bytes
+                    if get_request_state_plan(kv_cache_config) is None:
+                        initial_offset = layer_kv_cache_spec[source_name].unpadded_page_size_bytes
                     kv_cache_shape_list.append(
                         group.backend.get_kv_cache_shape(
-                            kv_cache_config.num_blocks,
+                            get_cache_group_capacity(kv_cache_config, group.kv_cache_group_id),
                             get_storage_block_size(kv_cache_spec),
                             kv_cache_spec.num_kv_heads,
                             kv_cache_spec.scale_dim,

@@ -382,6 +382,31 @@ vLLM Ascend revision.
         used by this configuration. `enable_cpu_binding` pins worker processes to
         CPUs, while `enable_npugraph_ex` enables the enhanced ACL Graph path.
 
+#### Experimental request-state pools
+
+The unpacked DeepSeek V4.1 Flash layout can use separate pools for history,
+SWA and compressor state with Model Runner V2. Enable
+`"enable_dsv41_request_state_pools": true` in `--additional-config`.
+Use `--no-enable-prefix-caching` and `--no-swa-bounded-replay`, and omit
+speculative decoding. This option requires PP, PCP and DCP sizes of one.
+
+The cache budget first reserves `--max-num-seqs` usable slots in each request
+state pool, one null slot per pool, and a shared SWA staging workspace. The
+remaining bytes determine history capacity. With P/D, the budget also reserves
+alignment overhead for the registered backings on each rank.
+
+For P/D, give both peers the same model weights, precision, cache layout and TP
+size. Use `"kv_connector": "MooncakePullConnector"` with `"kv_role":
+"kv_producer"` on P and `"kv_role": "kv_consumer"` on D. Set
+`"kv_load_failure_policy": "fail"` and include
+`"dsv41_state_pd": true` and a shared checkpoint identifier
+`"state_model_id"` in `kv_connector_extra_config`. Keep the full prompt for
+D and forward the producer's `kv_transfer_params` intact through the pull
+proxy. P computes all but the final input token, and D computes that token
+after the state has arrived. A transport error without a DMA completion fence
+requires retiring the D instance before the P instance. Start replacements with
+fresh engine identities. Sleep and KVPP are unsupported for this transfer path.
+
 ### 5.2 1P1D PD Disaggregated Deployment
 
 === "950DT products"

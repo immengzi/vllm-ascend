@@ -30,6 +30,11 @@ from vllm_ascend.ascend_config import (
     init_ascend_config,
 )
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
+    StateSnapshot,
+    is_state_config,
+    validate_pd_config,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakePCPTransferMetadata,
     MooncakePPTransferMetadata,
@@ -187,7 +192,7 @@ class MooncakeMetadataThread(threading.Thread):
                 for tp_rank, worker_metadata in workers_by_tp_rank.items():
                     mismatched_fields = [
                         field_name
-                        for field_name in ("block_size", "num_blocks", "cp_kv_cache_interleave_size")
+                        for field_name in ("block_size", "num_blocks", "cp_kv_cache_interleave_size", "state_layout")
                         if getattr(worker_metadata, field_name) != getattr(reference, field_name)
                     ]
                     if mismatched_fields:
@@ -313,6 +318,7 @@ class MooncakeMetadataThread(threading.Thread):
                 block_shapes=block_shapes,
                 block_size_scales=block_size_scales,
                 metadata_by_pcp_rank=metadata_by_pcp_rank,
+                state_layout=reference.state_layout,
                 indexer_replication_sizes=indexer_replication_sizes,
             )
         return merged
@@ -414,7 +420,9 @@ class MooncakeBaseConnectorScheduler:
         self.kv_cache_groups = kv_cache_config.kv_cache_groups
         self.group_block_size = [group.kv_cache_spec.block_size for group in self.kv_cache_groups]
         self.group_unique_specs = [self._get_group_unique_specs(group) for group in self.kv_cache_groups]
-        self.need_truncate = self._needs_prefill_token_truncation()
+        self.state_mode = is_state_config(kv_cache_config)
+        self.state_model_id = validate_pd_config(vllm_config) if self.state_mode else ""
+        self.need_truncate = self.state_mode or self._needs_prefill_token_truncation()
         self._logged_mamba_allocation = False
 
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
@@ -537,6 +545,15 @@ class MooncakeBaseConnectorScheduler:
         # Truncate before local prefix-cache lookup so its hit count stays
         # consistent with the prompt length used by the scheduler.
         params = request.kv_transfer_params
+        if (
+            self.state_mode
+            and params is not None
+            and params.get("do_remote_decode")
+            and not params.get("_p_side_truncated")
+        ):
+            if request.num_prompt_tokens < 2:
+                raise ValueError("State PD initially requires at least two prompt tokens")
+            params.setdefault("_dsv41_original_prompt_tokens", request.num_prompt_tokens)
         if params is not None and params.get("do_remote_decode") and self.need_truncate:
             self._truncate_request_for_prefill(request)
 
@@ -559,6 +576,18 @@ class MooncakeBaseConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             token_ids = request.prompt_token_ids or []
             actual = self._state_prefill_token_count(len(token_ids))
+            if self.state_mode:
+                snapshot = StateSnapshot.from_wire(params.get("dsv41_state_snapshot", {}))
+                if (
+                    snapshot.model_id != self.state_model_id
+                    or snapshot.tp_size != self.tp_size
+                    or snapshot.original_prompt_tokens != len(token_ids)
+                    or snapshot.boundary != actual
+                    or snapshot.source_request_id != params.get("remote_request_id")
+                    or num_computed_tokens != 0
+                ):
+                    raise ValueError("State PD requires a complete cold handoff at T=N-1")
+                params["dsv41_state_consumer"] = f"{self.engine_id}/{request.request_id}"
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
