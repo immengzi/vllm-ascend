@@ -198,6 +198,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
 
     def __init__(self) -> None:
         self.requests: dict[str, ReqMeta] = {}
+        self.pull_failed_requests: set[str] = set()
         self.push_requests: dict[str, PushReqMeta] = {}
         self.push_send_requests: dict[str, PushSendReqMeta] = {}
         # P request ID -> D completion routing, including pre-dispatch aborts.

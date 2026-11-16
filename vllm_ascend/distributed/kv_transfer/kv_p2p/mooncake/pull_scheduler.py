@@ -412,6 +412,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
         # Requests waiting for the worker to start a READ transfer.
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, BlockIds, int]] = {}
+        self._failed_state_receives: set[str] = set()
         # Producer requests whose blocks must remain allocated until read.
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
@@ -495,6 +496,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._reqs_in_batch.clear()
         self._reqs_recv_info.clear()
         if self.state_mode:
+            self._failed_state_receives.clear()
             self._active_state_receives.clear()
             self._state_receive_completions.clear()
         self._validated_producer_leases.clear()
@@ -526,6 +528,25 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if not self._sending_thread.is_alive():
             raise RuntimeError("Mooncake scheduler sending thread failed to start")
 
+    def _state_receive_target(self, request: "Request", params: dict[str, Any]) -> tuple[str, int, str, str, str]:
+        snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
+        host, port, engine_id = params["remote_host"], params["remote_port"], params["remote_engine_id"]
+        if (
+            snapshot.model_id != self.state_model_id
+            or snapshot.tp_size != self.tp_size
+            or snapshot.boundary != params["remote_num_prompt_tokens"]
+            or snapshot.source_request_id != params["remote_request_id"]
+            or not isinstance(host, str)
+            or not host
+            or type(port) is not int
+            or not 0 < port < 65536
+            or not isinstance(engine_id, str)
+            or not engine_id
+            or not params.get("remote_block_ids")
+        ):
+            raise ValueError("State PD requires a complete cold handoff at T=N-1")
+        return host, port, snapshot.source_request_id, snapshot.transfer_id, f"{self.engine_id}/{request.request_id}"
+
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -546,6 +567,37 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if params is None or not params.get("do_remote_prefill"):
             return
 
+        if self.state_mode:
+            params["do_remote_prefill"] = False
+            if num_external_tokens == 0:
+                # An explicit skip of external KV has no async receive to fail.
+                return
+            try:
+                remote = self._state_receive_target(request, params)
+                if (
+                    num_external_tokens != request.num_prompt_tokens - 1
+                    or num_external_tokens != params["remote_num_prompt_tokens"]
+                    or params["num_computed_tokens"] != 0
+                ):
+                    raise ValueError("State receive must reserve the entire transferred prefix")
+                key = (remote[0], remote[1], remote[3])
+                if key in self._active_state_receives or key in self._state_receive_completions:
+                    raise ValueError("A state generation may be loaded only once at D")
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Rejecting DSV4.1 state handoff for request %s: %s", request.request_id, exc)
+                self._failed_state_receives.add(request.request_id)
+                return
+            params["dsv41_state_consumer"] = remote[4]
+            self._active_state_receives.add(key)
+            self._reqs_need_recv[request.request_id] = (
+                request,
+                blocks.get_unhashed_block_ids_all_groups(),
+                blocks.get_block_ids(),
+                num_external_tokens,
+            )
+            self._reqs_recv_info[request.request_id] = remote
+            return
+
         if params.get("remote_block_ids"):
             required_remote_fields = (
                 "remote_engine_id",
@@ -559,15 +611,6 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                     params["remote_port"],
                     params["remote_request_id"],
                 )
-                if self.state_mode:
-                    snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
-                    if num_external_tokens != snapshot.boundary:
-                        raise ValueError("State receive must reserve the entire transferred prefix")
-                    remote += (snapshot.transfer_id, params["dsv41_state_consumer"])
-                    key = (remote[0], remote[1], snapshot.transfer_id)
-                    if key in self._active_state_receives or key in self._state_receive_completions:
-                        raise ValueError("A state generation may be loaded only once at D")
-                    self._active_state_receives.add(key)
                 if num_external_tokens > 0:
                     self._reqs_need_recv[request.request_id] = (
                         request,
@@ -608,6 +651,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             )
 
         self._reqs_need_recv.clear()
+        if self.state_mode:
+            meta.pull_failed_requests = self._failed_state_receives
+            self._failed_state_receives = set()
         meta.reqs_in_batch = self._reqs_in_batch
         self._reqs_in_batch = set()
         return meta
@@ -633,38 +679,46 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if params is not None and params.get("do_remote_prefill"):
             # Allocation clears this flag before scheduling READ. A cancelled
             # request that still has it can release an unconsumed generation.
+            if self.state_mode:
+                params["do_remote_prefill"] = False
+                try:
+                    remote = self._state_receive_target(request, params)
+                except (KeyError, TypeError, ValueError):
+                    return False, None
+                key = (remote[0], remote[1], remote[3])
+                # A frontend abort cannot release a generation owned by workers.
+                if key not in self._active_state_receives and key not in self._state_receive_completions:
+                    assert self._recving_thread is not None
+                    self._recving_thread.add_request(*remote)
+                return False, None
             if params.get("remote_block_ids"):
                 required_remote_fields = ("remote_host", "remote_port", "remote_request_id")
                 if all(field in params for field in required_remote_fields):
                     if self._recving_thread is None:
                         raise RuntimeError("Producer Mooncake scheduler cannot acknowledge a receive request")
                     remote = (params["remote_host"], params["remote_port"], params["remote_request_id"])
-                    if self.state_mode:
-                        snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
-                        key = (remote[0], remote[1], snapshot.transfer_id)
-                        # A synthetic frontend abort must not invent another
-                        # consumer for a generation already owned by workers.
-                        if key not in self._active_state_receives and key not in self._state_receive_completions:
-                            consumer = params.get("dsv41_state_consumer", f"{self.engine_id}/{request.request_id}")
-                            self._recving_thread.add_request(*remote, snapshot.transfer_id, consumer)
-                    else:
-                        self._recving_thread.add_request(*remote)
+                    self._recving_thread.add_request(*remote)
                 else:
                     logger.warning("Got invalid KVTransferParams. params=%s.", params)
             params["do_remote_prefill"] = False
             return False, None
 
+        if params is None or not params.get("do_remote_decode"):
+            return False, None
         if (
-            params is None
-            or not params.get("do_remote_decode")
-            or request.status != RequestStatus.FINISHED_LENGTH_CAPPED
+            self.state_mode
+            and params.get("_dsv41_original_prompt_tokens") == 1
+            and request.status in (RequestStatus.FINISHED_STOPPED, RequestStatus.FINISHED_LENGTH_CAPPED)
         ):
+            # N=1 has no shareable prefix. Override the proxy's P-side flags.
+            return False, {"do_remote_prefill": False, "do_remote_decode": False}
+        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
 
-        prompt_token_ids = request.prompt_token_ids or []
-        prompt_len = len(prompt_token_ids)
+        prompt_len = len(request.prompt_token_ids or [])
         snapshot = None
         if self.state_mode:
+            prompt_len = request.num_prompt_tokens
             if request.num_computed_tokens != prompt_len or request.num_in_flight_tokens:
                 raise ValueError("P state snapshot is not at a completed immutable token boundary")
             snapshot = StateSnapshot.create(

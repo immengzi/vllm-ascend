@@ -704,12 +704,13 @@ class AscendDSAV41Impl:
             return forward_request_window(self, attn, q, metadata, compressed_indices, source_cache=source_cache)
         return self._forward_attention_impl(attn, q, metadata, compressed_indices, source_cache=source_cache)
 
-    def _forward_attention_impl(self, attn, q, metadata, compressed_indices, *, source_cache=None):
+    def _forward_attention_impl(self, attn, q, metadata, compressed_indices, *, source_cache=None, staged_window=None):
         """Run SparseFlashMla with the same PA metadata for both operator stages."""
         if source_cache is None and self.role.has_long_context:
             source_cache = get_forward_context().no_compile_layers[self.long_kv_source_prefix].kv_cache[0]
         backend = getattr(attn, "packed_cache_ops", None)
         if backend is not None:
+            assert staged_window is None
             compressed_lengths = None
             if self.role.has_long_context and attn.shared_state.topk_lengths is not None:
                 compressed_lengths = attn.shared_state.topk_lengths[: q.shape[0]]
@@ -749,7 +750,13 @@ class AscendDSAV41Impl:
             id(op_metadata),
         )
         swa_cache = attn.dsa_attn.swa_cache_layer.kv_cache[0]
-        if metadata.swa.replay_block_table is not None:
+        if staged_window is not None:
+            state = metadata.swa.request_state
+            assert state is not None
+            swa_cache = staged_window
+            ori_block_table = state.block_table[:num_reqs]
+            seq_lens = state.lengths[:num_reqs]
+        elif metadata.swa.replay_block_table is not None:
             # Rebase only SWA: A3 CSA cannot mask its missing prefix with
             # sparse ori indices. Compressed KV retains its causal coordinates.
             swa_cache = swa_cache[metadata.swa.replay_cache_blocks, metadata.swa.replay_cache_offsets]

@@ -1567,6 +1567,8 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             raise RuntimeError("Mooncake pull worker is shutting down")
         if self.kv_transfer_config.is_kv_consumer and self._recving_thread is not None:
             self._recving_thread.raise_if_unfenced_state_dma()
+            for request_id in metadata.pull_failed_requests:
+                self._recving_thread.finished_requests.put((request_id, True))
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:

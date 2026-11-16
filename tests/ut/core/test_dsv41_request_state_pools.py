@@ -5,7 +5,7 @@
 import copy
 import pickle
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -21,6 +21,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_cache_group_capacity,
     register_ascend_kv_cache_specs,
 )
+from vllm_ascend.models.deepseek_v41 import request_state
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_request_state_groups,
     get_request_state_pd_alignment_bytes,
@@ -232,6 +233,36 @@ def test_staging_uses_one_workspace_and_pads_only_staging_rows(geometry):
     assert metadata.state_ids.tolist() == [1, 2]
     assert metadata.lengths.tolist() == [129, 0]
     assert metadata.rows_used == 256
+
+
+def test_staged_attention_keeps_registered_ring_bound(monkeypatch):
+    import sys
+
+    ring, projected, staging = (object() for _ in range(3))
+    layer = SimpleNamespace(kv_cache=[ring])
+    attn = SimpleNamespace(dsa_attn=SimpleNamespace(swa_cache_layer=layer))
+    state = SimpleNamespace(state_ids=object())
+    swa = SimpleNamespace(request_state=state, query_start_loc=object(), seq_lens=object(), max_query_len=1)
+    metadata = SimpleNamespace(swa=swa)
+    stages = Mock()
+    monkeypatch.setattr(request_state, "_stage", Mock(return_value=(ring, projected, staging)))
+    monkeypatch.setattr(request_state, "_release_current_kv", stages.release)
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.models.deepseek_v41.state_kernels", SimpleNamespace(commit=stages.commit)
+    )
+
+    def forward(attn_arg, q, step_metadata, indices, *, source_cache, staged_window):
+        assert attn_arg is attn and layer.kv_cache == [ring]
+        assert step_metadata is metadata and staged_window is staging
+        return q
+
+    stages.forward.side_effect = forward
+    impl = SimpleNamespace(_forward_attention_impl=stages.forward)
+    q = object()
+    assert request_state.forward_request_window(impl, attn, q, metadata, None) is q
+    assert [entry[0] for entry in stages.mock_calls] == ["forward", "commit", "release"]
+    stages.commit.assert_called_once_with(ring, projected, state.state_ids, swa.query_start_loc, swa.seq_lens)
+    assert layer.kv_cache == [ring]
 
 
 def test_core_resolves_rank_minimum_after_reserving_fixed_pools(geometry):

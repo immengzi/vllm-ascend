@@ -38,7 +38,7 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import is_state_config
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.dsv41 import make_layout, pool_capacity
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.dsv41 import make_layout
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePPTransferMetadata,
@@ -590,12 +590,9 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
                         block_strides.append(cache.stride(0) * element_size)
                         block_lens.append(math.prod(block_shape) * element_size)
                         block_shapes.append(block_shape)
-                        logical_count = (
-                            pool_capacity(self.kv_cache_config, layer_name) if state_mode else self.num_blocks
-                        )
-                        if tensor_num_blocks < logical_count or tensor_num_blocks % logical_count:
-                            raise ValueError(f"Invalid logical capacity for {layer_name}")
-                        block_size_scales.append(tensor_num_blocks // logical_count)
+                        # State layouts expose one row-strided view per pool
+                        # page. make_layout validates capacity before registration.
+                        block_size_scales.append(1 if state_mode else tensor_num_blocks // self.num_blocks)
 
                 layer_names.append(layer_name)
                 layer_block_size = spec.block_size

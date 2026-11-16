@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Chronological window execution; metadata and workspace ownership are explicit."""
 
-from dataclasses import replace
-
 import torch
 
 from vllm_ascend.models.deepseek_v41.cache_config import WINDOW
@@ -73,32 +71,16 @@ def defer_window_write(attn, metadata, value):
     attn._request_state_current_kv_stream = torch.npu.current_stream()
 
 
-def forward_request_window(impl, attn, q, metadata, compressed_indices, **kwargs):
+def forward_request_window(impl, attn, q, metadata, compressed_indices, *, source_cache=None):
     from vllm_ascend.models.deepseek_v41.state_kernels import commit
 
     swa = metadata.swa
     state = swa.request_state
     assert state is not None
     ring, current, staging = _stage(attn, metadata)
-    layer = attn.dsa_attn.swa_cache_layer
-    old_cache = layer.kv_cache
-    replacement = replace(
-        metadata,
-        swa=replace(
-            metadata.swa,
-            block_table=state.block_table,
-            seq_lens=state.lengths,
-        ),
+    output = impl._forward_attention_impl(
+        attn, q, metadata, compressed_indices, source_cache=source_cache, staged_window=staging
     )
-    # These replay fields are optional on the pinned metadata type.
-    replacement.swa.replay_block_table = None
-    replacement.swa.replay_cache_blocks = None
-    replacement.swa.replay_cache_offsets = None
-    layer.kv_cache = [staging]
-    try:
-        output = impl._forward_attention_impl(attn, q, replacement, compressed_indices, **kwargs)
-    finally:
-        layer.kv_cache = old_cache
     commit(ring, current, state.state_ids, swa.query_start_loc, swa.seq_lens)
     _release_current_kv(attn, current, prefill=swa.max_query_len > 1)
     return output

@@ -31,7 +31,6 @@ from vllm_ascend.ascend_config import (
 )
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
-    StateSnapshot,
     is_state_config,
     validate_pd_config,
 )
@@ -551,9 +550,9 @@ class MooncakeBaseConnectorScheduler:
             and params.get("do_remote_decode")
             and not params.get("_p_side_truncated")
         ):
-            if request.num_prompt_tokens < 2:
-                raise ValueError("State PD initially requires at least two prompt tokens")
             params.setdefault("_dsv41_original_prompt_tokens", request.num_prompt_tokens)
+            if request.num_prompt_tokens == 1:
+                request.max_tokens = 1
         if params is not None and params.get("do_remote_decode") and self.need_truncate:
             self._truncate_request_for_prefill(request)
 
@@ -574,21 +573,12 @@ class MooncakeBaseConnectorScheduler:
         )
 
         if params is not None and params.get("do_remote_prefill"):
-            token_ids = request.prompt_token_ids or []
-            actual = self._state_prefill_token_count(len(token_ids))
-            if self.state_mode:
-                snapshot = StateSnapshot.from_wire(params.get("dsv41_state_snapshot", {}))
-                if (
-                    snapshot.model_id != self.state_model_id
-                    or snapshot.tp_size != self.tp_size
-                    or snapshot.original_prompt_tokens != len(token_ids)
-                    or snapshot.boundary != actual
-                    or snapshot.source_request_id != params.get("remote_request_id")
-                    or num_computed_tokens != 0
-                ):
-                    raise ValueError("State PD requires a complete cold handoff at T=N-1")
-                params["dsv41_state_consumer"] = f"{self.engine_id}/{request.request_id}"
             params["num_computed_tokens"] = num_computed_tokens
+            if self.state_mode:
+                # A non-empty remote hint must take the async receive path so
+                # malformed handoffs can fail this request through KV output.
+                return max(request.num_prompt_tokens - 1, 1), True
+            actual = self._state_prefill_token_count(len(request.prompt_token_ids or []))
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
                 return count, True

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 import json
+import queue
 import threading
 import time
 from collections import OrderedDict
@@ -247,6 +248,21 @@ def test_destination_zeroes_only_its_request_slots():
     assert not rings[LAYERS[3]][3].any() and rings[LAYERS[3]][2].all()
 
 
+def state_decoder():
+    decoder = object.__new__(MooncakePullConnectorScheduler)
+    decoder.state_mode, decoder.need_truncate, decoder.state_model_id, decoder.tp_size = True, True, "weights", 4
+    decoder.engine_id = "decoder"
+    decoder._reqs_need_recv, decoder._reqs_recv_info = {}, {}
+    decoder._failed_state_receives = set()
+    decoder._state_receive_completions = OrderedDict()
+    decoder._active_state_receives = set()
+    decoder._reqs_in_batch = set()
+    decoder._sending_thread = decoder._heartbeat_thread = None
+    decoder._recving_thread = Mock()
+    decoder._log_mamba_request_allocation = Mock()
+    return decoder
+
+
 def test_scheduler_handoff_boundary_and_aggregate_completion():
     p = object.__new__(MooncakePullConnectorScheduler)
     p.state_mode = True
@@ -273,16 +289,7 @@ def test_scheduler_handoff_boundary_and_aggregate_completion():
     retain, wire = p.request_finished(request, ([1, 2], [2], [3]))
     assert retain and wire["remote_num_prompt_tokens"] == 256
 
-    d = object.__new__(MooncakePullConnectorScheduler)
-    d.state_mode, d.need_truncate, d.state_model_id, d.tp_size = True, True, "weights", 4
-    d.engine_id = "decoder"
-    d._reqs_need_recv, d._reqs_recv_info = {}, {}
-    d._state_receive_completions = OrderedDict()
-    d._active_state_receives = set()
-    d._reqs_in_batch = set()
-    d._sending_thread = d._heartbeat_thread = None
-    d._recving_thread = Mock()
-    d._log_mamba_request_allocation = Mock()
+    d = state_decoder()
     receiver = Request("decode", list(range(257)), SamplingParams(max_tokens=4), pooling_params=None)
     receiver.kv_transfer_params = wire
     assert d.get_num_new_matched_tokens(receiver, 0) == (256, True)
@@ -299,6 +306,75 @@ def test_scheduler_handoff_boundary_and_aggregate_completion():
     d._recving_thread.add_request.assert_called_once_with(
         "127.0.0.1", 10020, "prefill", wire["dsv41_state_snapshot"]["transfer_id"], "decoder/decode"
     )
+
+
+@pytest.mark.parametrize("invalid", ["missing_snapshot", "checkpoint", "boundary", "replay", "missing_route"])
+def test_rejected_handoff_reports_request_failure_without_read_or_done(invalid):
+    d = state_decoder()
+    source = snapshot()
+    params = {
+        "do_remote_prefill": True,
+        "remote_engine_id": "producer",
+        "remote_request_id": source.source_request_id,
+        "remote_host": "127.0.0.1",
+        "remote_port": 10020,
+        "remote_num_prompt_tokens": source.boundary,
+        "remote_block_ids": ([1], [2], [3]),
+        "dsv41_state_snapshot": source.to_wire(),
+    }
+    if invalid == "missing_snapshot":
+        del params["dsv41_state_snapshot"]
+    elif invalid == "checkpoint":
+        params["dsv41_state_snapshot"]["model_id"] = "other-weights"
+    elif invalid == "boundary":
+        params["remote_num_prompt_tokens"] += 1
+    elif invalid == "replay":
+        d._active_state_receives.add(("127.0.0.1", 10020, source.transfer_id))
+    else:
+        del params["remote_host"]
+
+    request = Request("rejected", list(range(source.original_prompt_tokens)), SamplingParams(max_tokens=1), None)
+    request.kv_transfer_params = params
+    assert d.get_num_new_matched_tokens(request, 0) == (source.boundary, True)
+    blocks = Mock()
+    d.update_state_after_alloc(request, blocks, source.boundary)
+    blocks.get_block_ids.assert_not_called()
+    meta = d.build_connector_meta(None)
+    assert not meta.requests and meta.pull_failed_requests == {"rejected"}
+    assert not d.build_connector_meta(None).pull_failed_requests
+
+    worker = object.__new__(MooncakePullConnectorWorker)
+    worker.kv_transfer_config = SimpleNamespace(is_kv_consumer=True)
+    receiver = worker._recving_thread = object.__new__(MooncakePullRecvingThread)
+    receiver.finished_requests = queue.SimpleQueue()
+    receiver.raise_if_unfenced_state_dma = Mock()
+    receiver.add_requests = Mock()
+    worker.start_load_kv(meta)
+    results = worker.get_transfer_results()
+    assert results.finished_recving == results.failed_recving == {"rejected"}
+    receiver.add_requests.assert_not_called()
+    assert d.request_finished(request, ([], [], [])) == (False, None)
+    d.update_connector_output(
+        KVConnectorOutput(finished_recving=results.finished_recving, failed_recving=results.failed_recving)
+    )
+    d._recving_thread.add_request.assert_not_called()
+    assert bool(d._active_state_receives) == (invalid == "replay")
+
+
+def test_one_token_prompt_has_no_transferable_prefix():
+    p = state_decoder()
+    request = Request("one-token", [7], SamplingParams(max_tokens=4), None)
+    request.kv_transfer_params = {"do_remote_decode": True}
+    p.on_new_request(request)
+    assert request.num_prompt_tokens == request.max_tokens == 1
+    request.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    retain, params = p.request_finished(request, ([1], [2], [3]))
+    assert not retain
+    assert params == {"do_remote_prefill": False, "do_remote_decode": False}
+
+    d = state_decoder()
+    request.kv_transfer_params = params
+    assert d.get_num_new_matched_tokens(request, 0) == (0, False)
 
 
 def test_transfer_config_and_peer_layout_validation():
@@ -352,8 +428,10 @@ def test_destination_event_completes_before_publish():
     event.record.side_effect = record
     event.synchronize.side_effect = lambda: order.append("synchronized")
     receiver.add_requests.side_effect = lambda *args, **kwargs: order.append("published")
+    metadata = MooncakeConnectorMetadata()
+    metadata.requests["d"] = meta
     with patch.object(torch, "npu", SimpleNamespace(Event=lambda: event, current_stream=lambda: None), create=True):
-        worker.start_load_kv(SimpleNamespace(requests={"d": meta}))
+        worker.start_load_kv(metadata)
     assert order == ["record", "synchronized", "published"]
     receiver.add_requests.assert_called_once_with("p", {"d": meta}, state_destination_ready=True)
 

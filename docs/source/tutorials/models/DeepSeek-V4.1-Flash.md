@@ -403,8 +403,8 @@ as `"state_model_id"` in `kv_connector_extra_config` on both peers. This
 identifier selects the state handoff together with the connector and layout.
 Keep the full prompt for D and forward the producer's `kv_transfer_params`
 intact through the pull proxy. P computes all but the final input token,
-and D computes that token
-after the state has arrived. A transport error without a DMA completion fence
+and D computes that token after the state has arrived. A single-token input
+has no prefix to transfer, so D computes it locally. A transport error without a DMA completion fence
 requires retiring the D instance before the P instance. Start replacements with
 fresh engine identities. Sleep and KVPP are unsupported for this transfer path.
 
