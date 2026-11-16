@@ -215,6 +215,35 @@ def test_partial_reservation_is_rolled_back(geometry):
     assert available(manager) == (6, 2, 2)
 
 
+def test_mixed_requests_keep_their_slots_until_released(geometry):
+    config, _, groups = geometry
+    manager = make_manager(config, groups)
+    prefill, decode, next_prefill = [make_request(rid) for rid in ("prefill", "decode", "next")]
+    slots = patch_request_state_manager.allocate_slots
+    assert slots(manager, prefill, 128) is not None
+    assert slots(manager, decode, 256) is not None
+    prefill.num_computed_tokens = 128
+    decode.num_computed_tokens = 256
+    before = manager.get_blocks(decode.request_id).get_block_ids()
+    assert slots(manager, prefill, 128) is not None
+    assert slots(manager, decode, 1) is not None
+    after = manager.get_blocks(decode.request_id).get_block_ids()
+    assert before[1:] == after[1:]
+    assert after[0][:-1] == before[0] and len(after[0]) == 3
+    assert available(manager) == (1, 0, 0)
+    assert slots(manager, next_prefill, 256) is None
+    assert available(manager) == (1, 0, 0)
+
+    previous_slots = manager.get_blocks(prefill.request_id).get_block_ids()[1:]
+    manager.free(prefill)
+    assert slots(manager, next_prefill, 256) is not None
+    assert manager.get_blocks(next_prefill.request_id).get_block_ids()[1:] == previous_slots
+    assert manager.get_blocks(decode.request_id).get_block_ids() == after
+    manager.free(next_prefill)
+    manager.free(decode)
+    assert available(manager) == (6, 2, 2)
+
+
 def test_staging_uses_one_workspace_and_pads_only_staging_rows(geometry):
     config, _, groups = geometry
     worker = materialize_request_state_pools(config, groups, 7)
@@ -233,6 +262,51 @@ def test_staging_uses_one_workspace_and_pads_only_staging_rows(geometry):
     assert metadata.state_ids.tolist() == [1, 2]
     assert metadata.lengths.tolist() == [129, 0]
     assert metadata.rows_used == 256
+
+
+def test_decode_staging_reuses_graph_buffers_with_new_slot_assignment():
+    seq_lens = torch.ones(4, dtype=torch.int32)
+    block_table = torch.zeros((4, 1), dtype=torch.int32)
+    starts = torch.arange(5, dtype=torch.int32)
+    builder = RequestWindowMetadataBuilder(seq_lens, 4 * 128)
+    common = SimpleNamespace(block_table_tensor=block_table, query_start_loc=starts)
+    result = SimpleNamespace(num_reqs=4, seq_lens=seq_lens, max_query_len=1)
+    captured = builder.build(common, result)
+    assert captured.lengths.tolist() == [1, 1, 1, 1]
+
+    seq_lens[:] = torch.tensor([9, 129, 0, 0])
+    block_table[:, 0] = torch.tensor([1, 2, 0, 0])
+    replay = builder.build(common, result)
+    for name in ("lengths", "state_ids", "row_starts", "block_table"):
+        assert getattr(captured, name).data_ptr() == getattr(replay, name).data_ptr()
+    assert captured.state_ids.tolist() == [1, 2, 0, 0]
+    assert captured.lengths.tolist() == [9, 128, 0, 0]
+    assert captured.row_starts.tolist() == [0, 128, 256, 384]
+
+
+@pytest.mark.parametrize(
+    ("state_id", "seq_len", "expected_offsets"),
+    [(0, 1, []), (0, 0, []), (2, 0, []), (-1, 1, []), (2, 129, [256])],
+)
+def test_swa_ring_commit_masks_reserved_and_padded_rows(monkeypatch, state_id, seq_len, expected_offsets):
+    from vllm_ascend.models.deepseek_v41 import state_kernels
+
+    # Run the actual mask and address expressions on CPU tensors. The first
+    # four loads are the request's query bounds, sequence length and slot ID.
+    controls = [torch.tensor(x) for x in (0, 1, seq_len, state_id)]
+    tl = SimpleNamespace(
+        arange=torch.arange,
+        program_id=lambda _axis: 0,
+        load=Mock(side_effect=[*controls, torch.zeros(16, 1)]),
+        minimum=lambda value, bound: value.clamp_max(bound),
+        where=torch.where,
+        store=Mock(),
+    )
+    monkeypatch.setattr(state_kernels, "tl", tl)
+    kernel = getattr(state_kernels._commit, "fn", state_kernels._commit)
+    kernel(0, 0, 0, 0, 0, WIDTH=1, WINDOW=128, ROWS=16)
+    args, kwargs = tl.store.call_args
+    assert args[0][kwargs["mask"]].tolist() == expected_offsets
 
 
 def test_staged_attention_keeps_registered_ring_bound(monkeypatch):

@@ -45,8 +45,9 @@ def _commit(RING, CURRENT, IDS, QSTART, SEQLEN, WIDTH: tl.constexpr, WINDOW: tl.
     length = end - first
     computed = tl.load(SEQLEN + req) - length
     state = tl.load(IDS + req)
-    # Do not read padded CURRENT rows or form a live store before the ring.
-    valid = (state >= 0) & (length > 0) & (computed >= 0)
+    # Capture dummy rows can share reserved slot 0. They participate in
+    # staging, but only real request slots may receive persistent writes.
+    valid = (state > 0) & (length > 0) & (computed >= 0)
     count = tl.where(valid, tl.minimum(length, WINDOW), 0)
     absolute = computed + length - count + row
     value = tl.load(CURRENT + (end - count + row[:, None]) * WIDTH + dim[None, :], mask=(row < count)[:, None], other=0)
