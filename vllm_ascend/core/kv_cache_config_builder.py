@@ -66,10 +66,6 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         Precedence: Kimi-K3.1, GLM-Next, then DSV4.1 / mixed-page-size shared slots, then
         the Kimi-K3 DSpark mixed grouping, then vLLM's generic grouping.
         """
-        if (getattr(vllm_config, "additional_config", None) or {}).get("enable_dsv41_request_state_pools") is True:
-            if not is_deepseek_v41_cache(kv_cache_spec):
-                raise ValueError("enable_dsv41_request_state_pools requires DeepSeek V4.1 Flash")
-            return get_request_state_groups(vllm_config, kv_cache_spec)
         if vllm_config.model_config.hf_config.model_type == "kimi_k31":
             return paired_sfa_cache_groups(vllm_config, kv_cache_spec)
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
@@ -81,6 +77,9 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
             return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
 
         if is_deepseek_v41_cache(kv_cache_spec):
+            request_state_groups = get_request_state_groups(vllm_config, kv_cache_spec)
+            if request_state_groups is not None:
+                return request_state_groups
             return make_cache_groups(group_cache_specs(kv_cache_spec))
 
         grouped_specs = group_and_unify_kv_cache_specs(kv_cache_spec)

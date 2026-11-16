@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
     KVCacheTensor,
     UniformTypeKVCacheSpecs,
 )
@@ -334,33 +335,34 @@ def is_request_state_cache(groups: list[KVCacheGroupSpec]) -> bool:
     return any(isinstance(spec, RequestWindowSpec) for group in groups for spec in unwrap(group.kv_cache_spec).values())
 
 
-def get_request_state_groups(vllm_config: VllmConfig, specs) -> list[KVCacheGroupSpec]:
-    if not vllm_config.use_v2_model_runner:
-        raise ValueError("DeepSeek V4.1 request-state pools require Model Runner V2")
+def get_request_state_groups(vllm_config: VllmConfig, specs: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec] | None:
+    """Select the default three-pool layout for supported V4.1 configurations."""
     parallel = vllm_config.parallel_config
-    if (
-        parallel.pipeline_parallel_size,
-        parallel.prefill_context_parallel_size,
-        parallel.decode_context_parallel_size,
-    ) != (1, 1, 1):
-        raise ValueError("DeepSeek V4.1 request-state pools require PP=PCP=DCP=1")
     cache = vllm_config.cache_config
     if (
-        cache.enable_prefix_caching
+        not vllm_config.use_v2_model_runner
+        or (
+            parallel.pipeline_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+        )
+        != (1, 1, 1)
+        or cache.enable_prefix_caching
         or cache.enable_extensible_kv_cache
         or getattr(cache, "swa_bounded_replay", False)
         or vllm_config.speculative_config is not None
         or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        or getattr(vllm_config.model_config, "enable_sleep_mode", False)
+        or uses_a5_packed_cache()
     ):
-        raise ValueError(
-            "DeepSeek V4.1 request-state pools require fixed hybrid KV cache without "
-            "prefix caching, SWA bounded replay or speculative decoding"
-        )
-    validate_pd_config(vllm_config)
-    if getattr(vllm_config.model_config, "enable_sleep_mode", False):
-        raise ValueError("DeepSeek V4.1 request-state pools require persistent backing; sleep mode is unsupported")
-    if uses_a5_packed_cache():
-        raise ValueError("DeepSeek V4.1 request-state pools require the unpacked cache layout")
+        return None
+    if vllm_config.kv_transfer_config is not None:
+        try:
+            validate_pd_config(vllm_config)
+        except ValueError:
+            # Keep the connector's existing cache contract outside the
+            # same-TP state handoff, including requests without a model identity.
+            return None
 
     history, swa, compressor = {}, {}, {}
     for name, spec in specs.items():
@@ -372,7 +374,7 @@ def get_request_state_groups(vllm_config: VllmConfig, specs) -> list[KVCacheGrou
                 torch.bfloat16,
                 MLA_HEAD_DIM,
             ):
-                raise ValueError(f"Unsupported request window layout for {name}")
+                return None
             attrs = {field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
             swa[name] = RequestWindowSpec(**attrs)
         elif isinstance(spec, CircularBufferSpec):
@@ -380,13 +382,16 @@ def get_request_state_groups(vllm_config: VllmConfig, specs) -> list[KVCacheGrou
         elif isinstance(spec, AscendMLAAttentionSpec) and name.endswith((".long_kv_cache", ".indexer.k_cache")):
             history[name] = spec
         else:
-            raise ValueError(f"Unsupported request-state cache layer {name}")
+            return None
     if [len(history), len(swa), len(compressor)] != [8, 40, 3]:
-        raise ValueError("Request-state pools currently require DeepSeek V4.1 Flash cache geometry")
-    uniform = [UniformTypeKVCacheSpecs.from_specs(group) for group in (history, swa, compressor)]
-    if any(group is None for group in uniform):
-        raise ValueError("Request-state cache layers must have a uniform specification within each group")
-    return make_cache_groups(uniform)
+        return None
+    groups = []
+    for pool_specs in (history, swa, compressor):
+        spec = UniformTypeKVCacheSpecs.from_specs(pool_specs)
+        if spec is None:
+            return None
+        groups.append(spec)
+    return make_cache_groups(groups)
 
 
 def get_window_staging_rows(max_tokens: int, max_requests: int) -> int:

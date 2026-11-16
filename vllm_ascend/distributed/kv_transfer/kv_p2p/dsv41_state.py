@@ -48,8 +48,6 @@ def validate_pd_config(config: Any) -> str:
         raise ValueError("Configure separate Mooncake producer and consumer roles for state PD")
     if (config.additional_config or {}).get("enable_kvpp", False):
         raise ValueError("State PD does not support KVPP")
-    if transfer.get_from_extra_config("dsv41_state_pd", False) is not True:
-        raise ValueError("Set kv_connector_extra_config.dsv41_state_pd=true explicitly")
     identity = transfer.get_from_extra_config("state_model_id", "")
     if not isinstance(identity, str) or not identity.strip():
         raise ValueError("state_model_id must identify the identical P/D weight checkpoint")

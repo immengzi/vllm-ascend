@@ -12,6 +12,7 @@ import torch
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 from vllm.v1.request import Request
 
@@ -24,6 +25,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     get_request_state_groups,
     get_request_state_pd_alignment_bytes,
     get_request_state_pool_plan,
+    is_request_state_cache,
     make_index_cache_spec,
     make_mla_cache_spec,
     make_swa_cache_spec,
@@ -43,7 +45,7 @@ def geometry():
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
         ),
-        model_config=SimpleNamespace(max_model_len=512),
+        model_config=SimpleNamespace(max_model_len=512, hf_config=SimpleNamespace(model_type="deepseek_v41")),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=512, max_num_seqs=2, disable_hybrid_kv_cache_manager=False
         ),
@@ -54,8 +56,11 @@ def geometry():
             prefix_cache_retention_interval=None,
         ),
         speculative_config=None,
+        additional_config={},
+        num_prefill_lookahead_tokens=1,
         kv_transfer_config=None,
     )
+    register_all_kvcache_specs(None)
     register_ascend_kv_cache_specs()
     with patch("vllm_ascend.models.deepseek_v41.cache_config.uses_a5_packed_cache", return_value=False):
         specs = {}
@@ -95,15 +100,55 @@ def test_fixed_buffers_survive_rank_replan_and_config_serialization(geometry):
     assert get_request_state_pool_plan(config, groups, 7) == narrow.request_state_plan
 
 
-def test_mrv1_and_bounded_replay_are_rejected(geometry):
+@pytest.mark.parametrize("role", [None, "kv_producer", "kv_consumer"])
+def test_engine_uses_request_state_pools_by_default(geometry, role):
+    from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups
+
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
+    config, specs, expected = geometry
+    if role is not None:
+        config.kv_transfer_config = SimpleNamespace(
+            kv_connector="MooncakePullConnector",
+            kv_role=role,
+            kv_load_failure_policy="fail",
+            get_from_extra_config={"state_model_id": "test-weights"}.get,
+        )
+    with patch(
+        "vllm.v1.core.kv_cache_config_builder.get_kv_cache_config_builder",
+        return_value=AscendKVCacheConfigBuilder(),
+    ):
+        assert get_global_kv_cache_groups(config, [specs]) == expected
+
+
+@pytest.mark.parametrize(
+    ("section", "flag", "value"),
+    [
+        (None, "use_v2_model_runner", False),
+        (None, "speculative_config", object()),
+        ("cache_config", "enable_prefix_caching", True),
+        ("cache_config", "swa_bounded_replay", True),
+        ("parallel_config", "prefill_context_parallel_size", 2),
+        ("kv_transfer_config", "kv_connector", "MooncakeHybridConnector"),
+        ("kv_transfer_config", "get_from_extra_config", {}.get),
+    ],
+)
+def test_ineligible_configurations_use_existing_layout(geometry, section, flag, value):
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+    from vllm_ascend.models.deepseek_v41.cache_config import group_cache_specs, make_cache_groups
+
     config, specs, _ = geometry
-    config.use_v2_model_runner = False
-    with pytest.raises(ValueError, match="Model Runner V2"):
-        get_request_state_groups(config, specs)
-    config.use_v2_model_runner = True
-    config.cache_config.swa_bounded_replay = True
-    with pytest.raises(ValueError, match="bounded replay"):
-        get_request_state_groups(config, specs)
+    if section == "kv_transfer_config":
+        config.kv_transfer_config = SimpleNamespace(
+            kv_connector="MooncakePullConnector",
+            kv_role="kv_consumer",
+            kv_load_failure_policy="fail",
+            get_from_extra_config={"state_model_id": "test-weights"}.get,
+        )
+    setattr(getattr(config, section) if section is not None else config, flag, value)
+    groups = AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
+    assert groups == make_cache_groups(group_cache_specs(specs))
+    assert not is_request_state_cache(groups)
 
 
 def make_manager(config, groups):
@@ -238,7 +283,7 @@ def test_mooncake_registers_each_backing_independently_of_history_capacity(geome
         kv_connector="MooncakePullConnector",
         kv_role="kv_producer",
         kv_load_failure_policy="fail",
-        get_from_extra_config={"dsv41_state_pd": True, "state_model_id": "test-weights"}.get,
+        get_from_extra_config={"state_model_id": "test-weights"}.get,
     )
     cache_config = materialize_request_state_pools(config, groups, 7)
     specs = {name: spec for group in groups for name, spec in unwrap(group.kv_cache_spec).items()}

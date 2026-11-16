@@ -302,7 +302,7 @@ def test_scheduler_handoff_boundary_and_aggregate_completion():
 
 
 def test_transfer_config_and_peer_layout_validation():
-    extra = {"dsv41_state_pd": True, "state_model_id": "weights"}
+    extra = {"state_model_id": "weights"}
     cfg = SimpleNamespace(
         additional_config={},
         kv_transfer_config=SimpleNamespace(
