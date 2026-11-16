@@ -68,6 +68,8 @@ class MooncakeMetadataThread(threading.Thread):
         dcp_size: int,
         use_kv_pp: bool,
         ready_event: threading.Event,
+        *,
+        published_engine_id: str | None = None,
     ) -> None:
         super().__init__(daemon=True, name=type(self).__name__)
         encoder = msgspec.msgpack.Encoder()
@@ -78,13 +80,14 @@ class MooncakeMetadataThread(threading.Thread):
         self.pcp_size = pcp_size
         self.dcp_size = dcp_size
         self.engine_id = engine_id
+        self.published_engine_id = published_engine_id or engine_id
         self.use_kv_pp = use_kv_pp
         if self.use_kv_pp and self.dcp_size != 1:
             raise ValueError(f"Mooncake KVPP cannot be combined with DCP, got dcp_size={self.dcp_size}")
         metadata_by_pp_rank = self._merge_metadata_by_pp_rank(metadata)
         self.encoded_metadata = encoder.encode(
             MooncakeTransferMetadataGroups(
-                engine_id=engine_id,
+                engine_id=self.published_engine_id,
                 scheduler_host=host,
                 scheduler_port=port,
                 pp_size=pp_size,
@@ -99,7 +102,7 @@ class MooncakeMetadataThread(threading.Thread):
             "Initialized Mooncake scheduler handshake metadata: engine_id=%s, "
             "worker_count=%d, pp_ranks=%s, tp_size=%d, pp_size=%d, "
             "pcp_size=%d, dcp_size=%d, use_kv_pp=%s",
-            engine_id,
+            self.published_engine_id,
             len(metadata),
             sorted(metadata_by_pp_rank),
             tp_size,

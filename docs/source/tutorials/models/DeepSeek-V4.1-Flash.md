@@ -395,8 +395,8 @@ state pool, one null slot per pool, and a shared SWA staging workspace. The
 remaining bytes determine history capacity. With P/D, the budget also reserves
 alignment overhead for the registered backings on each rank.
 
-For P/D, give both peers the same model weights, precision, cache layout and TP
-size. Use `"kv_connector": "MooncakePullConnector"` with `"kv_role":
+For P/D, run both peers at the same connector revision and use matching model
+weights, precision, cache layout and TP size. Use `"kv_connector": "MooncakePullConnector"` with `"kv_role":
 "kv_producer"` on P and `"kv_role": "kv_consumer"` on D. Set
 `"kv_load_failure_policy": "fail"` and provide the same checkpoint identifier
 as `"state_model_id"` in `kv_connector_extra_config` on both peers. This

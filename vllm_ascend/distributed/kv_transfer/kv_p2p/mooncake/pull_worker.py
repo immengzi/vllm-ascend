@@ -727,6 +727,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                                 self.tp_rank,
                                 snapshot.to_wire(),
                                 meta.remote_block_ids,
+                                remote_metadata.engine_id,
                             )
                         ),
                         path,

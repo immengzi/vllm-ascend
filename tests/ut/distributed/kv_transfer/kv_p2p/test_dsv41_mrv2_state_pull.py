@@ -86,12 +86,19 @@ def worker_metadata(history_capacity=8, state_capacity=5, rank=0):
     )
 
 
-def sender():
+def sender(*, address_delta=0):
+    metadata = {}
+    for rank in range(4):
+        worker = worker_metadata(rank=rank)
+        metadata[rank] = replace(
+            worker,
+            kv_caches_base_addr=[[addr + address_delta for addr in row] for row in worker.kv_caches_base_addr],
+        )
     return MooncakeSchedulerSendingThread(
         "127.0.0.1",
         10020,
         "producer",
-        {rank: worker_metadata(rank=rank) for rank in range(4)},
+        metadata,
         4,
         1,
         1,
@@ -155,7 +162,7 @@ def test_generation_lease_survives_partial_tp_until_real_aggregate_completion():
     snap = snapshot()
     ids = ([1, 2], [3], [4])
     p.add_state_lease(snap, time.monotonic(), ids)
-    acquire = (STATE_ACQUIRE_MSG, snap.transfer_id, "d/request", 2, snap.to_wire(), ids)
+    acquire = (STATE_ACQUIRE_MSG, snap.transfer_id, "d/request", 2, snap.to_wire(), ids, decode_handshake(p).engine_id)
     assert p._state_control(acquire) == b"ACK"
     assert p._state_control(acquire) == b"ACK"
     p._handle_finished_request(snap.source_request_id)
@@ -193,6 +200,42 @@ def test_terminal_reject_and_transient_completion_retry():
     returned.assert_called_once()
 
 
+def test_restart_with_same_configured_engine_id_fetches_fresh_registration():
+    old_p, new_p = sender(), sender(address_delta=1_000_000)
+    old_id, new_id = decode_handshake(old_p).engine_id, decode_handshake(new_p).engine_id
+    d = object.__new__(MooncakePullRecvingThread)
+    d.local_metadata = worker_metadata()
+    d.remote_metadata = {}
+    d.encoder = msgspec.msgpack.Encoder()
+    d.decoder = msgspec.msgpack.Decoder(MooncakeTransferMetadataGroups)
+    with (
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.zmq_ctx"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.ensure_zmq_send"),
+        patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.ensure_zmq_recv",
+            side_effect=[old_p.encoded_metadata, new_p.encoded_metadata],
+        ) as recv,
+    ):
+        old = d._get_remote_metadata(old_id, old_p.host, old_p.port)
+        new = d._get_remote_metadata(new_id, new_p.host, new_p.port)
+        assert d._get_remote_metadata(new_id, new_p.host, new_p.port) is new
+    assert recv.call_count == 2
+    assert old_id != new_id
+    for metadata, expected in ((old, 102000), (new, 1102000)):
+        pp = metadata.metadata_by_pp_rank[0]
+        rank = pp.metadata_by_pcp_rank[0].metadata_by_tp_rank[2]
+        assert rank.kv_caches_base_addr[pp.layer_names.index(LAYERS[0])] == [expected]
+
+    # A fresh lease cannot authorize READ with a stale address advertisement.
+    snap = snapshot()
+    ids = ([1, 2], [3], [4])
+    new_p.add_state_lease(snap, time.monotonic(), ids)
+    acquire = (STATE_ACQUIRE_MSG, snap.transfer_id, "d/request", 2, snap.to_wire(), ids)
+    assert new_p._state_control((*acquire, old_id)) == b"REJECT"
+    assert not new_p.state_leases[snap.transfer_id].acquired_ranks
+    assert new_p._state_control((*acquire, new_id)) == b"ACK"
+
+
 def test_copy_failure_quarantines_instance_without_completion():
     remote = decode_handshake(sender())
     local = worker_metadata(11, 7)
@@ -205,7 +248,7 @@ def test_copy_failure_quarantines_instance_without_completion():
         remote_block_ids=([1, 2], [2], [3]),
         remote_host="127.0.0.1",
         remote_port=10020,
-        remote_engine_id="producer",
+        remote_engine_id=remote.engine_id,
         remote_request_id="prefill",
         remote_num_prompt_tokens=256,
         state_snapshot=snapshot().to_wire(),
@@ -222,11 +265,12 @@ def test_copy_failure_quarantines_instance_without_completion():
     thread.engine = Mock()
     with (
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.zmq_ctx"),
-        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.ensure_zmq_send"),
+        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.ensure_zmq_send") as send,
         patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker.ensure_zmq_recv", return_value=b"ACK"),
     ):
         thread.engine.batch_transfer_sync_read.return_value = 0
         assert thread._handle_state_requests(remote, req.remote_host, req.remote_port, {"d": req}) == set()
+        assert msgspec.msgpack.decode(send.call_args.args[1])[-1] == remote.engine_id
         _, destinations, sources, sizes = thread.engine.batch_transfer_sync_read.call_args.args
         assert destinations[0] == 100000 + 8 * 256
         assert sources[0] == 102000 + 256
@@ -288,6 +332,7 @@ def test_scheduler_handoff_boundary_and_aggregate_completion():
     request.append_output_token_ids(99)
     retain, wire = p.request_finished(request, ([1, 2], [2], [3]))
     assert retain and wire["remote_num_prompt_tokens"] == 256
+    assert wire["remote_engine_id"] == decode_handshake(p._sending_thread).engine_id
 
     d = state_decoder()
     receiver = Request("decode", list(range(257)), SamplingParams(max_tokens=4), pooling_params=None)
@@ -375,6 +420,40 @@ def test_one_token_prompt_has_no_transferable_prefix():
     d = state_decoder()
     request.kv_transfer_params = params
     assert d.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
+@pytest.mark.parametrize("generation_status", ["unused", "active", "completed"])
+def test_explicit_cache_bypass_returns_only_an_unstarted_source(generation_status):
+    d = state_decoder()
+    snap = snapshot()
+    key = ("127.0.0.1", 10020, snap.transfer_id)
+    params = {
+        "do_remote_prefill": True,
+        "remote_engine_id": "producer",
+        "remote_host": key[0],
+        "remote_port": key[1],
+        "remote_request_id": snap.source_request_id,
+        "remote_num_prompt_tokens": snap.boundary,
+        "remote_block_ids": ([1, 2], [3], [4]),
+        "dsv41_state_snapshot": snap.to_wire(),
+    }
+    if generation_status == "active":
+        d._active_state_receives.add(key)
+    elif generation_status == "completed":
+        d._state_receive_completions[key] = None
+    request = Request(
+        "score", list(range(snap.original_prompt_tokens)), SamplingParams(max_tokens=1, prompt_logprobs=1), None
+    )
+    assert request.skip_reading_external_kv
+    request.kv_transfer_params = params
+    assert d.get_num_new_matched_tokens(request, 0) == (snap.boundary, True)
+    d.update_state_after_alloc(request, Mock(), 0)  # Core overrides the match for a bypass.
+    assert not d.build_connector_meta(None).requests
+    assert d.request_finished(request, ([], [], [])) == (False, None)
+    if generation_status == "unused":
+        d._recving_thread.add_request.assert_called_once_with(*key[:2], snap.source_request_id, key[2], "decoder/score")
+    else:
+        d._recving_thread.add_request.assert_not_called()
 
 
 def test_transfer_config_and_peer_layout_validation():

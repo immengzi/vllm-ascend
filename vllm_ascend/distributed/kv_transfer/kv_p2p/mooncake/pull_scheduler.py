@@ -83,8 +83,23 @@ class MooncakeSchedulerSendingThread(MooncakeMetadataThread):
         ready_event: threading.Event,
         kv_lease_duration: int = DEFAULT_KV_LEASE_DURATION,
     ) -> None:
-        super().__init__(host, port, engine_id, metadata, tp_size, pp_size, pcp_size, dcp_size, use_kv_pp, ready_event)
         self.state_mode = any(getattr(worker, "state_layout", None) is not None for worker in metadata.values())
+        # The address table belongs to one P registration, even when the
+        # operator configures the same engine ID across service restarts.
+        published_engine_id = f"{engine_id}:{uuid.uuid4().hex}" if self.state_mode else engine_id
+        super().__init__(
+            host,
+            port,
+            engine_id,
+            metadata,
+            tp_size,
+            pp_size,
+            pcp_size,
+            dcp_size,
+            use_kv_pp,
+            ready_event,
+            published_engine_id=published_engine_id,
+        )
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.renewed_requests: OrderedDict[str, float] = OrderedDict()
         self.kv_lease_duration = kv_lease_duration
@@ -105,11 +120,12 @@ class MooncakeSchedulerSendingThread(MooncakeMetadataThread):
 
     def _state_control(self, message: tuple) -> bytes:
         with self.state_lock:
-            if message[0] == STATE_ACQUIRE_MSG and len(message) == 6:
-                _, transfer_id, consumer, rank, snapshot_wire, remote_ids = message
+            if message[0] == STATE_ACQUIRE_MSG and len(message) == 7:
+                _, transfer_id, consumer, rank, snapshot_wire, remote_ids, registered_engine_id = message
                 lease = self.state_leases.get(transfer_id)
                 if (
-                    lease is None
+                    registered_engine_id != self.published_engine_id
+                    or lease is None
                     or lease.snapshot.to_wire() != snapshot_wire
                     or lease.resource_ids != tuple(tuple(group) for group in remote_ids)
                 ):
@@ -547,6 +563,19 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             raise ValueError("State PD requires a complete cold handoff at T=N-1")
         return host, port, snapshot.source_request_id, snapshot.transfer_id, f"{self.engine_id}/{request.request_id}"
 
+    def _release_unstarted_state_receive(self, request: "Request", params: dict[str, Any]) -> None:
+        if self._recving_thread is None:
+            return
+        try:
+            remote = self._state_receive_target(request, params)
+        except (KeyError, TypeError, ValueError):
+            return
+        key = (remote[0], remote[1], remote[3])
+        # Cancellation or an explicit cache bypass cannot finish another
+        # consumer's active READ or repeat an aggregated completion.
+        if key not in self._active_state_receives and key not in self._state_receive_completions:
+            self._recving_thread.add_request(*remote)
+
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -570,7 +599,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if self.state_mode:
             params["do_remote_prefill"] = False
             if num_external_tokens == 0:
-                # An explicit skip of external KV has no async receive to fail.
+                # Core can explicitly bypass external KV, e.g. for prompt
+                # scoring. Return the unused source before beginning local work.
+                self._release_unstarted_state_receive(request, params)
                 return
             try:
                 remote = self._state_receive_target(request, params)
@@ -681,15 +712,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             # request that still has it can release an unconsumed generation.
             if self.state_mode:
                 params["do_remote_prefill"] = False
-                try:
-                    remote = self._state_receive_target(request, params)
-                except (KeyError, TypeError, ValueError):
-                    return False, None
-                key = (remote[0], remote[1], remote[3])
-                # A frontend abort cannot release a generation owned by workers.
-                if key not in self._active_state_receives and key not in self._state_receive_completions:
-                    assert self._recving_thread is not None
-                    self._recving_thread.add_request(*remote)
+                self._release_unstarted_state_receive(request, params)
                 return False, None
             if params.get("remote_block_ids"):
                 required_remote_fields = ("remote_host", "remote_port", "remote_request_id")
@@ -732,6 +755,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
         delay_free_blocks = num_computed_blocks > 0
+        remote_engine_id = self.engine_id
         if delay_free_blocks:
             logger.info(
                 "Delaying free of %d blocks for request %s",
@@ -746,13 +770,14 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 self._sending_thread.add_delayed_request(request.request_id)
             else:
                 self._sending_thread.add_state_lease(snapshot, delay_start_time, computed_block_ids)
+                remote_engine_id = self._sending_thread.published_engine_id
 
         return delay_free_blocks, {
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": computed_block_ids,
             "remote_num_prompt_tokens": prompt_len,
-            "remote_engine_id": self.engine_id,
+            "remote_engine_id": remote_engine_id,
             "remote_request_id": request.request_id,
             "remote_host": self.side_channel_host,
             "remote_port": self.side_channel_port,
