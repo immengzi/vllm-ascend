@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Framework-side V4.1 layer-outermost cache placement and allocation."""
 
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 from vllm.config import VllmConfig
+from vllm.utils.math_utils import cdiv
 
 # Both supported versions expose planning helpers in kv_cache_planning.
 from vllm.v1.core.kv_cache_planning import may_override_num_blocks
@@ -13,19 +14,24 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheSpec,
     KVCacheTensor,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.core.kv_cache_interface import (
+    KV_CACHE_BUFFER_ALIGNMENT,
+    AscendKVCacheConfig,
     AscendMLAAttentionSpec,
     AscendSlidingWindowMLASpec,
     declared_kwarg,
 )
+from vllm_ascend.core.kv_cache_pool_plan import CachePoolPlan, CachePoolSpec, RequestStatePoolPlan
 from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import validate_pd_config
 
 STATE_RING_ROWS = 32
 
@@ -288,5 +294,168 @@ def get_deepseek_v41_kv_cache_config(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,
         kv_cache_groups=groups,
+        prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
+    )
+
+
+# The first request-state layout targets the unpacked 128-token SWA kernel.
+WINDOW = 128
+ROW_BYTES = MLA_HEAD_DIM * torch.bfloat16.itemsize
+
+
+@dataclass(frozen=True, kw_only=True)
+class RequestWindowSpec(AscendSlidingWindowMLASpec):
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
+    @property
+    def block_table_token_alignment(self) -> int | None:
+        return None
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+    def max_num_blocks_per_req(self, vllm_config, max_len) -> int:
+        return 1
+
+    def max_admission_blocks_per_request(self, **kwargs) -> int:
+        return 1
+
+    def max_memory_usage_bytes(self, vllm_config) -> int:
+        return self.page_size_bytes
+
+
+def unwrap(spec):
+    return spec.kv_cache_specs if isinstance(spec, UniformTypeKVCacheSpecs) else {"representative": spec}
+
+
+def is_request_state_cache(groups: list[KVCacheGroupSpec]) -> bool:
+    return any(isinstance(spec, RequestWindowSpec) for group in groups for spec in unwrap(group.kv_cache_spec).values())
+
+
+def get_request_state_groups(vllm_config: VllmConfig, specs: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec] | None:
+    """Select the default three-pool layout for supported V4.1 configurations."""
+    parallel = vllm_config.parallel_config
+    cache = vllm_config.cache_config
+    if (
+        not vllm_config.use_v2_model_runner
+        or (
+            parallel.pipeline_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.decode_context_parallel_size,
+        )
+        != (1, 1, 1)
+        or cache.enable_prefix_caching
+        or cache.enable_extensible_kv_cache
+        or getattr(cache, "swa_bounded_replay", False)
+        or vllm_config.speculative_config is not None
+        or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
+        or getattr(vllm_config.model_config, "enable_sleep_mode", False)
+        or uses_a5_packed_cache()
+    ):
+        return None
+    if vllm_config.kv_transfer_config is not None:
+        try:
+            validate_pd_config(vllm_config)
+        except ValueError:
+            # Keep the connector's existing cache contract outside the
+            # same-TP state handoff, including requests without a model identity.
+            return None
+
+    history, swa, compressor = {}, {}, {}
+    for name, spec in specs.items():
+        spec = replace(spec, page_size_padded=None)
+        if isinstance(spec, AscendSlidingWindowMLASpec):
+            if (spec.block_size, spec.sliding_window, spec.dtype, spec.head_size) != (
+                WINDOW,
+                WINDOW,
+                torch.bfloat16,
+                MLA_HEAD_DIM,
+            ):
+                return None
+            attrs = {field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
+            swa[name] = RequestWindowSpec(**attrs)
+        elif isinstance(spec, CircularBufferSpec):
+            compressor[name] = spec
+        elif isinstance(spec, AscendMLAAttentionSpec) and name.endswith((".long_kv_cache", ".indexer.k_cache")):
+            history[name] = spec
+        else:
+            return None
+    if [len(history), len(swa), len(compressor)] != [8, 40, 3]:
+        return None
+    groups = []
+    for pool_specs in (history, swa, compressor):
+        spec = UniformTypeKVCacheSpecs.from_specs(pool_specs)
+        if spec is None:
+            return None
+        groups.append(spec)
+    return make_cache_groups(groups)
+
+
+def get_window_staging_rows(max_tokens: int, max_requests: int) -> int:
+    return cdiv(max_tokens + max_requests * 2 * WINDOW, WINDOW) * WINDOW
+
+
+def get_request_state_pool_plan(
+    vllm_config: VllmConfig, groups: list[KVCacheGroupSpec], num_blocks: int
+) -> RequestStatePoolPlan:
+    scheduler = vllm_config.scheduler_config
+    specs = [
+        CachePoolSpec(
+            name,
+            (group_id,),
+            unit,
+            sum(spec.unpadded_page_size_bytes for spec in unwrap(group.kv_cache_spec).values()),
+        )
+        for group_id, ((name, unit), group) in enumerate(
+            zip(
+                (("history", "token_block"), ("swa", "request_slot"), ("compressor", "request_slot")),
+                groups,
+                strict=True,
+            )
+        )
+    ]
+    rows = get_window_staging_rows(scheduler.max_num_batched_tokens, scheduler.max_num_seqs)
+    return RequestStatePoolPlan(
+        CachePoolPlan(specs[0], num_blocks),
+        tuple(CachePoolPlan(spec, scheduler.max_num_seqs + 1) for spec in specs[1:]),
+        workspace_bytes=rows * ROW_BYTES + 2**20,
+    )
+
+
+def get_request_state_pd_alignment_bytes(vllm_config: VllmConfig, groups: list[KVCacheGroupSpec]) -> int:
+    # One aligned backing per layer, including both views of an indexer layer.
+    if vllm_config.kv_transfer_config is None:
+        return 0
+    return sum(len(group.layer_names) for group in groups) * KV_CACHE_BUFFER_ALIGNMENT
+
+
+def materialize_request_state_pools(
+    vllm_config: VllmConfig, groups: list[KVCacheGroupSpec], num_blocks: int
+) -> AscendKVCacheConfig:
+    plan = get_request_state_pool_plan(vllm_config, groups, num_blocks)
+    plan.validate_group_coverage(len(groups))
+    tensors = [
+        KVCacheTensor(
+            size=plan.pool_for_group(group_id).capacity * spec.unpadded_page_size_bytes,
+            layers=[name],
+            offset=0,
+            layer_stride=0,
+            block_stride=spec.unpadded_page_size_bytes,
+        )
+        for group_id, group in enumerate(groups)
+        for name, spec in unwrap(group.kv_cache_spec).items()
+    ]
+    if sum(tensor.size for tensor in tensors) + plan.workspace_bytes != plan.size_bytes:
+        raise ValueError("Materialized tensor sizes differ from request-state pool budget")
+    scheduler = vllm_config.scheduler_config
+    return AscendKVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_groups=groups,
+        kv_cache_tensors=tensors,
+        request_state_plan=plan,
+        staging_rows=get_window_staging_rows(scheduler.max_num_batched_tokens, scheduler.max_num_seqs),
         prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
     )
