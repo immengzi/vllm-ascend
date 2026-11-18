@@ -34,6 +34,7 @@ from vllm_ascend.device.hardware_profile import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import validate_pd_config
 
 STATE_RING_ROWS = 32
+REQUEST_STATE_POOLS_CONFIG_KEY = "enable_deepseek_v41_request_state_pools"
 
 # Fixed dimensions accepted by the packaged mixed-quant attention ABI.
 # The actual head sizes come from the model config; these bounds reject
@@ -336,33 +337,37 @@ def is_request_state_cache(groups: list[KVCacheGroupSpec]) -> bool:
 
 
 def get_request_state_groups(vllm_config: VllmConfig, specs: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec] | None:
-    """Select the default three-pool layout for supported V4.1 configurations."""
+    """Select the opt-in three-pool layout or reject an invalid opt-in."""
+    enabled = (getattr(vllm_config, "additional_config", None) or {}).get(REQUEST_STATE_POOLS_CONFIG_KEY, False)
+    if type(enabled) is not bool:
+        raise ValueError(f"{REQUEST_STATE_POOLS_CONFIG_KEY} must be a boolean")
+    if not enabled:
+        return None
+    if vllm_config.model_config.architecture != "DeepseekV41ForCausalLM" or not is_deepseek_v41_cache(specs):
+        raise ValueError(f"{REQUEST_STATE_POOLS_CONFIG_KEY} requires the DeepSeek V4.1 architecture and cache specs")
     parallel = vllm_config.parallel_config
     cache = vllm_config.cache_config
+    if not vllm_config.use_v2_model_runner:
+        raise ValueError(f"{REQUEST_STATE_POOLS_CONFIG_KEY} requires Model Runner V2")
+    if (parallel.pipeline_parallel_size, parallel.prefill_context_parallel_size, parallel.decode_context_parallel_size) != (
+        1, 1, 1
+    ):
+        raise ValueError(f"{REQUEST_STATE_POOLS_CONFIG_KEY} requires PP=PCP=DCP=1")
     if (
-        not vllm_config.use_v2_model_runner
-        or (
-            parallel.pipeline_parallel_size,
-            parallel.prefill_context_parallel_size,
-            parallel.decode_context_parallel_size,
-        )
-        != (1, 1, 1)
-        or cache.enable_prefix_caching
-        or cache.enable_extensible_kv_cache
+        cache.enable_prefix_caching
+        or getattr(cache, "enable_extensible_kv_cache", False)
         or getattr(cache, "swa_bounded_replay", False)
         or vllm_config.speculative_config is not None
         or vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
         or getattr(vllm_config.model_config, "enable_sleep_mode", False)
         or uses_a5_packed_cache()
     ):
-        return None
+        raise ValueError(
+            f"{REQUEST_STATE_POOLS_CONFIG_KEY} requires hybrid cache management and BF16 cache geometry, "
+            "with prefix caching, bounded replay, extensible KV, speculative decoding and sleep mode disabled"
+        )
     if vllm_config.kv_transfer_config is not None:
-        try:
-            validate_pd_config(vllm_config)
-        except ValueError:
-            # Keep the connector's existing cache contract outside the
-            # same-TP state handoff, including requests without a model identity.
-            return None
+        validate_pd_config(vllm_config)
 
     history, swa, compressor = {}, {}, {}
     for name, spec in specs.items():
@@ -374,7 +379,7 @@ def get_request_state_groups(vllm_config: VllmConfig, specs: dict[str, KVCacheSp
                 torch.bfloat16,
                 MLA_HEAD_DIM,
             ):
-                return None
+                raise ValueError(f"Unsupported request-state SWA cache geometry for {name}")
             attrs = {field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
             swa[name] = RequestWindowSpec(**attrs)
         elif isinstance(spec, CircularBufferSpec):
@@ -382,14 +387,14 @@ def get_request_state_groups(vllm_config: VllmConfig, specs: dict[str, KVCacheSp
         elif isinstance(spec, AscendMLAAttentionSpec) and name.endswith((".long_kv_cache", ".indexer.k_cache")):
             history[name] = spec
         else:
-            return None
+            raise ValueError(f"Unsupported request-state cache spec for {name}")
     if [len(history), len(swa), len(compressor)] != [8, 40, 3]:
-        return None
+        raise ValueError("Request-state pools require the supported DSV4.1 Flash history/SWA/compressor geometry")
     groups = []
     for pool_specs in (history, swa, compressor):
         spec = UniformTypeKVCacheSpecs.from_specs(pool_specs)
         if spec is None:
-            return None
+            raise ValueError("Incompatible cache specs within a DSV4.1 request-state pool")
         groups.append(spec)
     return make_cache_groups(groups)
 

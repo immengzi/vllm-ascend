@@ -30,6 +30,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
     STATE_META_MSG,
     SourceLease,
     StateSnapshot,
+    validate_state_tp_pair,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     GET_META_MSG,
@@ -546,10 +547,10 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
 
     def _state_receive_target(self, request: "Request", params: dict[str, Any]) -> tuple[str, int, str, str, str]:
         snapshot = StateSnapshot.from_wire(params["dsv41_state_snapshot"])
+        validate_state_tp_pair(snapshot.tp_size, self.tp_size)
         host, port, engine_id = params["remote_host"], params["remote_port"], params["remote_engine_id"]
         if (
             snapshot.model_id != self.state_model_id
-            or snapshot.tp_size != self.tp_size
             or snapshot.boundary != params["remote_num_prompt_tokens"]
             or snapshot.source_request_id != params["remote_request_id"]
             or not isinstance(host, str)
