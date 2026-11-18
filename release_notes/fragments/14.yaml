@@ -1,0 +1,4 @@
+pr: 14
+entries:
+  - category: feature
+    text: Added experimental opt-in DeepSeek V4.1 Flash request-state pools for Model Runner V2, including equal-TP and TP4-to-TP2 Mooncake Pull handoff paths. Full W4A8 P/D correctness, lifecycle and performance validation remains pending.
