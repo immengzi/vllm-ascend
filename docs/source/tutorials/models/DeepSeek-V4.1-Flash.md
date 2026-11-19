@@ -384,11 +384,13 @@ vLLM Ascend revision.
 
 #### Request-state pools
 
-Model Runner V2 selects separate pools for history, SWA and compressor state
-for the supported unpacked DeepSeek V4.1 Flash layout. This path uses
-`--no-enable-prefix-caching` and `--no-swa-bounded-replay`, with speculative
-decoding off and PP, PCP and DCP sizes of one. Configurations outside this
-scope use their existing cache layout.
+DeepSeek V4.1 Flash uses the existing KV layout by default. To enable separate
+history, SWA and compressor pools, set
+`"enable_deepseek_v41_request_state_pools": true` in `--additional-config`.
+Enable the same layout on both P/D peers. This path requires Model Runner V2,
+unpacked BF16 cache geometry, hybrid cache management and PP=PCP=DCP=1.
+Disable prefix caching, bounded SWA replay, speculative decoding, extensible
+KV and sleep mode. An unsupported explicit opt-in raises a configuration error.
 
 The cache budget first reserves `--max-num-seqs` usable slots in each request
 state pool, one null slot per pool, and a shared SWA staging workspace. The
@@ -396,11 +398,13 @@ remaining bytes determine history capacity. With P/D, the budget also reserves
 alignment overhead for the registered backings on each rank.
 
 For P/D, run both peers at the same connector revision and use matching model
-weights, precision, cache layout and TP size. Use `"kv_connector": "MooncakePullConnector"` with `"kv_role":
+weights, precision and cache layout. Supported topologies have equal TP sizes,
+or P TP4 and D TP2. In the latter case D ranks 0 and 1 read replicated state
+from P ranks 0 and 2, respectively. Use `"kv_connector": "MooncakePullConnector"` with `"kv_role":
 "kv_producer"` on P and `"kv_role": "kv_consumer"` on D. Set
 `"kv_load_failure_policy": "fail"` and provide the same checkpoint identifier
-as `"state_model_id"` in `kv_connector_extra_config` on both peers. This
-identifier selects the state handoff together with the connector and layout.
+as `"state_model_id"` in `kv_connector_extra_config` on both peers. The peers use
+this identifier to validate the source of a state handoff.
 Keep the full prompt for D and forward the producer's `kv_transfer_params`
 intact through the pull proxy. P computes all but the final input token,
 and D computes that token after the state has arrived. A single-token input
