@@ -343,6 +343,10 @@ class SinglePoolWindowSpec(StagedWindowSpec):
     """Window backed by one ordinary block ID per native SWA group."""
 
     @property
+    def is_circular(self) -> bool:
+        return True
+
+    @property
     def num_retained_tokens(self) -> int:
         # The MRV2 gather kernel nulls old position-indexed table entries.
         # Our only entry addresses the whole ring at every sequence position.

@@ -600,3 +600,43 @@ def test_single_pool_staging_reads_each_swa_groups_own_table(geometry):
         assert metadata.state_ids.data_ptr() == table.data_ptr()
         assert metadata.lengths.tolist() == [128]
         assert all(layers[name].kv_cache[0].shape[0] == worker.num_blocks for name in group.layer_names)
+
+
+def test_single_pool_window_uses_native_circular_block_selection(geometry):
+    from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import MooncakeBaseConnectorScheduler
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
+
+    config, specs, _ = geometry
+    config.additional_config = {SINGLE_POOL_SWA_CONFIG_KEY: True}
+    group = get_request_state_groups(config, specs)[2].kv_cache_spec
+    assert is_circular_kv_cache_spec(group)
+    ring = group.first_spec
+    assert is_circular_kv_cache_spec(ring)
+    scheduler = SimpleNamespace(group_unique_specs=[[ring]], group_block_size=[128], dcp_size=1)
+    advertised = MooncakeBaseConnectorScheduler._get_transfer_block_ids(scheduler, ([37],), 4096)
+    assert advertised == ([37],)
+    receiver = object.__new__(MooncakePullRecvingThread)
+    receiver.dcp_size = 1
+    request = dict(
+        request_id="single-pool",
+        remote_tp_rank_groups=[[0]],
+        remote_dcp_size=1,
+        spec_index=0,
+        local_block_size=128,
+        remote_block_size=128,
+        local_group_block_ids=[11],
+        local_full_group_block_ids=[11],
+        remote_group_block_ids=advertised[0],
+        local_num_prompt_tokens=4097,
+        remote_num_prompt_tokens=4096,
+        num_computed_tokens=256,
+        local_block_size_scale=1,
+        remote_block_size_scale=1,
+        spec=ring,
+        selection_index=0,
+        remote_interleave_size=1,
+    )
+    assert receiver._compute_group_block_ids(**request) == [(0, [11], [37])]
+    with pytest.raises(ValueError, match="exactly one block"):
+        receiver._compute_group_block_ids(**{**request, "remote_group_block_ids": [37, 38]})
