@@ -26,6 +26,7 @@ from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
+from vllm_ascend.models.deepseek_v41.compact_cache import BLOCK_BYTES, CompactPageGroup, compact_cache_config
 
 STATE_RING_ROWS = 32
 
@@ -259,6 +260,8 @@ def _specs_from_groups(groups):
 
 
 def get_deepseek_v41_pool_bytes_per_block(groups):
+    if groups and isinstance(groups[0], CompactPageGroup):
+        return BLOCK_BYTES
     page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
     return sum(page_sizes)
 
@@ -269,6 +272,9 @@ def get_deepseek_v41_kv_cache_config(
     available_memory: int,
 ) -> KVCacheConfig:
     """Allocate independent layer slots backed by one global block-ID pool."""
+    if groups and isinstance(groups[0], CompactPageGroup):
+        count = may_override_num_blocks(vllm_config, available_memory // BLOCK_BYTES)
+        return compact_cache_config(groups, count, vllm_config.cache_config.prefix_cache_retention_interval)
     page_sizes, layer_tuples = get_layer_tuples(_specs_from_groups(groups))
     capacity = max(available_memory // sum(page_sizes), 0)
     num_blocks = may_override_num_blocks(vllm_config, capacity)

@@ -36,6 +36,7 @@ The following table lists additional configuration options available in vLLM Asc
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
+| `enable_deepseek_v41_compact_kv_pages` | boolean | `false` | Experimental unpacked DeepSeek V4.1 Flash MRV2 layout. Packs history and index data into three 128 KiB banks under each native block ID. Use matching layouts on P and D. |
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
@@ -327,6 +328,14 @@ KVPP supports non-hybrid MLA/SFA models with eager execution or `PIECEWISE` grap
 KVPP can be combined with `MooncakeConnectorV2` for P/D disaggregation and `AscendStoreConnector` for KV pooling under the connector-specific restrictions in the [KVPP guide](../feature_guide/kvpp.md#kv-transfer-configuration). Enable KVPP only on the prefill node for P/D disaggregation. `MultiConnector` can combine these connectors; each child must satisfy its own type and role requirements.
 
 PCP gathers prefill KV before cache writes. KVPP layer broadcasts restore prior-forward cache contents before attention; the broadcast decision uses the global scheduled batch rather than PCP-local segment offsets.
+
+## Compact native KV pages for DeepSeek V4.1 Flash
+
+Set `--additional-config '{"enable_deepseek_v41_compact_kv_pages": true}'` on both endpoints to try the experimental layout.
+It supports the unpacked Flash cache geometry with MRV2, the hybrid cache manager, and PP, PCP and DCP all set to 1.
+Disable prefix caching, SWA bounded replay, speculative decoding, extensible KV cache and KV layer parallelism.
+The shared native block pool allocates one ID across all cache groups. Each ID costs 384 KiB per worker.
+The 40 sliding-window layers use 14 groups, so request capacity depends on the prompt length and the number of live window pages.
 
 ## GDN internal prefill checkpoints
 

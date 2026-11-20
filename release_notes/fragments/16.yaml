@@ -1,0 +1,4 @@
+pr: 16
+entries:
+  - category: feature
+    text: Added opt-in compact native KV pages for the unpacked DeepSeek V4.1 Flash MRV2 cache layout.
