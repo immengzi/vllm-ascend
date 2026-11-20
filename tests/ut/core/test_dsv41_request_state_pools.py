@@ -23,6 +23,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.models.deepseek_v41 import request_state
 from vllm_ascend.models.deepseek_v41.cache_config import (
+    REQUEST_STATE_POOLS_CONFIG_KEY,
     get_request_state_groups,
     get_request_state_pd_alignment_bytes,
     get_request_state_pool_plan,
@@ -46,7 +47,11 @@ def geometry():
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1, prefill_context_parallel_size=1, decode_context_parallel_size=1
         ),
-        model_config=SimpleNamespace(max_model_len=512, hf_config=SimpleNamespace(model_type="deepseek_v41")),
+        model_config=SimpleNamespace(
+            max_model_len=512,
+            architecture="DeepseekV41ForCausalLM",
+            hf_config=SimpleNamespace(model_type="deepseek_v41"),
+        ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=512, max_num_seqs=2, disable_hybrid_kv_cache_manager=False
         ),
@@ -57,7 +62,7 @@ def geometry():
             prefix_cache_retention_interval=None,
         ),
         speculative_config=None,
-        additional_config={},
+        additional_config={REQUEST_STATE_POOLS_CONFIG_KEY: True},
         num_prefill_lookahead_tokens=1,
         kv_transfer_config=None,
     )
@@ -102,7 +107,7 @@ def test_fixed_buffers_survive_rank_replan_and_config_serialization(geometry):
 
 
 @pytest.mark.parametrize("role", [None, "kv_producer", "kv_consumer"])
-def test_engine_uses_request_state_pools_by_default(geometry, role):
+def test_engine_uses_request_state_pools_when_enabled(geometry, role):
     from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups
 
     from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
@@ -130,11 +135,12 @@ def test_engine_uses_request_state_pools_by_default(geometry, role):
         ("cache_config", "enable_prefix_caching", True),
         ("cache_config", "swa_bounded_replay", True),
         ("parallel_config", "prefill_context_parallel_size", 2),
+        ("model_config", "architecture", "Qwen3ForCausalLM"),
         ("kv_transfer_config", "kv_connector", "MooncakeHybridConnector"),
         ("kv_transfer_config", "get_from_extra_config", {}.get),
     ],
 )
-def test_ineligible_configurations_use_existing_layout(geometry, section, flag, value):
+def test_ineligible_opt_in_is_rejected(geometry, section, flag, value):
     from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
     from vllm_ascend.models.deepseek_v41.cache_config import group_cache_specs, make_cache_groups
 
@@ -147,9 +153,24 @@ def test_ineligible_configurations_use_existing_layout(geometry, section, flag, 
             get_from_extra_config={"state_model_id": "test-weights"}.get,
         )
     setattr(getattr(config, section) if section is not None else config, flag, value)
+    with pytest.raises(ValueError):
+        AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
+    config.additional_config[REQUEST_STATE_POOLS_CONFIG_KEY] = False
     groups = AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
     assert groups == make_cache_groups(group_cache_specs(specs))
     assert not is_request_state_cache(groups)
+
+
+def test_eligible_geometry_defaults_to_existing_layout(geometry):
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+    from vllm_ascend.models.deepseek_v41.cache_config import group_cache_specs, make_cache_groups
+
+    config, specs, _ = geometry
+    config.additional_config = {}
+    assert AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs) == make_cache_groups(group_cache_specs(specs))
+    config.additional_config[REQUEST_STATE_POOLS_CONFIG_KEY] = "false"
+    with pytest.raises(ValueError, match="must be a boolean"):
+        AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
 
 
 def make_manager(config, groups):

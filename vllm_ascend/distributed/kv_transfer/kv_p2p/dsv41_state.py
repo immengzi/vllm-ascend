@@ -37,6 +37,27 @@ def is_state_config(config: Any) -> bool:
     return isinstance(getattr(config, "request_state_plan", None), RequestStatePoolPlan)
 
 
+def validate_state_tp_pair(producer_tp: int, consumer_tp: int) -> None:
+    if (
+        type(producer_tp) is not int
+        or type(consumer_tp) is not int
+        or producer_tp < 1
+        or consumer_tp < 1
+        or (producer_tp != consumer_tp and (producer_tp, consumer_tp) != (4, 2))
+    ):
+        raise ValueError("State PD requires equal TP or the supported TP4-to-TP2 configuration")
+
+
+def state_source_rank(producer_tp: int, consumer_tp: int, consumer_rank: int) -> int:
+    """Select one full producer replica for each DSV4.1 consumer rank."""
+    validate_state_tp_pair(producer_tp, consumer_tp)
+    if type(consumer_rank) is not int or not 0 <= consumer_rank < consumer_tp:
+        raise ValueError("Invalid state consumer TP rank")
+    # MLA/SWA, indexer K/scales and compressor projections are replicated.
+    # Keep one source rank across all planes. TP4->TP2 uses producer 0 and 2.
+    return consumer_rank * (producer_tp // consumer_tp)
+
+
 def validate_pd_config(config: Any) -> str:
     """Constrain the initial path; the explicit identity must name the weights."""
     transfer = config.kv_transfer_config
@@ -289,10 +310,16 @@ def build_copy_plan(
 ) -> tuple[CopyRange, ...]:
     """Validate the complete handoff before submitting READ."""
     snapshot.validate()
+    if remote_layout.get("tp_size") != snapshot.tp_size:
+        raise ValueError("P metadata disagrees with the published snapshot TP size")
+    validate_state_tp_pair(snapshot.tp_size, local_layout.get("tp_size"))
+    fingerprint = local_layout.get("fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise ValueError("Missing local model fingerprint")
     for layout in (local_layout, remote_layout):
-        if layout.get("model_id") != snapshot.model_id or layout.get("tp_size") != snapshot.tp_size:
-            raise ValueError("P/D model identity or TP mismatch")
-        if layout.get("fingerprint") != local_layout.get("fingerprint"):
+        if layout.get("model_id") != snapshot.model_id:
+            raise ValueError("P/D model identity mismatch")
+        if layout.get("fingerprint") != fingerprint:
             raise ValueError("P/D model fingerprint or precision mismatch")
     local, remote = decode_planes(local_layout), decode_planes(remote_layout)
     remote_by_key = {p.key: p for p in remote}

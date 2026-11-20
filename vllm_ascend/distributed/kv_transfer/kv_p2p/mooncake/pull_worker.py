@@ -29,7 +29,12 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
     is_circular_kv_cache_spec,
 )
-from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import STATE_ACQUIRE_MSG, STATE_META_MSG, StateSnapshot
+from vllm_ascend.distributed.kv_transfer.kv_p2p.dsv41_state import (
+    STATE_ACQUIRE_MSG,
+    STATE_META_MSG,
+    StateSnapshot,
+    state_source_rank,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
@@ -681,11 +686,12 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
         remote_port: int,
         requests: dict[str, ReqMeta],
     ) -> set[str]:
-        """Same-TP request-state transfer using the existing READ/completion path."""
+        """Read one full producer replica using the usual completion path."""
         if (remote_metadata.pp_size, remote_metadata.pcp_size, remote_metadata.dcp_size) != (1, 1, 1):
             raise ValueError("State PD requires PP=PCP=DCP=1 on both peers")
-        if remote_metadata.tp_size != self.tp_size or remote_metadata.use_kv_pp:
-            raise ValueError("State PD requires equal TP and no KVPP")
+        if remote_metadata.use_kv_pp:
+            raise ValueError("State PD does not support KVPP")
+        source_rank = state_source_rank(remote_metadata.tp_size, self.tp_size, self.tp_rank)
         remote = remote_metadata.metadata_by_pp_rank[0]
         failed = set()
         for request_id, meta in requests.items():
@@ -695,21 +701,20 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                     raise ValueError("State snapshot and consumer identity are required")
                 snapshot = StateSnapshot.from_wire(meta.state_snapshot)
                 if (
-                    meta.num_computed_tokens != 0
+                    snapshot.tp_size != remote_metadata.tp_size
+                    or meta.num_computed_tokens != 0
                     or meta.num_external_tokens != snapshot.boundary
                     or meta.local_num_prompt_tokens != snapshot.original_prompt_tokens
                     or meta.remote_num_prompt_tokens != snapshot.boundary
                     or meta.remote_request_id != snapshot.source_request_id
                 ):
                     raise ValueError("Worker received inconsistent state boundary metadata")
-                # Use the corresponding rank for every object, including FP32
-                # compressor state. Generic replicated-MLA rank selection is
-                # deliberately not applied to a stateful snapshot.
+                # Every plane in a snapshot comes from the same producer rank.
                 remote_sources, local_destinations, sizes = transfer_addresses(
                     snapshot,
                     self.local_metadata,
                     remote,
-                    self.tp_rank,
+                    source_rank,
                     meta.local_full_block_ids,
                     meta.remote_block_ids,
                 )
@@ -724,7 +729,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                                 STATE_ACQUIRE_MSG,
                                 snapshot.transfer_id,
                                 meta.state_consumer,
-                                self.tp_rank,
+                                source_rank,
                                 snapshot.to_wire(),
                                 meta.remote_block_ids,
                                 remote_metadata.engine_id,
@@ -737,7 +742,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                 # start_load_kv cleared the destinations and completed its
                 # bounded event before publishing this batch. Do not submit
                 # device work on a default stream shared with dummy/MoE here.
-                remote_tp = remote.metadata_by_pcp_rank[0].metadata_by_tp_rank[self.tp_rank]
+                remote_tp = remote.metadata_by_pcp_rank[0].metadata_by_tp_rank[source_rank]
                 session_id = f"{remote_tp.local_ip}:{remote_tp.te_rpc_port}"
                 start = time.perf_counter()
                 # Mooncake READ's ABI is (session, local buffers, peer buffers,
@@ -754,7 +759,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                     raise UnfencedStateTransferError(f"State READ returned unfenced status {ret}")
                 logger.info(
                     "DSV4.1 state READ complete: request=%s transfer=%s boundary=%d rank=%d "
-                    "ranges=%d bytes=%d elapsed_ms=%.3f",
+                    "ranges=%d bytes=%d elapsed_ms=%.3f source_rank=%d",
                     request_id,
                     snapshot.transfer_id,
                     snapshot.boundary,
@@ -762,6 +767,7 @@ class MooncakePullRecvingThread(threading.Thread, MooncakeTransferAddressMixin):
                     len(sizes),
                     sum(sizes),
                     (time.perf_counter() - start) * 1000,
+                    source_rank,
                 )
             except Exception:
                 failed.add(request_id)
