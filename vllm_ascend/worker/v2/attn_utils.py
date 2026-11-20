@@ -89,6 +89,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
     requires_padded_page_layout,
     supports_component_major_mla_pd,
+    uses_window_staging,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
@@ -686,7 +687,7 @@ def build_attn_metadata(
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,
                     skip_ring_state_update=skip_ring_state_update,
-                    request_state_pools=get_request_state_plan(kv_cache_config) is not None,
+                    request_state_pools=uses_window_staging(kv_cache_config),
                     common_v41_metadata=common_v41_metadata,
                     common_v41_batch_metadata=common_v41_batch_metadata,
                     v41_prefill_override=v41_prefill_override,

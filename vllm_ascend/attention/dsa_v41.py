@@ -37,7 +37,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend.models.deepseek_v41.cache_config import WINDOW, RequestWindowSpec, get_window_staging_rows
+from vllm_ascend.models.deepseek_v41.cache_config import WINDOW, StagedWindowSpec, get_window_staging_rows
 from vllm_ascend.models.deepseek_v41.request_state import (
     defer_window_write,
     forward_request_window,
@@ -909,7 +909,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self.request_window_builder = (
             RequestWindowMetadataBuilder(self._seq_lens, get_window_staging_rows(max_tokens, max_reqs))
-            if isinstance(kv_cache_spec, RequestWindowSpec)
+            if isinstance(kv_cache_spec, StagedWindowSpec)
             else None
         )
         self._max_tokens = max_tokens

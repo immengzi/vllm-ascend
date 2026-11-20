@@ -24,6 +24,9 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.models.deepseek_v41 import request_state
 from vllm_ascend.models.deepseek_v41.cache_config import (
     REQUEST_STATE_POOLS_CONFIG_KEY,
+    SINGLE_POOL_SWA_CONFIG_KEY,
+    get_deepseek_v41_kv_cache_config,
+    get_deepseek_v41_pool_bytes_per_block,
     get_request_state_groups,
     get_request_state_pd_alignment_bytes,
     get_request_state_pool_plan,
@@ -32,6 +35,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     make_mla_cache_spec,
     make_swa_cache_spec,
     materialize_request_state_pools,
+    uses_single_pool_windows,
 )
 from vllm_ascend.models.deepseek_v41.window_state import (
     RequestWindowMetadataBuilder,
@@ -167,7 +171,9 @@ def test_eligible_geometry_defaults_to_existing_layout(geometry):
 
     config, specs, _ = geometry
     config.additional_config = {}
-    assert AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs) == make_cache_groups(group_cache_specs(specs))
+    assert AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs) == make_cache_groups(
+        group_cache_specs(specs)
+    )
     config.additional_config[REQUEST_STATE_POOLS_CONFIG_KEY] = "false"
     with pytest.raises(ValueError, match="must be a boolean"):
         AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
@@ -316,6 +322,7 @@ def test_swa_ring_commit_masks_reserved_and_padded_rows(monkeypatch, state_id, s
     # four loads are the request's query bounds, sequence length and slot ID.
     controls = [torch.tensor(x) for x in (0, 1, seq_len, state_id)]
     tl = SimpleNamespace(
+        int64=torch.int64,
         arange=torch.arange,
         program_id=lambda _axis: 0,
         load=Mock(side_effect=[*controls, torch.zeros(16, 1)]),
@@ -325,7 +332,7 @@ def test_swa_ring_commit_masks_reserved_and_padded_rows(monkeypatch, state_id, s
     )
     monkeypatch.setattr(state_kernels, "tl", tl)
     kernel = getattr(state_kernels._commit, "fn", state_kernels._commit)
-    kernel(0, 0, 0, 0, 0, WIDTH=1, WINDOW=128, ROWS=16)
+    kernel(0, 0, 0, 0, 0, WIDTH=1, WINDOW=128, ROWS=16, PAGE_STRIDE=128)
     args, kwargs = tl.store.call_args
     assert args[0][kwargs["mask"]].tolist() == expected_offsets
 
@@ -459,3 +466,177 @@ def test_mooncake_registers_each_backing_independently_of_history_capacity(geome
     assert {plane["capacity"] for plane in planes if plane["group"] == 0} == {7}
     assert {plane["capacity"] for plane in planes if plane["group"] != 0} == {3}
     assert {plane["rows"] for plane in planes if plane["group"] == 0} == {64, 128}
+
+
+def test_single_pool_window_allocation_and_reuse(geometry):
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+    from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
+
+    config, specs, _ = geometry
+    config.cache_config.num_gpu_blocks_override = None
+    config.additional_config.clear()
+    builder = AscendKVCacheConfigBuilder()
+    native = builder.get_kv_cache_groups(config, specs)
+    config.additional_config[SINGLE_POOL_SWA_CONFIG_KEY] = True
+    groups = builder.get_kv_cache_groups(config, specs)
+    assert uses_single_pool_windows(groups) and not is_request_state_cache(groups)
+    assert [g.layer_names for g in groups] == [g.layer_names for g in native]
+    stride = get_deepseek_v41_pool_bytes_per_block(groups)
+    assert stride == get_deepseek_v41_pool_bytes_per_block(native) == 540928
+    # Null page + three history + one compressor + ten SWA leaves no spare IDs.
+    worker = get_deepseek_v41_kv_cache_config(config, groups, 15 * stride)
+    assert worker.request_state_plan is None and worker.num_blocks == 15
+    assert worker.staging_rows == 1024
+    for group in groups[2:]:
+        ring = group.kv_cache_spec.first_spec
+        assert ring.sliding_window == 128 and ring.num_retained_tokens == 0
+        assert ring.max_num_blocks_per_req(config, 700_001) == 1
+        assert not ring.uses_slot_mapping
+    assert [t.size for t in worker.kv_cache_tensors] == [
+        t.size for t in get_deepseek_v41_kv_cache_config(config, native, 15 * stride).kv_cache_tensors
+    ]
+    scheduler = generate_scheduler_kv_cache_config([worker])
+    with patch(
+        "vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator", patch_kv_cache_coordinator.get_kv_cache_coordinator
+    ):
+        manager = KVCacheManager(scheduler, 512, 128, 128, enable_caching=False)
+    managers = manager.coordinator.single_type_managers
+    assert len(managers) == 12 and all(m.block_pool is manager.coordinator.block_pool for m in managers)
+    assert all(isinstance(m, AscendCircularBufferManager) for m in managers[2:])
+    first, second = make_request("first"), make_request("after-cancel")
+    assert manager.allocate_slots(first, 128) is not None
+    initial = manager.get_blocks(first.request_id).get_block_ids()
+    assert [len(ids) for ids in initial] == [1] * 12
+    first.num_computed_tokens = 128
+    assert manager.allocate_slots(first, 129) is not None
+    final = manager.get_blocks(first.request_id).get_block_ids()
+    assert len(final[0]) == 3 and final[1:] == initial[1:]
+    assert manager.allocate_slots(second, 1) is None
+    manager.free(first)
+    assert manager.allocate_slots(second, 257) is not None
+    recycled = manager.get_blocks(second.request_id).get_block_ids()
+    assert set(sum((list(ids) for ids in recycled), [])) == set(range(1, 15))
+    manager.free(second)
+    assert manager.coordinator.block_pool.get_num_free_blocks() == 14
+
+
+def test_single_pool_rejects_incompatible_modes(geometry):
+    config, specs, _ = geometry
+    config.additional_config[SINGLE_POOL_SWA_CONFIG_KEY] = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        get_request_state_groups(config, specs)
+    config.additional_config[REQUEST_STATE_POOLS_CONFIG_KEY] = False
+    config.kv_transfer_config = object()
+    with pytest.raises(ValueError, match="KV transfer"):
+        get_request_state_groups(config, specs)
+
+
+def test_single_pool_reserves_workspace_once_per_rank(geometry):
+    from vllm_ascend.patch.platform import patch_kv_cache_utils as planning
+
+    config, specs, _ = geometry
+    config.additional_config = {SINGLE_POOL_SWA_CONFIG_KEY: True}
+    config.cache_config.num_gpu_blocks_override = None
+    groups = get_request_state_groups(config, specs)
+    page = get_deepseek_v41_pool_bytes_per_block(groups)
+    workspace = 1024 * 1024 + 2**20
+    available = [workspace + 20 * page, workspace + 24 * page]
+    with patch.object(planning, "_orig_get_kv_cache_configs") as delegate:
+        planning._ascend_get_kv_cache_configs(config, [specs, specs], available, groups)
+        delegate.assert_called_once_with(config, [specs, specs], [20 * page, 24 * page], groups)
+        config.cache_config.num_gpu_blocks_override = 21
+        with pytest.raises(ValueError, match="profiled KV memory budget"):
+            planning._ascend_get_kv_cache_configs(config, [specs, specs], available, groups)
+        assert delegate.call_count == 1
+
+
+def test_single_pool_worker_replanning_through_core(geometry):
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+    from vllm_ascend.patch.platform import patch_kv_cache_utils as planning
+
+    config, specs, _ = geometry
+    config.additional_config = {SINGLE_POOL_SWA_CONFIG_KEY: True}
+    config.parallel_config.tensor_parallel_size = 2
+    config.cache_config.num_gpu_blocks_override = None
+    config.model_config.original_max_model_len = 512
+    config.attention_config = SimpleNamespace(hisparse_config=None)
+    builder = AscendKVCacheConfigBuilder()
+    groups = builder.get_kv_cache_groups(config, specs)
+    page = get_deepseek_v41_pool_bytes_per_block(groups)
+    workspace = 2 * 1024**2
+    with patch("vllm.v1.core.kv_cache_config_builder.get_kv_cache_config_builder", return_value=builder):
+        workers = planning._ascend_get_kv_cache_configs(
+            config, [specs, specs], [workspace + 20 * page, workspace + 24 * page], groups
+        )
+    for worker in workers:
+        assert worker.num_blocks == 20 and worker.staging_rows == 1024
+        assert worker.request_state_plan is None
+        assert [tensor.block_stride for tensor in worker.kv_cache_tensors] == [147712, 131072, 131072, 131072]
+        assert sum(tensor.size for tensor in worker.kv_cache_tensors) == 20 * page
+
+
+def test_single_pool_staging_reads_each_swa_groups_own_table(geometry):
+    config, specs, _ = geometry
+    config.cache_config.num_gpu_blocks_override = None
+    config.additional_config = {SINGLE_POOL_SWA_CONFIG_KEY: True}
+    groups = get_request_state_groups(config, specs)
+    worker = get_deepseek_v41_kv_cache_config(config, groups, get_deepseek_v41_pool_bytes_per_block(groups) * 12)
+    layers = {}
+    for tensor in worker.kv_cache_tensors:
+        storage = torch.empty(tensor.size // 2, dtype=torch.bfloat16)
+        ring = storage.as_strided((12, 128, 1, 512), (tensor.block_stride // 2, 512, 512, 1))
+        for name in tensor.layers:
+            if name.endswith(".swa_cache"):
+                layers[name] = SimpleNamespace(kv_cache=[ring])
+    workspace = bind_window_staging_workspace(worker, layers)
+    assert len(layers) == 40 and all(layer.request_state_workspace is workspace for layer in layers.values())
+    assert workspace.tensor.shape == (8, 128, 1, 512)
+    result = SimpleNamespace(num_reqs=1, max_query_len=1, seq_lens=torch.tensor([4097]))
+    for block_id, group in enumerate(groups[2:], 1):
+        table = torch.tensor([[block_id]], dtype=torch.int32)
+        metadata = RequestWindowMetadataBuilder(result.seq_lens, worker.staging_rows).build(
+            SimpleNamespace(block_table_tensor=table, query_start_loc=torch.tensor([0, 1])), result
+        )
+        assert metadata.state_ids.data_ptr() == table.data_ptr()
+        assert metadata.lengths.tolist() == [128]
+        assert all(layers[name].kv_cache[0].shape[0] == worker.num_blocks for name in group.layer_names)
+
+
+def test_single_pool_window_uses_native_circular_block_selection(geometry):
+    from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import MooncakeBaseConnectorScheduler
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
+
+    config, specs, _ = geometry
+    config.additional_config = {SINGLE_POOL_SWA_CONFIG_KEY: True}
+    group = get_request_state_groups(config, specs)[2].kv_cache_spec
+    assert is_circular_kv_cache_spec(group)
+    ring = group.first_spec
+    assert is_circular_kv_cache_spec(ring)
+    scheduler = SimpleNamespace(group_unique_specs=[[ring]], group_block_size=[128], dcp_size=1)
+    advertised = MooncakeBaseConnectorScheduler._get_transfer_block_ids(scheduler, ([37],), 4096)
+    assert advertised == ([37],)
+    receiver = object.__new__(MooncakePullRecvingThread)
+    receiver.dcp_size = 1
+    request = dict(
+        request_id="single-pool",
+        remote_tp_rank_groups=[[0]],
+        remote_dcp_size=1,
+        spec_index=0,
+        local_block_size=128,
+        remote_block_size=128,
+        local_group_block_ids=[11],
+        local_full_group_block_ids=[11],
+        remote_group_block_ids=advertised[0],
+        local_num_prompt_tokens=4097,
+        remote_num_prompt_tokens=4096,
+        num_computed_tokens=256,
+        local_block_size_scale=1,
+        remote_block_size_scale=1,
+        spec=ring,
+        selection_index=0,
+        remote_interleave_size=1,
+    )
+    assert receiver._compute_group_block_ids(**request) == [(0, [11], [37])]
+    with pytest.raises(ValueError, match="exactly one block"):
+        receiver._compute_group_block_ids(**{**request, "remote_group_block_ids": [37, 38]})

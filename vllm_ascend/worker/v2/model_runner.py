@@ -73,7 +73,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
-from vllm_ascend.core.kv_cache_interface import get_request_state_plan, is_circular_kv_cache_spec
+from vllm_ascend.core.kv_cache_interface import get_request_state_plan, is_circular_kv_cache_spec, uses_window_staging
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     bind_dspark_context_receiver,
     configure_dspark_kv_transfer,
@@ -1150,12 +1150,12 @@ class NPUModelRunner(GPUModelRunner):
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-        separated = get_request_state_plan(getattr(self, "kv_cache_config", None)) is not None
+        staged = uses_window_staging(getattr(self, "kv_cache_config", None))
         block_tables, slot_mappings = super().prepare_dummy_attn(
             input_batch,
-            valid_state_slots=valid_state_slots and not separated,
+            valid_state_slots=valid_state_slots and not staged,
         )
-        if not separated:
+        if not staged:
             prepare_v41_dummy_ring_state(self, input_batch.num_reqs)
         # Separated pools keep the parent's reserved null IDs. IDs 1..N can
         # belong to live requests even on a DP rank with no work in this step.

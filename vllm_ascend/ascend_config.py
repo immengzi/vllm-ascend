@@ -648,6 +648,7 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_deepseek_v41_request_state_pools: StrictBool = False
+    enable_single_pool_swa_ring: StrictBool = False
     """Use request-state pools for supported DeepSeek V4.1 MRV2 configurations."""
     enable_cpu_binding: bool = True
     shared_engram: SharedEngramConfig | None = None

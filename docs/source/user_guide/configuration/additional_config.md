@@ -36,6 +36,7 @@ The following table lists additional configuration options available in vLLM Asc
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
+| `enable_single_pool_swa_ring` | boolean | `false` | Experimental DeepSeek V4.1 Flash MRV2 layout for colocated execution with unpacked BF16 KV. Each native SWA group uses one shared-pool block per active request and shares a runner-owned staging workspace. Mutually exclusive with dedicated request-state pools. |
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
