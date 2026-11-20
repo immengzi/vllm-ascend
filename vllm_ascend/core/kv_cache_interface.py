@@ -42,6 +42,10 @@ def get_request_state_plan(config: KVCacheConfig | None) -> RequestStatePoolPlan
     return config.request_state_plan if isinstance(config, AscendKVCacheConfig) else None
 
 
+def uses_window_staging(config: KVCacheConfig | None) -> bool:
+    return isinstance(config, AscendKVCacheConfig) and config.staging_rows > 0
+
+
 def get_cache_group_capacity(config: KVCacheConfig, group_id: int) -> int:
     plan = get_request_state_plan(config)
     return config.num_blocks if plan is None else plan.pool_for_group(group_id).capacity
@@ -577,7 +581,12 @@ class AscendCircularBufferSpec(CircularBufferSpec):
 
 def register_ascend_kv_cache_specs() -> None:
     from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
+    from vllm_ascend.models.deepseek_v41.cache_config import SinglePoolWindowSpec
     from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
+
+    KVCacheSpecRegistry.register(
+        SinglePoolWindowSpec, AscendCircularBufferManager, uniform_type_base_spec=SinglePoolWindowSpec
+    )
 
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendCircularBufferSpec,

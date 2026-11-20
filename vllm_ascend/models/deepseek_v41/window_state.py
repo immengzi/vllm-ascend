@@ -10,7 +10,7 @@ import torch
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_ascend.core.kv_cache_interface import AscendKVCacheConfig
-from vllm_ascend.models.deepseek_v41.cache_config import MLA_HEAD_DIM, WINDOW, RequestWindowSpec, unwrap
+from vllm_ascend.models.deepseek_v41.cache_config import MLA_HEAD_DIM, WINDOW, StagedWindowSpec, unwrap
 
 
 @dataclass(frozen=True)
@@ -123,12 +123,12 @@ def bind_window_staging_workspace(
     existing: WindowStagingWorkspace | None = None,
 ) -> WindowStagingWorkspace | None:
     """Bind the single planned staging allocation to this runner's SWA layers."""
-    if not isinstance(config, AscendKVCacheConfig) or config.request_state_plan is None:
+    if not isinstance(config, AscendKVCacheConfig) or config.staging_rows <= 0:
         return None
     windows = [
         layers[name]
         for group in config.kv_cache_groups
-        if all(isinstance(spec, RequestWindowSpec) for spec in unwrap(group.kv_cache_spec).values())
+        if all(isinstance(spec, StagedWindowSpec) for spec in unwrap(group.kv_cache_spec).values())
         for name in group.layer_names
     ]
     # Bind from declared cache-group membership, never model-name suffixes.

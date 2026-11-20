@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.core.kv_cache_interface import get_request_state_plan
 from vllm_ascend.models.deepseek_v41.cache_config import (
+    ROW_BYTES,
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
     get_request_state_pd_alignment_bytes,
@@ -35,7 +36,9 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
     is_request_state_cache,
     make_cache_groups,
+    single_pool_staging_rows,
     unwrap,
+    uses_single_pool_windows,
 )
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
@@ -514,6 +517,14 @@ def _ascend_get_kv_cache_configs(
     available_memory: list[int],
     global_kv_cache_groups: list[KVCacheGroupSpec],
 ) -> list[KVCacheConfig]:
+    if uses_single_pool_windows(global_kv_cache_groups):
+        workspace_bytes = single_pool_staging_rows(vllm_config) * ROW_BYTES + 2**20
+        block_bytes = get_deepseek_v41_pool_bytes_per_block(global_kv_cache_groups)
+        override = vllm_config.cache_config.num_gpu_blocks_override
+        for memory in available_memory:
+            if memory < workspace_bytes + (override or 1) * block_bytes:
+                raise ValueError("Single-pool SWA blocks and staging exceed the profiled KV memory budget")
+        available_memory = [memory - workspace_bytes for memory in available_memory]
     if is_request_state_cache(global_kv_cache_groups):
         # Core estimates, checks and reconciles the history pages. Deduct the
         # rank-local fixed allocation once; the builder restores it at any
