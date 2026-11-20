@@ -329,6 +329,14 @@ KVPP can be combined with `MooncakeConnectorV2` for P/D disaggregation and `Asce
 
 PCP gathers prefill KV before cache writes. KVPP layer broadcasts restore prior-forward cache contents before attention; the broadcast decision uses the global scheduled batch rather than PCP-local segment offsets.
 
+## Compact native KV pages for DeepSeek V4.1 Flash
+
+Set `--additional-config '{"enable_deepseek_v41_compact_kv_pages": true}'` on both endpoints to try the experimental layout.
+It supports the unpacked Flash cache geometry with MRV2, the hybrid cache manager, and PP, PCP and DCP all set to 1.
+Disable prefix caching, SWA bounded replay, speculative decoding, extensible KV cache and KV layer parallelism.
+The shared native block pool allocates one ID across all cache groups. Each ID costs 384 KiB per worker.
+The 40 sliding-window layers use 14 groups, so request capacity depends on the prompt length and the number of live window pages.
+
 ## GDN internal prefill checkpoints
 
 Enable with `--additional-config '{"gdn_internal_prefill_checkpoints": true}'`.
