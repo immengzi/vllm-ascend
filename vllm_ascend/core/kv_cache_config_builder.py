@@ -34,6 +34,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
     make_cache_groups,
 )
+from vllm_ascend.models.deepseek_v41.compact_cache import compact_groups_if_enabled
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_groups,
@@ -62,6 +63,9 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         Precedence: Kimi-K3.1, GLM-Next, then DSV4.1 / mixed-page-size shared slots, then
         the Kimi-K3 DSpark mixed grouping, then vLLM's generic grouping.
         """
+        compact = compact_groups_if_enabled(vllm_config, kv_cache_spec)
+        if compact is not None:
+            return compact
         if vllm_config.model_config.hf_config.model_type == "kimi_k31":
             return paired_sfa_cache_groups(vllm_config, kv_cache_spec)
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:

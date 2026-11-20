@@ -36,6 +36,7 @@ The following table lists additional configuration options available in vLLM Asc
 
 | Name                                | Type | Default | Description                                                                                               |
 |-------------------------------------|------|---------|-----------------------------------------------------------------------------------------------------------|
+| `enable_deepseek_v41_compact_kv_pages` | boolean | `false` | Experimental unpacked DeepSeek V4.1 Flash MRV2 layout. Packs history and index data into three 128 KiB banks under each native block ID. Use matching layouts on P and D. |
 | `xlite_graph_config`                | dict | `{}`    | Configuration options for Xlite graph mode                                                                |
 | `finegrained_tp_config`             | dict | `{}`    | Configuration options for fine-grained tensor parallelism. See [Fine-Grained Tensor Parallelism](../feature_guide/Fine_grained_TP.md). |
 | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
