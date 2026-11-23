@@ -99,6 +99,8 @@ from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .engram.shared_pool import rollback_shared_engram
 from .engram_lifecycle import close_engram_on_init_failure
 from .indexer import DeepseekV41Indexer
+from .uniform_cache import LAYOUT_OPTION
+from .window_state import bind_window_staging_workspace
 
 
 def _engram_enabled_for_runtime(config, vllm_config) -> bool:
@@ -986,6 +988,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
+        if (vllm_config.additional_config or {}).get(LAYOUT_OPTION) is True:
+            bind_window_staging_workspace(
+                self.layers[self.start_layer : self.end_layer], vllm_config.scheduler_config, torch.device(self.device)
+            )
         self._oproj_buffer_pool = OProjBufferPool()
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
