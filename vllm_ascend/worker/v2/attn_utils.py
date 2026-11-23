@@ -97,7 +97,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
-from vllm_ascend.models.deepseek_v41.compact_cache import CompactPageGroup, allocate_compact_views
+from vllm_ascend.models.deepseek_v41.compact_cache import CompactPageGroup, allocate_compact_views, uses_fixed_swa_ring
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.models.qwen4_exp.cache_config import (
     GDN,
@@ -545,6 +545,7 @@ def build_attn_metadata(
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
+    fixed_swa_ring = uses_fixed_swa_ring(kv_cache_config)
     batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
     formatted_slot_mappings = None
     if batch_tq_slots:
@@ -684,6 +685,7 @@ def build_attn_metadata(
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,
                     skip_ring_state_update=skip_ring_state_update,
+                    fixed_swa_ring=fixed_swa_ring,
                     common_v41_metadata=common_v41_metadata,
                     common_v41_batch_metadata=common_v41_batch_metadata,
                     v41_prefill_override=v41_prefill_override,

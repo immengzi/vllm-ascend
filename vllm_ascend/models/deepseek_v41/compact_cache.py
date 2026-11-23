@@ -3,9 +3,11 @@
 """Pack Flash history and bounded state into equal-cost native block IDs."""
 
 from collections.abc import Callable
+from dataclasses import dataclass, fields
 
 import torch
 from vllm.config import VllmConfig
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
@@ -24,6 +26,48 @@ BANKS = 3
 BLOCK_BYTES = BANKS * BANK_BYTES
 
 
+WINDOW = 128
+RING_CONFIG_KEY = "enable_deepseek_v41_fixed_swa_ring"
+
+
+@dataclass(frozen=True, kw_only=True)
+class SinglePoolWindowSpec(AscendSlidingWindowMLASpec):
+    @property
+    def uses_slot_mapping(self) -> bool:
+        return False
+
+    @property
+    def block_table_token_alignment(self) -> int | None:
+        return None
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+    def max_num_blocks_per_req(self, vllm_config, max_len) -> int:
+        return 1
+
+    def max_admission_blocks_per_request(self, **kwargs) -> int:
+        return 1
+
+    def max_memory_usage_bytes(self, vllm_config) -> int:
+        return self.page_size_bytes
+
+    @property
+    def is_circular(self) -> bool:
+        return True
+
+    @property
+    def num_retained_tokens(self) -> int:
+        # The MRV2 gather kernel nulls old position-indexed table entries.
+        # Our only entry addresses the whole ring at every sequence position.
+        return 0
+
+
+def get_window_staging_rows(max_tokens: int, max_requests: int) -> int:
+    return cdiv(max_tokens + max_requests * 2 * WINDOW, WINDOW) * WINDOW
+
+
 class CompactPageGroup(KVCacheGroupSpec):
     """Native cache group whose block IDs use the compact DSV4.1 placement."""
 
@@ -32,11 +76,22 @@ def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
     enabled = (getattr(config, "additional_config", None) or {}).get(CONFIG_KEY, False)
     if type(enabled) is not bool:
         raise ValueError(f"{CONFIG_KEY} must be a boolean")
+    ring = (getattr(config, "additional_config", None) or {}).get(RING_CONFIG_KEY, False)
+    if type(ring) is not bool or (ring and not enabled):
+        raise ValueError(f"{RING_CONFIG_KEY} must be boolean and requires {CONFIG_KEY} when enabled")
     if not enabled:
         return None
     if (config.additional_config or {}).get("enable_kvpp") or config.cache_config.enable_extensible_kv_cache:
         raise ValueError("Compact KV pages require static placement with KVPP disabled")
     parallel = config.parallel_config
+    if ring and getattr(parallel, "use_ubatching", False):
+        raise ValueError("Fixed SWA rings share a staging workspace and require non-overlapping forwards")
+    if (
+        ring
+        and config.kv_transfer_config is not None
+        and config.kv_transfer_config.kv_connector != "MooncakePullConnector"
+    ):
+        raise ValueError("Fixed SWA rings support MooncakePullConnector for disaggregated serving")
     if (
         config.model_config.architecture != "DeepseekV41ForCausalLM"
         or not config.use_v2_model_runner
@@ -99,6 +154,13 @@ def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
         raise ValueError("Compact history requires four matching Flash KV/index pairs")
     windows.sort(key=lambda name: int(name.rsplit(".layers.", 1)[1].split(".", 1)[0]))
     members = [history, states, *(windows[i : i + BANKS] for i in range(0, len(windows), BANKS))]
+    if ring:
+        specs = dict(specs)
+        for name in windows:
+            original = specs[name]
+            specs[name] = SinglePoolWindowSpec(
+                **{field.name: getattr(original, field.name) for field in fields(original) if field.init}
+            )
     groups = []
     for names in members:
         spec = UniformTypeKVCacheSpecs.from_specs({n: specs[n] for n in names})
@@ -106,6 +168,12 @@ def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
             raise ValueError(f"Incompatible cache specs in compact group {names}")
         groups.append(CompactPageGroup(layer_names=names, kv_cache_spec=spec))
     return groups
+
+
+def uses_fixed_swa_ring(config: KVCacheConfig | None) -> bool:
+    if config is None or not config.kv_cache_groups or not isinstance(config.kv_cache_groups[0], CompactPageGroup):
+        return False
+    return any(isinstance(group.kv_cache_spec.first_spec, SinglePoolWindowSpec) for group in config.kv_cache_groups)
 
 
 def compact_cache_config(

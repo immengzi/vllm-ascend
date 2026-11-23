@@ -58,6 +58,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     make_cache_groups,
     make_folded_index_cache_spec,
 )
+from vllm_ascend.models.deepseek_v41.compact_cache import SinglePoolWindowSpec
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.model import AscendDeepseekV41SWACache, build_layer_plan
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage
@@ -1449,6 +1450,28 @@ def _swa_builder(runtime, window=REPLAY_WINDOW):
         model_version="deepseek_v41",
     )
     return AscendDSAV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+
+
+@pytest.mark.parametrize(("n", "query"), [(128, 63), (129, 1), (257, 1)])
+def test_fixed_swa_builder_keeps_group_block_and_chronological_lengths(runtime, n, query):
+    runtime.model_config.hf_text_config.sliding_window = 128
+    spec = SinglePoolWindowSpec(
+        block_size=128,
+        sliding_window=128,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        model_version="deepseek_v41",
+    )
+    common = _replay_common(None, query_lens=[query], seq_lens=[n]).replace(
+        block_table_tensor=torch.tensor([[19]], dtype=torch.int32)
+    )
+    builder = dsa_v41.AscendDSAV41SWAMetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    meta = builder.build(0, common, fixed_swa_ring=True)
+    assert meta.request_state.state_ids.tolist() == [19]
+    assert meta.request_state.lengths.tolist() == [min(127, n - query) + query]
+    assert torch.all(meta.slot_mapping == -1)
+    assert meta.flat_slot_mapping is None
 
 
 def _expected_lens(window: int, replay_start: int, positions) -> list[int]:

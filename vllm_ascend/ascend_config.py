@@ -649,6 +649,7 @@ class AscendConfig:
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
     enable_deepseek_v41_compact_kv_pages: StrictBool = False
+    enable_deepseek_v41_fixed_swa_ring: StrictBool = False
     shared_engram: SharedEngramConfig | None = None
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;

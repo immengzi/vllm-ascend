@@ -337,6 +337,14 @@ Disable prefix caching, SWA bounded replay, speculative decoding, extensible KV 
 The shared native block pool allocates one ID across all cache groups. Each ID costs 384 KiB per worker.
 The 40 sliding-window layers use 14 groups, so request capacity depends on the prompt length and the number of live window pages.
 
+### Experimental fixed SWA ring
+
+With compact pages enabled, set `enable_deepseek_v41_fixed_swa_ring` to `true` on both MRV2 endpoints
+to keep one native block per request per SWA group. The default is `false`. For P/D use the stock Mooncake
+Pull connector. The experiment requires sequential forwards within each runner. Each model allocates one shared
+BF16 workspace before KV memory profiling. Only the persistent ring views are published for SWA transfer.
+Fused operator results, model probabilities and performance require A3 validation.
+
 ## GDN internal prefill checkpoints
 
 Enable with `--additional-config '{"gdn_internal_prefill_checkpoints": true}'`.

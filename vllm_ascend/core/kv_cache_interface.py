@@ -555,7 +555,12 @@ class AscendCircularBufferSpec(CircularBufferSpec):
 
 def register_ascend_kv_cache_specs() -> None:
     from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
+    from vllm_ascend.models.deepseek_v41.compact_cache import SinglePoolWindowSpec
     from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
+
+    KVCacheSpecRegistry.register(
+        SinglePoolWindowSpec, AscendCircularBufferManager, uniform_type_base_spec=SinglePoolWindowSpec
+    )
 
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendCircularBufferSpec,

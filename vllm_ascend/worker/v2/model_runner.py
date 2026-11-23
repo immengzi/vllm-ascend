@@ -95,6 +95,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.hisparse.host_mirror import HostMirrorConnector, overlap_target_host_mirror
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
+from vllm_ascend.models.deepseek_v41.compact_cache import uses_fixed_swa_ring
 from vllm_ascend.observability.runtime_guard.hooks import (
     runtime_guard_sample_tokens,
     runtime_guard_step,
@@ -1128,11 +1129,14 @@ class NPUModelRunner(GPUModelRunner):
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        # Dummy DP work must not address positive ring IDs owned by live requests.
+        fixed_ring = uses_fixed_swa_ring(getattr(self, "kv_cache_config", None))
         block_tables, slot_mappings = super().prepare_dummy_attn(
             input_batch,
-            valid_state_slots=valid_state_slots,
+            valid_state_slots=valid_state_slots and not fixed_ring,
         )
-        prepare_v41_dummy_ring_state(self, input_batch.num_reqs)
+        if not fixed_ring:
+            prepare_v41_dummy_ring_state(self, input_batch.num_reqs)
         slot_mappings = self._maybe_extend_slot_mappings(input_batch, slot_mappings)
         return block_tables, slot_mappings
 
