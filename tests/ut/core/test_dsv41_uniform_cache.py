@@ -52,7 +52,6 @@ def flash():
         cache_config=SimpleNamespace(
             enable_prefix_caching=False,
             swa_bounded_replay=False,
-            enable_extensible_kv_cache=False,
             num_gpu_blocks_override=None,
             prefix_cache_retention_interval=None,
         ),
@@ -235,3 +234,11 @@ def test_decode_uses_last_window_at_page_boundaries(length):
     assert metadata.state_ids.tolist() == [17]
     assert metadata.lengths.tolist() == [128]
     assert metadata.block_table.tolist() == [[0]]
+
+
+def test_extensible_cache_rejected_when_present(flash):
+    config, specs = flash
+    configure(config, 2, 2, 128)
+    config.cache_config.enable_extensible_kv_cache = True
+    with pytest.raises(ValueError, match="static placement"):
+        AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)

@@ -139,7 +139,9 @@ def uniform_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
         raise ValueError(f"{LAYOUT_OPTION} must be a boolean")
     if not enabled:
         return None
-    if (config.additional_config or {}).get("enable_kvpp") or config.cache_config.enable_extensible_kv_cache:
+    if (config.additional_config or {}).get("enable_kvpp") or getattr(
+        config.cache_config, "enable_extensible_kv_cache", False
+    ):
         raise ValueError("Uniform KV tiles require static placement with KVPP disabled")
     parallel = config.parallel_config
     if getattr(parallel, "use_ubatching", False):
