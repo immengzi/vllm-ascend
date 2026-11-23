@@ -14,7 +14,13 @@ from vllm.v1.request import Request
 from tests.ut.core import test_dsv41_compact_pages as pages
 from tests.ut.core.test_dsv41_compact_ring_handoff import cache_parts, manager_for, stock_read_batch
 from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
-from vllm_ascend.models.deepseek_v41.compact_cache import BANK_BYTES, C2_SLOTS_KEY, LOGICAL_CONFIG_KEY, SWA_SLOTS_KEY
+from vllm_ascend.models.deepseek_v41.compact_cache import (
+    BANK_BYTES,
+    C2_SLOTS_KEY,
+    LOGICAL_CONFIG_KEY,
+    PACKED_HISTORY_KEY,
+    SWA_SLOTS_KEY,
+)
 
 flash = pages.flash
 
@@ -66,10 +72,13 @@ def test_auto_fit_reserves_state_and_null(flash):
 
 
 @pytest.mark.parametrize("hist,swa,c2", [(3, 1, 2), (3, 2, 1), (1, 2, 2)])
-def test_quota_atomicity_and_deferred_free(flash, hist, swa, c2):
+@pytest.mark.parametrize("packed", [False, True])
+def test_quota_atomicity_and_deferred_free(flash, hist, swa, c2, packed):
     config, specs = flash
     configure(config, swa, c2, 128)
-    cfg, _ = pages.worker_views(config, specs, 1 + 3 * hist + 40 * swa + 3 * c2)
+    config.additional_config[PACKED_HISTORY_KEY] = packed
+    count = 1 + hist + 20 * swa + 2 * c2 if packed else 1 + 3 * hist + 40 * swa + 3 * c2
+    cfg, _ = pages.worker_views(config, specs, count)
     mgr = manager_for(cfg)
     pool = mgr.coordinator.block_pool
 
@@ -79,14 +88,14 @@ def test_quota_atomicity_and_deferred_free(flash, hist, swa, c2):
     a, b = req("first"), req("second")
     assert mgr.allocate_slots(a, 1) is not None
     ids = mgr.get_blocks(a.request_id).get_block_ids()
-    assert len({i for group in ids for i in group}) == 46
+    assert len({i for group in ids for i in group}) == (23 if packed else 46)
     free = pool.get_num_free_blocks()
     assert free > 0 and mgr.allocate_slots(b, 1) is None
     assert pool.get_num_free_blocks() == free
     # The scheduler has removed the request, but a simulated in-flight
     # transfer still owns the native blocks until its completion fence.
     detached = mgr.pop_blocks_for_free(a)
-    assert len(detached) == 46
+    assert len(detached) == (23 if packed else 46)
     assert mgr.allocate_slots(b, 1) is None
     assert pool.get_num_free_blocks() == free
     pool.free_blocks(reversed(detached))
@@ -96,11 +105,13 @@ def test_quota_atomicity_and_deferred_free(flash, hist, swa, c2):
         assert pool.get_num_free_blocks() == cfg.num_blocks - 1
 
 
-def test_four_producer_sources_both_decode_ranks(flash):
+@pytest.mark.parametrize("packed", [False, True])
+def test_four_producer_sources_both_decode_ranks(flash, packed):
     config, specs = flash
     configure(config, 4, 4, 512)
 
     def workers(count, tp_size):
+        config.additional_config[PACKED_HISTORY_KEY] = packed
         result = []
         for rank in range(tp_size):
             cfg, views = pages.worker_views(config, specs, count)
@@ -159,4 +170,45 @@ def test_invalid_logical_slot_count(flash, key, value):
     configure(config, 2, 3, 128)
     config.additional_config[key] = value
     with pytest.raises(ValueError, match=key):
+        AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
+
+
+@pytest.mark.parametrize("packed, history_blocks, generation_fits", [(False, 35094, False), (True, 36883, True)])
+def test_six_long_requests(flash, packed, history_blocks, generation_fits):
+    config, specs = flash
+    configure(config, 72, 72, 1048576)
+    config.additional_config[PACKED_HISTORY_KEY] = packed
+    cfg = plan(config, specs, int(13.23 * 2**30))[0]
+    mgr = manager_for(cfg, max_model_len=config.model_config.max_model_len)
+    assert mgr.coordinator.single_type_managers[0].logical_limit == history_blocks
+    requests = [Request(str(i), [1] * 700001, SamplingParams(max_tokens=65536), pooling_params=None) for i in range(7)]
+    for req in requests[:6]:
+        assert mgr.allocate_slots(req, 0, num_external_computed_tokens=700000, delay_cache_blocks=True) is not None
+        req.num_computed_tokens = 700000
+        assert mgr.allocate_slots(req, 1) is not None
+        req.num_computed_tokens += 1
+    assert mgr.allocate_slots(requests[-1], 0, num_external_computed_tokens=700000, delay_cache_blocks=True) is None
+    # Capacity only: reserve the 64K continuation, without executing model steps.
+    admitted = [mgr.allocate_slots(req, 65536) is not None for req in requests[:6]]
+    assert all(admitted) == generation_fits
+
+
+def test_packed_backing_and_autofit(flash):
+    config, specs = flash
+    configure(config, 2, 3, 2048)
+    config.additional_config[PACKED_HISTORY_KEY] = True
+    config.device_config = SimpleNamespace(device_type="cpu")
+    config.model_config.original_max_model_len = -1
+    count = 1 + 20 * 2 + 2 * 3 + 6
+    for cfg in plan(config, specs, count * 369280):
+        assert cfg.num_blocks == count
+        assert set(d.size for d in cfg.kv_cache_tensors) == {count * 369280}
+    assert config.model_config.max_model_len == 768
+    cfg, views = pages.worker_views(config, specs, count)
+    storages = {
+        p.untyped_storage().data_ptr(): p.untyped_storage().nbytes() for v in views.values() for p in cache_parts(v)
+    }
+    assert list(storages.values()) == [count * 369280 + 2**21]
+    config.additional_config = {PACKED_HISTORY_KEY: True}
+    with pytest.raises(ValueError, match=LOGICAL_CONFIG_KEY):
         AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)

@@ -30,9 +30,11 @@ from vllm_ascend.models.deepseek_v41.compact_cache import (
     BANK_BYTES,
     C2_SLOTS_KEY,
     LOGICAL_CONFIG_KEY,
+    PACKED_HISTORY_KEY,
     RING_CONFIG_KEY,
     SWA_SLOTS_KEY,
     LogicalPoolGroup,
+    PackedHistoryGroup,
     get_window_staging_rows,
 )
 from vllm_ascend.models.deepseek_v41.window_state import RequestWindowMetadataBuilder, bind_window_staging_workspace
@@ -99,13 +101,15 @@ def cpu_ring_kernels(monkeypatch):
         monkeypatch.setattr(state_kernels, name, CpuLaunch(getattr(state_kernels, name)))
 
 
-def manager_for(cfg):
+def manager_for(cfg, max_model_len=4096):
     from vllm_ascend.patch.platform import patch_kv_cache_coordinator
 
     with patch(
         "vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator", patch_kv_cache_coordinator.get_kv_cache_coordinator
     ):
-        manager = KVCacheManager(generate_scheduler_kv_cache_config([cfg]), 4096, 128, 128, enable_caching=False)
+        manager = KVCacheManager(
+            generate_scheduler_kv_cache_config([cfg]), max_model_len, 128, 128, enable_caching=False
+        )
     pool = manager.coordinator.block_pool
     assert all(m.block_pool is pool for m in manager.coordinator.single_type_managers)
     return manager
@@ -113,6 +117,18 @@ def manager_for(cfg):
 
 def cache_parts(value):
     return value if isinstance(value, tuple) else (value,)
+
+
+def physical_ids(config, offset, size):
+    # Independent oracle for byte ownership across plane boundaries.
+    strides = (131072, 131072, 107136) if isinstance(config.kv_cache_groups[0], PackedHistoryGroup) else (BANK_BYTES,)
+    for stride in strides:
+        extent = config.num_blocks * stride
+        if offset < extent:
+            assert 0 <= offset < offset + size <= extent
+            return set(range(offset // stride, (offset + size - 1) // stride + 1))
+        offset -= extent
+    raise AssertionError("Address outside the KV slab")
 
 
 def stock_read_batch(producers, consumer, jobs):
@@ -183,9 +199,7 @@ def stock_read_batch(producers, consumer, jobs):
                     base = min(min(a) for a in meta.kv_caches_base_addr)
                     assert base <= address < address + size <= base + worker.kv_cache_config.kv_cache_tensors[0].size
                     if logical:
-                        tile_ranges.append(
-                            set(range((address - base) // BANK_BYTES, (address - base + size - 1) // BANK_BYTES + 1))
-                        )
+                        tile_ranges.append(physical_ids(worker.kv_cache_config, address - base, size))
                 if logical:
                     source_tiles, destination_tiles = tile_ranges
                     assert 0 not in source_tiles and 0 not in destination_tiles
@@ -205,19 +219,20 @@ def fixture_probabilities(windows, query, head):
     return torch.softmax(hidden @ head, dim=-1)
 
 
-@pytest.mark.parametrize("logical", [False, True], ids=["compact", "logical"])
+@pytest.mark.parametrize("layout,first_state,num_groups", [("compact", 1, 16), ("logical", 3, 46), ("packed", 1, 23)])
 @pytest.mark.parametrize("n", [128, 129, 257])
-def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n, logical):
+def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n, layout, first_state, num_groups):
+    logical = layout != "compact"
     config, specs = flash
     config.additional_config[RING_CONFIG_KEY] = True
     if logical:
         config.additional_config = {LOGICAL_CONFIG_KEY: True, SWA_SLOTS_KEY: 3, C2_SLOTS_KEY: 3}
+        config.additional_config[PACKED_HISTORY_KEY] = layout == "packed"
         config.model_config.max_model_len = 512
     p_cfg, p = compact_tests.worker_views(config, specs, 154 if logical else 73)
     if logical:
         config.additional_config[SWA_SLOTS_KEY] = 2
     d_cfg, d = compact_tests.worker_views(config, dict(reversed(specs.items())), 108 if logical else 71)
-    first_state = 3 if logical else 1
     pm, dm = manager_for(p_cfg), manager_for(d_cfg)
     p_req = Request("producer", [0] * (n - 1), SamplingParams(max_tokens=1), pooling_params=None)
     d_req = Request("consumer", [0] * n, SamplingParams(max_tokens=1), pooling_params=None)
@@ -232,7 +247,7 @@ def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n, logical):
     assert before[first_state:] == pids[first_state:]
     assert dm.allocate_slots(d_req, 0, num_external_computed_tokens=n - 1, delay_cache_blocks=True) is not None
     dids = dm.get_blocks(d_req.request_id).get_block_ids()
-    assert len(pids) == len(dids) == (46 if logical else 16)
+    assert len(pids) == len(dids) == num_groups
     assert all(len(ids) == 1 for ids in (*pids[first_state:], *dids[first_state:]))
     assert all(a != b for a, b in zip(pids[first_state:], dids[first_state:]))
     pro, con = compact_tests.register(config, p_cfg, p), compact_tests.register(config, d_cfg, d)
@@ -252,13 +267,18 @@ def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n, logical):
             for j, block in enumerate(pids[group]):
                 plane[block].fill_(3 * j + component + pro.transfer_metadata.layer_names.index(name) + 1)
     if logical:
-        # State tensors are dense, starting at byte zero of each physical tile.
-        slab = d[names[0]].view(torch.uint8).reshape(d_cfg.num_blocks, BANK_BYTES)
+        base = min((part for value in d.values() for part in cache_parts(value)), key=lambda t: t.data_ptr())
+        slab = base[0].view(torch.uint8).as_strided((d_cfg.kv_cache_tensors[0].size,), (1,))
         slab.fill_(0x5A)
-        target_ids = [i for group in dids for i in group]
-        assert len(target_ids) == len(set(target_ids))
-        outside = torch.ones(d_cfg.num_blocks, dtype=torch.bool)
-        outside[target_ids] = False
+        outside = torch.ones_like(slab, dtype=torch.bool)
+        for name, value in d.items():
+            for part in cache_parts(value):
+                for bid in dids[con.layer_name_to_group_index[name]]:
+                    block = part[bid]
+                    start = block.data_ptr() - slab.data_ptr()
+                    end = start + block.numel() * block.element_size()
+                    assert block.is_contiguous() and outside[start:end].all()
+                    outside[start:end] = False
     count = stock_read_batch([pro] * 4, con, {"target": (pids, dids, n)})
     if logical:
         assert torch.all(slab[outside] == 0x5A)

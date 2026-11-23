@@ -65,9 +65,7 @@ class LogicalQuotaMixin:
 class LogicalHistoryManager(LogicalQuotaMixin, FullAttentionManager):
     @property
     def logical_limit(self):
-        from vllm_ascend.models.deepseek_v41.compact_cache import BANKS
-
-        return (self.block_pool.num_gpu_blocks - 1 - self.kv_cache_spec.reserved_state_tiles) // BANKS
+        return self.kv_cache_spec.history_capacity(self.block_pool.num_gpu_blocks)
 
 
 class LogicalRingManager(LogicalQuotaMixin, AscendCircularBufferManager):

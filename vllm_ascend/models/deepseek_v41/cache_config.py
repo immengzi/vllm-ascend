@@ -28,10 +28,10 @@ from vllm_ascend.device.hardware_profile import (
 )
 from vllm_ascend.models.deepseek_v41.compact_cache import (
     BANK_BYTES,
-    BANKS,
     BLOCK_BYTES,
     CompactPageGroup,
     LogicalPoolGroup,
+    PackedHistoryGroup,
     compact_cache_config,
 )
 
@@ -267,6 +267,8 @@ def _specs_from_groups(groups):
 
 
 def get_deepseek_v41_pool_bytes_per_block(groups):
+    if groups and isinstance(groups[0], PackedHistoryGroup):
+        return sum(s.unpadded_page_size_bytes for s in groups[0].kv_cache_spec.kv_cache_specs.values())
     if groups and isinstance(groups[0], CompactPageGroup):
         return BANK_BYTES if isinstance(groups[0], LogicalPoolGroup) else BLOCK_BYTES
     page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
@@ -282,8 +284,7 @@ def get_deepseek_v41_kv_cache_config(
     if groups and isinstance(groups[0], CompactPageGroup):
         count = may_override_num_blocks(vllm_config, available_memory // get_deepseek_v41_pool_bytes_per_block(groups))
         if isinstance(groups[0], LogicalPoolGroup):
-            reserved = groups[0].kv_cache_spec.first_spec.reserved_state_tiles
-            history_blocks = (count - 1 - reserved) // BANKS
+            history_blocks = groups[0].kv_cache_spec.first_spec.history_capacity(count)
             if history_blocks * 128 < vllm_config.model_config.max_model_len:
                 raise ValueError(f"Logical state reservations leave {history_blocks} history blocks for max_model_len")
         return compact_cache_config(groups, count, vllm_config.cache_config.prefix_cache_retention_interval)

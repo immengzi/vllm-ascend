@@ -651,6 +651,7 @@ class AscendConfig:
     enable_deepseek_v41_compact_kv_pages: StrictBool = False
     enable_deepseek_v41_fixed_swa_ring: StrictBool = False
     enable_deepseek_v41_logical_state_pools: StrictBool = False
+    enable_deepseek_v41_packed_history: StrictBool = False
     deepseek_v41_swa_slots: StrictInt | None = None
     deepseek_v41_compressor_slots: StrictInt | None = None
     shared_engram: SharedEngramConfig | None = None

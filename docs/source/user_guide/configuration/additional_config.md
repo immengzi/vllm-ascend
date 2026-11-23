@@ -395,3 +395,11 @@ additional capacity waits if any required group is full. Startup allocates the e
 The chronological staging workspace and the transfer allocation's alignment allowance are separate.
 CPU tests cover address calculation, request admission and registered bytes. Hardware memory usage,
 model probabilities and serving performance require device validation.
+
+
+### Packed history in the logical state pools
+
+With `enable_deepseek_v41_logical_state_pools` enabled, set `enable_deepseek_v41_packed_history` to
+`true` on both endpoints to try the three-plane placement. The option defaults to `false`.
+Each history block uses 360.625 KiB per worker. Each SWA slot occupies 20 native IDs and each
+compressor slot occupies two. See the [design and validation scope](../../developer_guide/Design_Documents/dsv41_packed_history_zh.md).
