@@ -45,6 +45,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reset_sparse_kv_offload_request_owners,
     update_sparse_kv_offload_metadata,
 )
+from vllm_ascend.models.deepseek_v41.uniform_cache import uses_fixed_swa_ring
 from vllm_ascend.utils import should_skip_allreduce_across_dp_group
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, ring_state_update_skipped
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
@@ -565,6 +566,8 @@ class AscendModelState(DefaultModelState):
             for_cudagraph_capture=for_capture,
             # Same wiring as model_runner_v1
             full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
+            skip_ring_state_update=ring_state_update_skipped()
+            or (uses_fixed_swa_ring(kv_cache_config) and input_batch.is_dummy and not for_capture),
             model_specific_attn_metadata=model_specific_attn_metadata,
             req_ids_tensor=offload_req_ids.gpu[:num_reqs] if offload_req_ids is not None else None,
             token_to_req=offload_token_to_req.gpu[:num_input_tokens] if offload_token_to_req is not None else None,

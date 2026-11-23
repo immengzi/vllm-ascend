@@ -1,0 +1,4 @@
+pr: 19
+entries:
+  - category: feature
+    text: DeepSeek V4.1 Flash can reserve sliding-window and compressor slots in one native KV block pool using an opt-in 128 KiB layout on MRV2.

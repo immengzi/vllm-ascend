@@ -26,6 +26,12 @@ from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
+from vllm_ascend.models.deepseek_v41.uniform_cache import (
+    HISTORY_GROUP_COUNT,
+    TILE_BYTES,
+    LogicalPoolGroup,
+    uniform_cache_config,
+)
 
 STATE_RING_ROWS = 32
 
@@ -259,6 +265,8 @@ def _specs_from_groups(groups):
 
 
 def get_deepseek_v41_pool_bytes_per_block(groups):
+    if groups and isinstance(groups[0], LogicalPoolGroup):
+        return TILE_BYTES
     page_sizes, _ = get_layer_tuples(_specs_from_groups(groups))
     return sum(page_sizes)
 
@@ -269,6 +277,13 @@ def get_deepseek_v41_kv_cache_config(
     available_memory: int,
 ) -> KVCacheConfig:
     """Allocate independent layer slots backed by one global block-ID pool."""
+    if groups and isinstance(groups[0], LogicalPoolGroup):
+        count = may_override_num_blocks(vllm_config, available_memory // get_deepseek_v41_pool_bytes_per_block(groups))
+        reserved = groups[0].kv_cache_spec.first_spec.reserved_state_tiles
+        history_blocks = (count - 1 - reserved) // HISTORY_GROUP_COUNT
+        if history_blocks * 128 < vllm_config.model_config.max_model_len:
+            raise ValueError(f"Logical state reservations leave {history_blocks} history blocks for max_model_len")
+        return uniform_cache_config(groups, count, vllm_config.cache_config.prefix_cache_retention_interval)
     page_sizes, layer_tuples = get_layer_tuples(_specs_from_groups(groups))
     capacity = max(available_memory // sum(page_sizes), 0)
     num_blocks = may_override_num_blocks(vllm_config, capacity)

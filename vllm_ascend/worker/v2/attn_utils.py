@@ -97,6 +97,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
+from vllm_ascend.models.deepseek_v41.uniform_cache import allocate_uniform_views, uses_fixed_swa_ring
 from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
 from vllm_ascend.models.qwen4_exp.cache_config import (
     GDN,
@@ -544,6 +545,7 @@ def build_attn_metadata(
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
+    fixed_swa_ring = uses_fixed_swa_ring(kv_cache_config)
     batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
     formatted_slot_mappings = None
     if batch_tq_slots:
@@ -683,6 +685,7 @@ def build_attn_metadata(
                 attn_metadata_extra_kwargs.update(
                     num_actual_reqs=num_actual_reqs,
                     skip_ring_state_update=skip_ring_state_update,
+                    fixed_swa_ring=fixed_swa_ring,
                     common_v41_metadata=common_v41_metadata,
                     common_v41_batch_metadata=common_v41_batch_metadata,
                     v41_prefill_override=v41_prefill_override,
@@ -1192,6 +1195,11 @@ def _allocate_kv_cache(
     # prefill disaggregation need the addr of cache tensor be aligned with 2M
     alignment = 2 * 1024 * 1024
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
+    if uses_fixed_swa_ring(kv_cache_config):
+        return allocate_uniform_views(
+            kv_cache_config, lambda size: _allocate_int8_cache_tensor(size, alignment, device)
+        )
+
     attn_layers: dict[str, AttentionLayerBase] | None = None
     # Gemma 4 full/sliding groups share one pool while retaining contiguous
     # K/V views. The worker keeps the full budget only for this V2 path.
@@ -1713,6 +1721,7 @@ def _reshape_kv_cache_v2(
         kv_cache_config.kv_cache_groups,
         kv_cache_config.num_blocks,
     )
+    uniform_layout = uses_fixed_swa_ring(kv_cache_config)
     layer_tuple_strides: dict[str, int] = {}
     if is_deepseek_v41_cache(layer_kv_cache_spec):
         layer_tuple_strides = {
@@ -1879,9 +1888,9 @@ def _reshape_kv_cache_v2(
                 kv_cache_dtype_list = [kv_cache_spec.dtype]
                 is_index = isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.scale_dim
                 if is_index:
-                    source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
-                    source_spec = layer_kv_cache_spec[source_name]
-                    initial_offset = source_spec.unpadded_page_size_bytes
+                    if not uniform_layout:
+                        source_name = layer_name.removesuffix(".indexer.k_cache") + ".long_kv_cache"
+                        initial_offset = layer_kv_cache_spec[source_name].unpadded_page_size_bytes
                     kv_cache_shape_list.append(
                         group.backend.get_kv_cache_shape(
                             kv_cache_config.num_blocks,
