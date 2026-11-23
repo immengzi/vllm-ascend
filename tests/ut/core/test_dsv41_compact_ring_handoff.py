@@ -101,14 +101,19 @@ def cpu_ring_kernels(monkeypatch):
         monkeypatch.setattr(state_kernels, name, CpuLaunch(getattr(state_kernels, name)))
 
 
-def manager_for(cfg, max_model_len=4096):
+def manager_for(cfg, max_model_len=4096, *, max_in_flight_tokens=None):
     from vllm_ascend.patch.platform import patch_kv_cache_coordinator
 
     with patch(
         "vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator", patch_kv_cache_coordinator.get_kv_cache_coordinator
     ):
         manager = KVCacheManager(
-            generate_scheduler_kv_cache_config([cfg]), max_model_len, 128, 128, enable_caching=False
+            generate_scheduler_kv_cache_config([cfg]),
+            max_model_len,
+            128,
+            128,
+            enable_caching=False,
+            max_in_flight_tokens=max_in_flight_tokens,
         )
     pool = manager.coordinator.block_pool
     assert all(m.block_pool is pool for m in manager.coordinator.single_type_managers)
@@ -131,7 +136,7 @@ def physical_ids(config, offset, size):
     raise AssertionError("Address outside the KV slab")
 
 
-def stock_read_batch(producers, consumer, jobs):
+def stock_read_batch(producers, consumer, jobs, *, local_unhashed_ids=None):
     local = consumer.transfer_metadata
     metadata = {rank: worker.transfer_metadata for rank, worker in enumerate(producers)}
     server = MooncakeMetadataThread("127.0.0.1", 1, "cpu", metadata, 4, 1, 1, 1, False, threading.Event())
@@ -170,7 +175,7 @@ def stock_read_batch(producers, consumer, jobs):
             if is_circular_kv_cache_spec(group.kv_cache_spec)
         )
         requests[key] = SimpleNamespace(
-            local_block_ids=dids,
+            local_block_ids=dids if local_unhashed_ids is None else local_unhashed_ids[key],
             local_full_block_ids=dids,
             remote_block_ids=advertised,
             local_num_prompt_tokens=n,
@@ -196,8 +201,9 @@ def stock_read_batch(producers, consumer, jobs):
                 # pages require both endpoints to belong to the same request.
                 tile_ranges = []
                 for meta, address, worker in ((remote, src, producers[tp]), (local, dst, consumer)):
-                    base = min(min(a) for a in meta.kv_caches_base_addr)
-                    assert base <= address < address + size <= base + worker.kv_cache_config.kv_cache_tensors[0].size
+                    regions = worker.probe_regions
+                    assert any(base <= address < address + size <= base + count for base, count in regions)
+                    base = min(ptr for ptr, _ in regions)
                     if logical:
                         tile_ranges.append(physical_ids(worker.kv_cache_config, address - base, size))
                 if logical:

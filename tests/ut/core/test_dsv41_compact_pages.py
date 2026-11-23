@@ -178,7 +178,7 @@ def worker_views(c, specs, count):
     return cfg, views
 
 
-def register(c, cfg, views, tp_size=2, tp_rank=0):
+def register(c, cfg, views, tp_size=2, tp_rank=0, *, multiple_regions=False):
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import MooncakeBaseConnectorWorker
 
     worker = object.__new__(MooncakeBaseConnectorWorker)
@@ -189,8 +189,12 @@ def register(c, cfg, views, tp_size=2, tp_rank=0):
     with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker.global_te") as engine:
         worker.register_kv_caches(views)
     pointers, sizes = engine.register_buffer.call_args.args
-    assert len(pointers) == 1 and pointers[0] % (2 * 1024**2) == 0
-    assert sizes == [cfg.kv_cache_tensors[0].size]
+    assert all(ptr % (2 * 1024**2) == 0 for ptr in pointers)
+    if multiple_regions:
+        assert sorted(sizes) == sorted(t.size for t in cfg.kv_cache_tensors)
+    else:
+        assert sizes == [cfg.kv_cache_tensors[0].size]
+    worker.probe_regions = list(zip(pointers, sizes, strict=True))
     return worker
 
 
