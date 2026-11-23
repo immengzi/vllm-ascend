@@ -1,0 +1,4 @@
+pr: 17
+entries:
+  - category: feature
+    text: Added optional packed history placement for the experimental DeepSeek V4.1 Flash logical KV pools.
