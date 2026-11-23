@@ -48,7 +48,6 @@ def flash():
         cache_config=SimpleNamespace(
             enable_prefix_caching=False,
             swa_bounded_replay=False,
-            enable_extensible_kv_cache=False,
             num_gpu_blocks_override=None,
             prefix_cache_retention_interval=None,
         ),

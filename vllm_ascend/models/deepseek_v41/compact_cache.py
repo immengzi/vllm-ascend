@@ -197,7 +197,9 @@ def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
     ring = ring or logical
     if not (enabled or logical):
         return None
-    if (config.additional_config or {}).get("enable_kvpp") or config.cache_config.enable_extensible_kv_cache:
+    if (config.additional_config or {}).get("enable_kvpp") or getattr(
+        config.cache_config, "enable_extensible_kv_cache", False
+    ):
         raise ValueError("Compact KV pages require static placement with KVPP disabled")
     parallel = config.parallel_config
     if ring and getattr(parallel, "use_ubatching", False):
