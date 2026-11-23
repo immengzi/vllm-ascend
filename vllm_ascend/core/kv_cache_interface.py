@@ -554,10 +554,24 @@ class AscendCircularBufferSpec(CircularBufferSpec):
 
 
 def register_ascend_kv_cache_specs() -> None:
-    from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
-    from vllm_ascend.models.deepseek_v41.compact_cache import SinglePoolWindowSpec
+    from vllm_ascend.core.single_type_kv_cache_manager import (
+        AscendCircularBufferManager,
+        LogicalHistoryManager,
+        LogicalRingManager,
+    )
+    from vllm_ascend.models.deepseek_v41.compact_cache import (
+        LogicalCompressorSpec,
+        LogicalHistorySpec,
+        LogicalWindowSpec,
+        SinglePoolWindowSpec,
+    )
     from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
 
+    KVCacheSpecRegistry.register(LogicalHistorySpec, LogicalHistoryManager, uniform_type_base_spec=FullAttentionSpec)
+    KVCacheSpecRegistry.register(LogicalWindowSpec, LogicalRingManager, uniform_type_base_spec=LogicalWindowSpec)
+    KVCacheSpecRegistry.register(
+        LogicalCompressorSpec, LogicalRingManager, uniform_type_base_spec=LogicalCompressorSpec
+    )
     KVCacheSpecRegistry.register(
         SinglePoolWindowSpec, AscendCircularBufferManager, uniform_type_base_spec=SinglePoolWindowSpec
     )

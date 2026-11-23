@@ -3,10 +3,12 @@
 """CPU contract for compact fixed rings, native block ownership and stock Pull."""
 
 import ctypes
+import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
@@ -16,10 +18,23 @@ from vllm.v1.request import Request
 
 from tests.ut.core import test_dsv41_compact_pages as compact_tests
 from vllm_ascend.attention.dsa_v41 import AscendDSAV41Impl
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import MooncakeBaseConnectorScheduler
+from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
+    MooncakeBaseConnectorScheduler,
+    MooncakeMetadataThread,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import MooncakeTransferMetadataGroups
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_worker import MooncakePullRecvingThread
 from vllm_ascend.models.deepseek_v41 import request_state, state_kernels
-from vllm_ascend.models.deepseek_v41.compact_cache import RING_CONFIG_KEY, get_window_staging_rows
+from vllm_ascend.models.deepseek_v41.compact_cache import (
+    BANK_BYTES,
+    C2_SLOTS_KEY,
+    LOGICAL_CONFIG_KEY,
+    RING_CONFIG_KEY,
+    SWA_SLOTS_KEY,
+    LogicalPoolGroup,
+    get_window_staging_rows,
+)
 from vllm_ascend.models.deepseek_v41.window_state import RequestWindowMetadataBuilder, bind_window_staging_workspace
 
 flash = compact_tests.flash
@@ -100,10 +115,15 @@ def cache_parts(value):
     return value if isinstance(value, tuple) else (value,)
 
 
-def stock_read(producer, consumer, pids, dids, n):
-    remote, local = producer.transfer_metadata, consumer.transfer_metadata
+def stock_read_batch(producers, consumer, jobs):
+    local = consumer.transfer_metadata
+    metadata = {rank: worker.transfer_metadata for rank, worker in enumerate(producers)}
+    server = MooncakeMetadataThread("127.0.0.1", 1, "cpu", metadata, 4, 1, 1, 1, False, threading.Event())
+    handshake = msgspec.msgpack.decode(server.encoded_metadata, type=MooncakeTransferMetadataGroups)
     thread = object.__new__(MooncakePullRecvingThread)
-    thread.tp_size, thread.tp_rank, thread.pcp_size, thread.pcp_rank, thread.dcp_size = 2, 1, 1, 0, 1
+    thread._validate_remote_metadata(handshake, "cpu")
+    peer = handshake.metadata_by_pp_rank[0]
+    thread.tp_size, thread.tp_rank, thread.pcp_size, thread.pcp_rank, thread.dcp_size = 2, consumer.tp_rank, 1, 0, 1
     thread.kv_cache_specs = consumer.kv_cache_specs
     thread.spec_indices = [consumer.layer_name_to_spec_index[name] for name in local.layer_names]
     for field in (
@@ -117,60 +137,64 @@ def stock_read(producer, consumer, pids, dids, n):
         "kv_caches_base_addr",
     ):
         setattr(thread, field, getattr(local, field))
-    peer = SimpleNamespace(
-        **{
-            key: getattr(remote, key)
-            for key in (
-                "group_indices",
-                "block_shapes",
-                "block_lens",
-                "block_strides",
-                "dcp_sharded",
-                "layer_block_sizes",
-                "block_size_scales",
-                "indexer_replication_sizes",
-                "cp_kv_cache_interleave_size",
-            )
-        },
-        metadata_by_pcp_rank=[SimpleNamespace(metadata_by_tp_rank=[remote] * 4)],
-    )
-    pg = producer.kv_cache_config.kv_cache_groups
+    pg = producers[0].kv_cache_config.kv_cache_groups
     adv = SimpleNamespace(
         group_unique_specs=[list(g.kv_cache_spec.kv_cache_specs.values()) for g in pg],
         group_block_size=[g.kv_cache_spec.block_size for g in pg],
         dcp_size=1,
     )
-    advertised = MooncakeBaseConnectorScheduler._get_transfer_block_ids(adv, pids, n - 1)
-    assert all(len(ids) == 1 for ids in advertised[1:])
-    req = SimpleNamespace(
-        local_block_ids=dids,
-        local_full_block_ids=dids,
-        remote_block_ids=advertised,
-        local_num_prompt_tokens=n,
-        remote_num_prompt_tokens=n - 1,
-        num_computed_tokens=0,
-    )
-    pairs = [(i, remote.layer_names.index(name)) for i, name in enumerate(local.layer_names)]
-    ranks = {
-        (local_idx, remote_idx): thread._get_layer_remote_tp_rank_groups(
-            local_idx, remote_idx, thread.kv_cache_specs[thread.spec_indices[local_idx]], peer, 1, 4, 1
+    requests = {}
+    ownership = []
+    for key, (pids, dids, n) in jobs.items():
+        ownership.append(({i for group in pids for i in group}, {i for group in dids for i in group}))
+        advertised = MooncakeBaseConnectorScheduler._get_transfer_block_ids(adv, pids, n - 1)
+        assert all(
+            len(ids) == 1
+            for ids, group in zip(advertised, pg, strict=True)
+            if is_circular_kv_cache_spec(group.kv_cache_spec)
         )
-        for local_idx, remote_idx in pairs
-    }
-    buckets, _ = thread._build_transfer_block_buckets(peer, pairs, ranks, 1, 1, {"target": req}, {})
-    local_addr, remote_addr, lengths = [], [], []
+        requests[key] = SimpleNamespace(
+            local_block_ids=dids,
+            local_full_block_ids=dids,
+            remote_block_ids=advertised,
+            local_num_prompt_tokens=n,
+            remote_num_prompt_tokens=n - 1,
+            num_computed_tokens=0,
+        )
+    ranks, pairs = thread._build_remote_transfer_layout(handshake)
+    buckets, _ = thread._build_transfer_block_buckets(peer, pairs[0], ranks[0], 1, 1, requests, {})
+    logical = isinstance(pg[0], LogicalPoolGroup)
+    if logical:
+        for meta in (*metadata.values(), local):
+            assert all(scale == 1 for scales in meta.block_size_scales for scale in scales)
+    total = 0
     for (pcp, tp), by_spec in buckets.items():
+        remote = metadata[tp]
         for spec, layers in by_spec.items():
+            local_addr, remote_addr, lengths = [], [], []
             thread._append_spec_transfer_addresses(
                 spec, pcp, tp, 1, 4, 1, layers, peer, local_addr, remote_addr, lengths
             )
-    for dst, src, size in zip(local_addr, remote_addr, lengths, strict=True):
-        for worker, address in ((producer, src), (consumer, dst)):
-            view = cache_parts(next(iter(worker.kv_caches.values())))[0]
-            storage = view.untyped_storage()
-            assert storage.data_ptr() <= address < address + size <= storage.data_ptr() + storage.nbytes()
-        ctypes.memmove(dst, src, size)
-    return sum(lengths)
+            for dst, src, size in zip(local_addr, remote_addr, lengths, strict=True):
+                # Bound the CPU copy by both real registrations. For one-tile
+                # pages require both endpoints to belong to the same request.
+                tile_ranges = []
+                for meta, address, worker in ((remote, src, producers[tp]), (local, dst, consumer)):
+                    base = min(min(a) for a in meta.kv_caches_base_addr)
+                    assert base <= address < address + size <= base + worker.kv_cache_config.kv_cache_tensors[0].size
+                    if logical:
+                        tile_ranges.append(
+                            set(range((address - base) // BANK_BYTES, (address - base + size - 1) // BANK_BYTES + 1))
+                        )
+                if logical:
+                    source_tiles, destination_tiles = tile_ranges
+                    assert 0 not in source_tiles and 0 not in destination_tiles
+                    assert any(
+                        source_tiles <= src_ids and destination_tiles <= dst_ids for src_ids, dst_ids in ownership
+                    )
+                ctypes.memmove(dst, src, size)
+            total += sum(lengths)
+    return total
 
 
 def fixture_probabilities(windows, query, head):
@@ -181,12 +205,19 @@ def fixture_probabilities(windows, query, head):
     return torch.softmax(hidden @ head, dim=-1)
 
 
+@pytest.mark.parametrize("logical", [False, True], ids=["compact", "logical"])
 @pytest.mark.parametrize("n", [128, 129, 257])
-def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n):
+def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n, logical):
     config, specs = flash
     config.additional_config[RING_CONFIG_KEY] = True
-    p_cfg, p = compact_tests.worker_views(config, specs, 73)
-    d_cfg, d = compact_tests.worker_views(config, specs, 71)
+    if logical:
+        config.additional_config = {LOGICAL_CONFIG_KEY: True, SWA_SLOTS_KEY: 3, C2_SLOTS_KEY: 3}
+        config.model_config.max_model_len = 512
+    p_cfg, p = compact_tests.worker_views(config, specs, 154 if logical else 73)
+    if logical:
+        config.additional_config[SWA_SLOTS_KEY] = 2
+    d_cfg, d = compact_tests.worker_views(config, dict(reversed(specs.items())), 108 if logical else 71)
+    first_state = 3 if logical else 1
     pm, dm = manager_for(p_cfg), manager_for(d_cfg)
     p_req = Request("producer", [0] * (n - 1), SamplingParams(max_tokens=1), pooling_params=None)
     d_req = Request("consumer", [0] * n, SamplingParams(max_tokens=1), pooling_params=None)
@@ -198,11 +229,12 @@ def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n):
     p_req.num_computed_tokens = 65
     assert pm.allocate_slots(p_req, n - 1 - 65) is not None
     pids = pm.get_blocks(p_req.request_id).get_block_ids()
-    assert before[1:] == pids[1:]
+    assert before[first_state:] == pids[first_state:]
     assert dm.allocate_slots(d_req, 0, num_external_computed_tokens=n - 1, delay_cache_blocks=True) is not None
     dids = dm.get_blocks(d_req.request_id).get_block_ids()
-    assert len(pids) == len(dids) == 16 and all(len(ids) == 1 for ids in (*pids[1:], *dids[1:]))
-    assert all(a != b for a, b in zip(pids[1:], dids[1:]))
+    assert len(pids) == len(dids) == (46 if logical else 16)
+    assert all(len(ids) == 1 for ids in (*pids[first_state:], *dids[first_state:]))
+    assert all(a != b for a, b in zip(pids[first_state:], dids[first_state:]))
     pro, con = compact_tests.register(config, p_cfg, p), compact_tests.register(config, d_cfg, d)
     names = [name for name in specs if name.endswith(".swa_cache")]
     gen = torch.Generator().manual_seed(621)
@@ -219,7 +251,17 @@ def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n):
         for component, plane in enumerate(cache_parts(p[name])):
             for j, block in enumerate(pids[group]):
                 plane[block].fill_(3 * j + component + pro.transfer_metadata.layer_names.index(name) + 1)
-    count = stock_read(pro, con, pids, dids, n)
+    if logical:
+        # State tensors are dense, starting at byte zero of each physical tile.
+        slab = d[names[0]].view(torch.uint8).reshape(d_cfg.num_blocks, BANK_BYTES)
+        slab.fill_(0x5A)
+        target_ids = [i for group in dids for i in group]
+        assert len(target_ids) == len(set(target_ids))
+        outside = torch.ones(d_cfg.num_blocks, dtype=torch.bool)
+        outside[target_ids] = False
+    count = stock_read_batch([pro] * 4, con, {"target": (pids, dids, n)})
+    if logical:
+        assert torch.all(slab[outside] == 0x5A)
     assert count == len(pids[0]) * 369280 + 43 * 128 * 1024
     for name in specs:
         group = pro.layer_name_to_group_index[name]
@@ -228,7 +270,7 @@ def test_compact_ring_pd_boundary(flash, cpu_ring_kernels, n):
                 assert torch.equal(src[source_id], dst[destination_id])
     d_req.num_computed_tokens = n - 1
     assert dm.allocate_slots(d_req, 1) is not None
-    assert dm.get_blocks(d_req.request_id).get_block_ids()[1:] == dids[1:]
+    assert dm.get_blocks(d_req.request_id).get_block_ids()[first_state:] == dids[first_state:]
     layers = [
         SimpleNamespace(self_attn=SimpleNamespace(dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace())))
         for _ in names

@@ -80,7 +80,7 @@ from .cache_config import (
     make_mla_cache_spec,
     make_swa_cache_spec,
 )
-from .compact_cache import RING_CONFIG_KEY
+from .compact_cache import LOGICAL_CONFIG_KEY, RING_CONFIG_KEY
 from .compressor import DeepseekV41Compressor
 from .decoder_replay_layers import make_decoder_replay
 from .engram import (
@@ -988,7 +988,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
-        if (vllm_config.additional_config or {}).get(RING_CONFIG_KEY) is True:
+        if any((vllm_config.additional_config or {}).get(k) is True for k in (RING_CONFIG_KEY, LOGICAL_CONFIG_KEY)):
             bind_window_staging_workspace(
                 self.layers[self.start_layer : self.end_layer], vllm_config.scheduler_config, torch.device(self.device)
             )

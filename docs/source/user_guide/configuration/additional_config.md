@@ -375,3 +375,23 @@ convolution allocates its output separately.
 Small prefix match units can increase checkpoint traffic.
 
 Validate correctness, quality and performance on the deployment hardware before deploying in production.
+
+### Experimental logical history, SWA and compressor pools
+
+Set `enable_deepseek_v41_logical_state_pools` to `true` on both endpoints. This option defaults to
+`false` and enables the fixed ring for this layout. The Flash MRV2 and sequential-forward restrictions
+above apply. Each worker has one native BlockPool and one registered slab with a 128 KiB stride.
+Pull uses the native page IDs from each layer's cache group. P and D can use different slot counts.
+
+| Capacity setting | Unit per worker | Default |
+| --- | --- | --- |
+| `deepseek_v41_swa_slots` | One request's 40 window pages, 5 MiB | `max_num_seqs` |
+| `deepseek_v41_compressor_slots` | One request's three compressor pages, 384 KiB | `max_num_seqs` |
+
+Both slot counts must be positive integers. Startup reserves both capacities and a single native null
+page. Each additional history block covers 128 input positions across the history and index layers
+and consumes three native pages. Up to two pages can remain after rounding. A request needing
+additional capacity waits if any required group is full. Startup allocates the entire shared slab.
+The chronological staging workspace and the transfer allocation's alignment allowance are separate.
+CPU tests cover address calculation, request admission and registered bytes. Hardware memory usage,
+model probabilities and serving performance require device validation.

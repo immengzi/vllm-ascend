@@ -178,19 +178,19 @@ def worker_views(c, specs, count):
     return cfg, views
 
 
-def register(c, cfg, views):
+def register(c, cfg, views, tp_size=2, tp_rank=0):
     from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import MooncakeBaseConnectorWorker
 
     worker = object.__new__(MooncakeBaseConnectorWorker)
     worker.vllm_config, worker.kv_cache_config = c, cfg
     worker.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
-    worker.block_size, worker.tp_size, worker.tp_rank, worker.pcp_rank = 128, 2, 0, 0
+    worker.block_size, worker.tp_size, worker.tp_rank, worker.pcp_rank = 128, tp_size, tp_rank, 0
     worker.engine_id, worker.te_rpc_port, worker.side_channel_host, worker.handshake_port = "cpu", 1, "127.0.0.1", 2
     with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker.global_te") as engine:
         worker.register_kv_caches(views)
     pointers, sizes = engine.register_buffer.call_args.args
     assert len(pointers) == 1 and pointers[0] % (2 * 1024**2) == 0
-    assert sizes == [cfg.num_blocks * 393216]
+    assert sizes == [cfg.kv_cache_tensors[0].size]
     return worker
 
 

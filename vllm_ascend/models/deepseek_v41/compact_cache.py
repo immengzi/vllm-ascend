@@ -68,8 +68,81 @@ def get_window_staging_rows(max_tokens: int, max_requests: int) -> int:
     return cdiv(max_tokens + max_requests * 2 * WINDOW, WINDOW) * WINDOW
 
 
+@dataclass(frozen=True, kw_only=True)
+class LogicalHistorySpec(AscendMLAAttentionSpec):
+    reserved_state_tiles: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class LogicalWindowSpec(SinglePoolWindowSpec):
+    slot_limit: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class LogicalCompressorSpec(CircularBufferSpec):
+    slot_limit: int
+
+
 class CompactPageGroup(KVCacheGroupSpec):
     """Native cache group whose block IDs use the compact DSV4.1 placement."""
+
+
+class ReservedRingSpecs(UniformTypeKVCacheSpecs):
+    """Reserve all configured ring slots during Core's max-model-length fit."""
+
+    def max_memory_usage_pages(self, vllm_config):
+        return self.first_spec.slot_limit
+
+
+class LogicalPoolGroup(CompactPageGroup):
+    """One native ID addresses one tile in the shared slab."""
+
+
+LOGICAL_CONFIG_KEY = "enable_deepseek_v41_logical_state_pools"
+SWA_SLOTS_KEY = "deepseek_v41_swa_slots"
+C2_SLOTS_KEY = "deepseek_v41_compressor_slots"
+
+
+def _slot_limit(config, key):
+    value = config.additional_config.get(key)
+    if value is None:
+        value = config.scheduler_config.max_num_seqs
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
+def _as_spec(cls, spec, **quota):
+    return cls(**{f.name: getattr(spec, f.name) for f in fields(spec) if f.init}, **quota)
+
+
+def _logical_groups(config, specs, history, windows, states):
+    swa_slots = _slot_limit(config, SWA_SLOTS_KEY)
+    compressor_slots = _slot_limit(config, C2_SLOTS_KEY)
+    reserved = len(windows) * swa_slots + len(states) * compressor_slots
+    bins = []
+    sizes = []
+    for name in sorted(history, key=lambda n: (-specs[n].unpadded_page_size_bytes, n)):
+        size = specs[name].unpadded_page_size_bytes
+        bank = next((i for i, used in enumerate(sizes) if used + size <= BANK_BYTES), len(bins))
+        if bank == len(bins):
+            bins.append({})
+            sizes.append(0)
+        bins[bank][name] = _as_spec(LogicalHistorySpec, specs[name], reserved_state_tiles=reserved)
+        sizes[bank] += size
+    if len(bins) != BANKS or max(sizes) > BANK_BYTES:
+        raise ValueError("Flash history must fit in three native tiles per token block")
+    history_groups = len(bins)
+    bins.extend({n: _as_spec(LogicalCompressorSpec, specs[n], slot_limit=compressor_slots)} for n in states)
+    bins.extend({n: _as_spec(LogicalWindowSpec, specs[n], slot_limit=swa_slots)} for n in windows)
+    groups = []
+    for i, layers in enumerate(bins):
+        wrapper = UniformTypeKVCacheSpecs if i < history_groups else ReservedRingSpecs
+        uniform = wrapper.from_specs(layers)
+        if uniform is None:
+            raise ValueError(f"Incompatible logical pool layers {list(layers)}")
+        groups.append(LogicalPoolGroup(layer_names=list(layers), kv_cache_spec=uniform))
+    return groups
 
 
 def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec] | None:
@@ -77,9 +150,13 @@ def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
     if type(enabled) is not bool:
         raise ValueError(f"{CONFIG_KEY} must be a boolean")
     ring = (getattr(config, "additional_config", None) or {}).get(RING_CONFIG_KEY, False)
-    if type(ring) is not bool or (ring and not enabled):
+    logical = (getattr(config, "additional_config", None) or {}).get(LOGICAL_CONFIG_KEY, False)
+    if type(logical) is not bool:
+        raise ValueError(f"{LOGICAL_CONFIG_KEY} must be a boolean")
+    if type(ring) is not bool or (ring and not (enabled or logical)):
         raise ValueError(f"{RING_CONFIG_KEY} must be boolean and requires {CONFIG_KEY} when enabled")
-    if not enabled:
+    ring = ring or logical
+    if not (enabled or logical):
         return None
     if (config.additional_config or {}).get("enable_kvpp") or config.cache_config.enable_extensible_kv_cache:
         raise ValueError("Compact KV pages require static placement with KVPP disabled")
@@ -153,6 +230,8 @@ def compact_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec])
     ):
         raise ValueError("Compact history requires four matching Flash KV/index pairs")
     windows.sort(key=lambda name: int(name.rsplit(".layers.", 1)[1].split(".", 1)[0]))
+    if logical:
+        return _logical_groups(config, specs, history, windows, states)
     members = [history, states, *(windows[i : i + BANKS] for i in range(0, len(windows), BANKS))]
     if ring:
         specs = dict(specs)
@@ -180,7 +259,7 @@ def compact_cache_config(
     groups: list[KVCacheGroupSpec], num_blocks: int, retention_interval: int | None
 ) -> KVCacheConfig:
     descriptor = KVCacheTensor(
-        size=num_blocks * BLOCK_BYTES,
+        size=num_blocks * (BANK_BYTES if isinstance(groups[0], LogicalPoolGroup) else BLOCK_BYTES),
         layers=[name for group in groups for name in group.layer_names],
         offset=0,
         block_stride=BANK_BYTES,
@@ -201,7 +280,7 @@ def allocate_compact_views(config: KVCacheConfig, allocate: Callable[[int], torc
     views = {}
     for group in config.kv_cache_groups:
         specs = group.kv_cache_spec.kv_cache_specs
-        used = [0] * BANKS
+        used = [0] * (1 if isinstance(group, LogicalPoolGroup) else BANKS)
         # Only layers in the same group can own the same block ID simultaneously.
         for name in sorted(group.layer_names, key=lambda n: (-specs[n].unpadded_page_size_bytes, n)):
             size = specs[name].unpadded_page_size_bytes
