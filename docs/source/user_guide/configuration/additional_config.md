@@ -396,7 +396,6 @@ The chronological staging workspace and the transfer allocation's alignment allo
 CPU tests cover address calculation, request admission and registered bytes. Hardware memory usage,
 model probabilities and serving performance require device validation.
 
-
 ### Packed history in the logical state pools
 
 With `enable_deepseek_v41_logical_state_pools` enabled, set `enable_deepseek_v41_packed_history` to
