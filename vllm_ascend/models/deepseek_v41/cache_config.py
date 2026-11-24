@@ -305,7 +305,9 @@ def get_deepseek_v41_kv_cache_config(
     """Place stage-local resource pages within one shared backing pool."""
     if groups and isinstance(groups[0], PackedHistoryGroup):
         count = may_override_num_blocks(vllm_config, available_memory // get_deepseek_v41_pool_bytes_per_block(groups))
-        history_blocks = count - 1 - groups[0].kv_cache_spec.first_spec.reserved_state_tiles
+        history_blocks = (
+            count - 1 - sum(group.kv_cache_spec.max_memory_usage_pages(vllm_config) for group in groups[1:])
+        )
         if history_blocks * 128 < vllm_config.model_config.max_model_len:
             raise ValueError(f"State reservations leave {history_blocks} history blocks for max_model_len")
         return packed_cache_config(groups, count, vllm_config.cache_config.prefix_cache_retention_interval)

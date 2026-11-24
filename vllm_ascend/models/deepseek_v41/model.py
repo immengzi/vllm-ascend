@@ -1189,7 +1189,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self.has_engram = self.has_engram and bool(self.local_engram_layer_ids)
-        if PackedHistoryConfig.from_vllm_config(vllm_config) is not None:
+        if (
+            PackedHistoryConfig.from_vllm_config(vllm_config) is not None
+            and not vllm_config.cache_config.enable_prefix_caching
+        ):
             bind_window_staging_workspace(
                 self.layers[self.start_layer : self.end_layer], vllm_config.scheduler_config, torch.device(self.device)
             )

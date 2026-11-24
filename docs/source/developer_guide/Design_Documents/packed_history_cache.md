@@ -18,7 +18,13 @@ For a worker with room for G IDs and quotas S (SWA requests) and C (compressor r
 
 At startup the packed layout reports how many whole requests of the configured maximum length fit per replica. Each request needs one history block per 128 input positions, rounded up. The limit is the smallest of the history-based request count and the two state quotas. The frontend token estimate multiplies this limit by the configured length. Shorter or mixed-length requests can reach a different concurrency.
 
-During attention, the worker assembles the visible tail of the old ring and the current rows in chronological order. After attention it commits the new rows to the ring. Sequential layers share the staging workspace. The packed path requires non-overlapping forwards and excludes prefix caching, bounded SWA replay, speculative decoding and extensible cache allocation. It supports the unpacked BF16 Flash KV format, INT8 indices with FP16 scales, and FP32 compressor rings with PP, PCP and DCP all equal to one.
+During attention, the worker assembles the visible tail of the old ring and the current rows in chronological order. After attention it commits the new rows to the ring. Sequential layers share the staging workspace. The packed path requires non-overlapping forwards and excludes bounded SWA replay, speculative decoding and extensible cache allocation. It supports the unpacked BF16 Flash KV format, INT8 indices with FP16 scales, and FP32 compressor rings with PP, PCP and DCP all equal to one.
+
+## Prefix caching
+
+With `--enable-prefix-caching --no-swa-bounded-replay`, compressed history still uses the three packed planes. SWA uses vLLM's position-indexed sliding-window pages in the same allocation. A prefix hit requires both the compressed history and the SWA tail covering the same 128-token boundary. Concurrent continuations can read those immutable pages and write their own suffix pages. The native block pool keeps cached pages eligible for eviction once their last reader releases them.
+
+Compressor rings remain private. Each 128-token boundary ends a complete compression pair, so a new continuation starts its next pair from its own input. The smaller of the configured SWA and compressor slot limits caps concurrent requests. The fixed-ring memory formula above applies with prefix caching disabled. With prefix caching enabled, SWA uses pages for its visible tail and in-flight chunk, and the reported cold-request capacity accounts for both. Actual capacity also depends on prefix reuse and eviction. Use the same prefix and replay settings on both P/D peers.
 
 ## Serving and P/D handoff
 

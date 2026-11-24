@@ -118,18 +118,36 @@ def _logical_groups(config, options, specs, history, windows, states):
     reserved = (
         cdiv(len(windows), state_layers_per_id) * swa_slots + cdiv(len(states), state_layers_per_id) * compressor_slots
     )
-    bins = [{n: _as_spec(LogicalHistorySpec, specs[n], reserved_state_tiles=reserved) for n in history}]
+    prefix_caching = config.cache_config.enable_prefix_caching
+    if prefix_caching:
+        # History and the SWA tail at a hash boundary are shared, immutable pages.
+        # Their native managers account for unique block IDs, including cache hits.
+        # C2 starts a new compression pair at every 128-token hit boundary.
+        history_specs = {name: specs[name] for name in history}
+        compressor_slots = min(swa_slots, compressor_slots)
+    else:
+        history_specs = {
+            name: _as_spec(LogicalHistorySpec, specs[name], reserved_state_tiles=reserved) for name in history
+        }
+    bins = [history_specs]
     for names, cls, slots in (
         (states, LogicalCompressorSpec, compressor_slots),
         (windows, LogicalWindowSpec, swa_slots),
     ):
         for start in range(0, len(names), state_layers_per_id):
-            bins.append(
-                {n: _as_spec(cls, specs[n], slot_limit=slots) for n in names[start : start + state_layers_per_id]}
-            )
+            batch = names[start : start + state_layers_per_id]
+            if prefix_caching and cls is LogicalWindowSpec:
+                bins.append({name: specs[name] for name in batch})
+            else:
+                bins.append({name: _as_spec(cls, specs[name], slot_limit=slots) for name in batch})
     groups = []
-    for i, layers in enumerate(bins):
-        wrapper = UniformTypeKVCacheSpecs if i == 0 else ReservedRingSpecs
+    for layers in bins:
+        first = next(iter(layers.values()))
+        wrapper = (
+            ReservedRingSpecs
+            if isinstance(first, (LogicalWindowSpec, LogicalCompressorSpec))
+            else UniformTypeKVCacheSpecs
+        )
         uniform = wrapper.from_specs(layers)
         if uniform is None:
             raise ValueError(f"Incompatible logical pool layers {list(layers)}")
@@ -160,13 +178,12 @@ def packed_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec]) 
             parallel.decode_context_parallel_size,
         )
         != (1, 1, 1)
-        or config.cache_config.enable_prefix_caching
         or config.cache_config.swa_bounded_replay
         or config.speculative_config is not None
     ):
         raise ValueError(
             "Packed history requires DSV4.1 Flash MRV2 hybrid cache with PP=PCP=DCP=1 "
-            "without prefix cache, replay or draft"
+            "without bounded SWA replay or draft"
         )
 
     history, windows, states = [], [], []
@@ -214,7 +231,7 @@ def packed_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec]) 
     return _logical_groups(config, options, specs, history, windows, states)
 
 
-def uses_fixed_swa_ring(config: KVCacheConfig | None) -> bool:
+def uses_packed_history(config: KVCacheConfig | None) -> bool:
     groups = getattr(config, "kv_cache_groups", None)
     return bool(groups and isinstance(groups[0], PackedHistoryGroup))
 

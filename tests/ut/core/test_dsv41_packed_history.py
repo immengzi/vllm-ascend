@@ -8,8 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config
+from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config, get_request_block_hasher, init_none_hash
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 from vllm.v1.request import Request
@@ -98,13 +99,15 @@ def worker_views(c, specs, count, *, connector="MooncakePullConnector"):
     return cfg, views
 
 
-def manager_for(cfg):
+def manager_for(cfg, *, enable_caching=False):
     from vllm_ascend.patch.platform import patch_kv_cache_coordinator
 
     with patch(
         "vllm.v1.core.kv_cache_manager.get_kv_cache_coordinator", patch_kv_cache_coordinator.get_kv_cache_coordinator
     ):
-        manager = KVCacheManager(generate_scheduler_kv_cache_config([cfg]), 4096, 128, 128, enable_caching=False)
+        manager = KVCacheManager(
+            generate_scheduler_kv_cache_config([cfg]), 4096, 128, 128, enable_caching=enable_caching
+        )
     pool = manager.coordinator.block_pool
     assert all(m.block_pool is pool for m in manager.coordinator.single_type_managers)
     return manager
@@ -331,12 +334,12 @@ def test_enable_requires_json_boolean(flash, bad_value):
         AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
 
 
-@pytest.mark.parametrize("feature", ["prefix_cache", "pcp", "other_model", "spec_decode", "hma_disabled", "hisparse"])
+@pytest.mark.parametrize("feature", ["bounded_replay", "pcp", "other_model", "spec_decode", "hma_disabled", "hisparse"])
 def test_explicit_opt_in_rejects_unsupported_combinations(flash, feature):
     config, specs = flash
     configure(config, 1, 2, 128)
-    if feature == "prefix_cache":
-        config.cache_config.enable_prefix_caching = True
+    if feature == "bounded_replay":
+        config.cache_config.swa_bounded_replay = True
     elif feature == "pcp":
         config.parallel_config.prefill_context_parallel_size = 4
     elif feature == "other_model":
@@ -349,6 +352,55 @@ def test_explicit_opt_in_rejects_unsupported_combinations(flash, feature):
         config.attention_config.hisparse_config = SimpleNamespace()
     with pytest.raises(ValueError, match="Packed history|Fixed SWA rings"):
         AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
+
+
+@pytest.mark.parametrize(("shared_tokens", "hit_tokens"), [(127, 0), (128, 128), (255, 128), (256, 256)])
+def test_prefix_hits_include_window_pages_and_keep_compressor_private(flash, shared_tokens, hit_tokens):
+    config, specs = flash
+    configure(config, 2, 3, 512)
+    config.cache_config.enable_prefix_caching = True
+    config.max_in_flight_tokens = 128
+    builder = AscendKVCacheConfigBuilder()
+    groups = builder.get_kv_cache_groups(config, specs)
+    cfg = builder.get_kv_cache_config_from_groups(config, groups, 256)
+    manager = manager_for(cfg, enable_caching=True)
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(128, sha256)
+    shared = list(range(shared_tokens))
+
+    def request(name, suffix):
+        return Request(name, shared + [suffix] * 128, SamplingParams(max_tokens=1), None, block_hasher=hasher)
+
+    first, second = request("first", 1001), request("second", 1002)
+    assert manager.allocate_slots(first, first.num_tokens) is not None
+    hits, length, _ = manager.get_computed_blocks(second)
+    assert length == hit_tokens
+    assert manager.allocate_slots(second, second.num_tokens - length, length, hits) is not None
+    a = manager.get_block_ids(first.request_id)
+    b = manager.get_block_ids(second.request_id)
+    for idx, group in enumerate(groups):
+        spec = group.kv_cache_spec.first_spec
+        if isinstance(spec, CircularBufferSpec):
+            assert not hits.blocks[idx]
+            assert len(a[idx]) == len(b[idx]) == 1 and a[idx] != b[idx]
+        elif hit_tokens:
+            # At the boundary both the compressed history and the full SWA tail
+            # refer to the original immutable page; divergent suffixes are private.
+            last_hit = hit_tokens // 128 - 1
+            assert a[idx][last_hit] == b[idx][last_hit] != 0
+            assert a[idx][-1] != b[idx][-1]
+    third = request("third", 1003)
+    third_hits, third_len, _ = manager.get_computed_blocks(third)
+    assert third_len == hit_tokens
+    assert manager.allocate_slots(third, third.num_tokens - third_len, third_len, third_hits) is None
+    manager.free(first)
+    assert manager.get_block_ids(second.request_id) == b
+    assert manager.allocate_slots(third, third.num_tokens - third_len, third_len, third_hits) is not None
+    manager.free(second)
+    manager.free(third)
+    assert manager.get_computed_blocks(request("after-release", 1004))[1] == hit_tokens
+    assert manager.reset_prefix_cache()
+    assert manager.get_computed_blocks(request("after-reset", 1005))[1] == 0
 
 
 def test_request_window_prefill_uses_previous_tail_and_current_chunk():
