@@ -3,7 +3,7 @@
 """Storage, admission and release for the 128 KiB Flash KV layout."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -226,6 +226,73 @@ def test_planner_auto_fit_reserves_state_and_null(flash):
     for cfg in configs:
         assert cfg.num_blocks == 53
         assert {d.size for d in cfg.kv_cache_tensors} == {budget}
+
+
+@pytest.mark.parametrize(
+    "count,swa,compressor,length,limit",
+    [
+        (101, 1, 1, 128, 1),  # 77 free IDs after one request; both state quotas are full.
+        (101, 1, 3, 129, 1),  # SWA quota.
+        (101, 3, 2, 129, 2),  # Compressor quota.
+        (72, 3, 3, 129, 2),  # Five history IDs: two full requests, one ID left.
+    ],
+)
+def test_quota_capacity_report_matches_native_admission(flash, count, swa, compressor, length, limit):
+    from vllm.v1.core.kv_cache_utils import update_kv_cache_capacity
+
+    config, specs = flash
+    configure(config, swa, compressor, length)
+    config.device_config = SimpleNamespace(device_type="cpu")
+    cfg, _ = worker_views(config, specs, count)
+    for view in (cfg, generate_scheduler_kv_cache_config([cfg])):
+        update_kv_cache_capacity(config, view)
+        assert config.cache_config.kv_cache_max_concurrency == limit
+        assert config.cache_config.kv_cache_size_tokens == limit * length
+
+    manager = manager_for(cfg)
+    for i in range(limit + 1):
+        req = Request(str(i), [0] * length, SamplingParams(max_tokens=1), pooling_params=None)
+        assert (manager.allocate_slots(req, length) is not None) == (i < limit)
+
+
+def test_native_capacity_after_packed_planning(flash):
+    from vllm.v1.core import kv_cache_utils
+
+    config, specs = flash
+
+    def native_capacity():
+        config.additional_config = {}
+        cfg, _ = worker_views(config, specs, 64)
+        return kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config=config, kv_cache_config=cfg)
+
+    config.model_config.max_model_len = 128
+    expected = native_capacity()
+    configure(config, 1, 1, 128)
+    worker_views(config, specs, 64)
+    assert native_capacity() == expected
+
+
+def test_packed_descriptors_expose_three_physical_pages(flash):
+    import sys
+
+    with patch.dict(sys.modules, {"mooncake.engine": MagicMock()}):
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import _reconstruct_shared_pages
+
+    config, specs = flash
+    configure(config, 1, 1, 257)
+    count = 64
+    cfg, views = worker_views(config, specs, count)
+    pages = _reconstruct_shared_pages(cfg, views)
+    base = min(t.data_ptr() for view in views.values() for t in (view if isinstance(view, tuple) else (view,)))
+    spans = []
+    for page in pages:
+        addresses = set()
+        for name, offset in page.placements:
+            tensors = views[name] if isinstance(views[name], tuple) else (views[name],)
+            addresses.add(min(t.data_ptr() for t in tensors) - offset)
+        assert len(addresses) == 1
+        spans.append((addresses.pop() - base, page.block_stride))
+    assert sorted(spans) == [(0, 131072), (count * 131072, 131072), (count * 262144, 107136)]
 
 
 def test_stock_pull_registers_one_backing_with_per_plane_strides(flash):

@@ -33,6 +33,13 @@ Quota checks precede allocation. Detached blocks still count while a transfer
 owns a reference. The byte budget comes from the worker's KV profile.
 Staging and base-address alignment have separate costs.
 
+At startup the packed layout reports how many whole requests of the configured
+maximum length fit per replica. Each request needs one history block per
+128 input positions, rounded up. The limit is the smallest of the history-based
+request count and the two state quotas. The frontend token estimate multiplies
+this limit by the configured length. Shorter or mixed-length requests can
+reach a different concurrency.
+
 During attention, the worker assembles the visible tail of the old ring and
 the current rows in chronological order. After attention it commits the new
 rows to the ring. Sequential layers share the staging workspace. The packed
@@ -58,6 +65,13 @@ ID, and the stride published by the tensor view. The layout supplies normal
 placement descriptors consumed by the upstream allocator. The deployment
 must configure matching layouts on both sides.
 
+Disaggregated serving currently accepts MooncakePullConnector only. Each layer
+descriptor publishes the block stride and the size of its physical plane. This
+lets a consumer reconstruct page boundaries even when a history component starts
+in the middle of a page. CPU tests exercised the stock MooncakeHybridConnector's
+address calculations at 128, 129, 130 and 257 tokens, including the final block
+of the allocation. Hybrid still requires hardware validation.
+
 ## A3 measurements
 
 These results were collected on a frozen vLLM 0.33 runtime. The native and
@@ -71,7 +85,9 @@ eight logical devices each. Both used BF16 KV and a 1,048,576-token context
 limit. Memory utilization was 0.90 on P and 0.95 on D. All layouts used the
 same model, tokenizer, seed and scheduling limits. The official Ascend proxy
 served the P/D frontend. Each timed `vllm bench serve` round used 100 requests.
-The comparison covers 33 P/D rounds and 18 standalone rounds.
+The comparison covers 33 P/D rounds and 18 standalone rounds. The capacity row
+records the frozen runtime's startup estimate. The streaming row counts requests
+observed generating concurrently.
 
 | P/D workload and metric | Native | Uniform 128 KiB control | Packed history |
 | --- | ---: | ---: | ---: |

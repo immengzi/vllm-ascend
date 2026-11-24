@@ -228,12 +228,14 @@ def _packed_descriptors(groups, count):
     descriptors = []
     plane_starts = []
     start = 0
+    # Match native V4.1 placements: even singleton descriptors identify
+    # their full plane so consumers can reconstruct shared page boundaries.
     for names, width in zip(banks, widths, strict=True):
         plane_starts.append(start)
         offset = start
         for name in names:
             descriptors.append(
-                KVCacheTensor(size=size, layers=[name], offset=offset, block_stride=width, layer_stride=0)
+                KVCacheTensor(size=size, layers=[name], offset=offset, block_stride=width, layer_stride=count * width)
             )
             offset += history_specs[name].unpadded_page_size_bytes
         start += count * width
@@ -241,7 +243,9 @@ def _packed_descriptors(groups, count):
     for group in groups[1:]:
         for name, offset in zip(group.layer_names, state_starts[: len(group.layer_names)], strict=True):
             descriptors.append(
-                KVCacheTensor(size=size, layers=[name], offset=offset, block_stride=BANK_BYTES, layer_stride=0)
+                KVCacheTensor(
+                    size=size, layers=[name], offset=offset, block_stride=BANK_BYTES, layer_stride=count * BANK_BYTES
+                )
             )
     return descriptors
 
@@ -249,6 +253,11 @@ def _packed_descriptors(groups, count):
 def packed_cache_config(
     groups: list[KVCacheGroupSpec], num_blocks: int, retention_interval: int | None
 ) -> KVCacheConfig:
+    # The upstream reporter has no per-layout callback. Install the reporting
+    # adapter only once the model has selected this layout.
+    from .packed_capacity import install_packed_capacity_reporting
+
+    install_packed_capacity_reporting()
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=_packed_descriptors(groups, num_blocks),
