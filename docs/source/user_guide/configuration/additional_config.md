@@ -418,4 +418,4 @@ Validate correctness, quality and performance on the deployment hardware before 
 
 For P/D serving, enable the same layout on both peers with
 `--additional-config '{"packed_history_cache":{"enabled":true}}'`.
-See [placement, supported configurations and measured trade-offs](../../developer_guide/Design_Documents/packed_history_cache.md).
+See [placement, supported configurations and P/D handoff](../../developer_guide/Design_Documents/packed_history_cache.md).
