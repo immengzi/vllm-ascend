@@ -26,7 +26,7 @@ from contextvars import ContextVar
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, Field, StrictBool, StrictInt, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -519,6 +519,24 @@ class ExpertOffloadConfig:
         return self
 
 
+@config(config=ConfigDict(frozen=True, extra="forbid"))
+class PackedHistoryConfig:
+    """Pack compatible history layers and bound request-local state in one native pool."""
+
+    enabled: StrictBool = False
+    swa_slots: StrictInt | None = Field(default=None, gt=0)
+    compressor_slots: StrictInt | None = Field(default=None, gt=0)
+
+    @classmethod
+    def from_vllm_config(cls, vllm_config):
+        # Planning can precede the worker's global AscendConfig initialization.
+        raw = (getattr(vllm_config, "additional_config", None) or {}).get("packed_history_cache")
+        if raw is None:
+            return None
+        options = TypeAdapter(cls).validate_python(raw)
+        return options if options.enabled else None
+
+
 @config
 class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
@@ -685,6 +703,7 @@ class AscendConfig:
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
     enable_cpu_binding: bool = True
+    packed_history_cache: PackedHistoryConfig | None = None
     shared_engram: SharedEngramConfig | None = None
     multistream_dsv4_dsa_overlap: bool = True
     # Prepare Engram hashes, lookups and DP/TP exchanges on an auxiliary stream;

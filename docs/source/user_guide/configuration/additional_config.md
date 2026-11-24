@@ -407,3 +407,15 @@ convolution allocates its output separately.
 Small prefix match units can increase checkpoint traffic.
 
 Validate correctness, quality and performance on the deployment hardware before deploying in production.
+
+## Packed history cache
+
+| Key under `packed_history_cache` | Type | Default | Behavior |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Enable packed history and request-local rings for supported DeepSeek V4.1 Flash MRV2 cache specs. |
+| `swa_slots` | positive integer | `max_num_seqs` | Number of concurrent per-request sliding-window slots reserved per DP replica. |
+| `compressor_slots` | positive integer | `max_num_seqs` | Number of concurrent per-request compressor slots reserved per DP replica. |
+
+For P/D serving, enable the same layout on both peers with
+`--additional-config '{"packed_history_cache":{"enabled":true}}'`.
+See [placement, supported configurations and measured trade-offs](../../developer_guide/Design_Documents/packed_history_cache.md).

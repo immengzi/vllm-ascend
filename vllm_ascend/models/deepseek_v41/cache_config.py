@@ -27,6 +27,7 @@ from vllm_ascend.device.hardware_profile import (
     HardwareCapability,
     get_current_hardware_profile,
 )
+from vllm_ascend.models.deepseek_v41.packed_cache import PackedHistoryGroup, packed_cache_config
 
 STATE_RING_ROWS = 32
 
@@ -290,6 +291,8 @@ def _get_worker_layer_tuples(groups):
 
 
 def get_deepseek_v41_pool_bytes_per_block(groups):
+    if groups and isinstance(groups[0], PackedHistoryGroup):
+        return sum(s.unpadded_page_size_bytes for s in groups[0].kv_cache_spec.kv_cache_specs.values())
     page_sizes, _ = _get_worker_layer_tuples(groups)
     return sum(page_sizes)
 
@@ -300,6 +303,12 @@ def get_deepseek_v41_kv_cache_config(
     available_memory: int,
 ) -> KVCacheConfig:
     """Place stage-local resource pages within one shared backing pool."""
+    if groups and isinstance(groups[0], PackedHistoryGroup):
+        count = may_override_num_blocks(vllm_config, available_memory // get_deepseek_v41_pool_bytes_per_block(groups))
+        history_blocks = count - 1 - groups[0].kv_cache_spec.first_spec.reserved_state_tiles
+        if history_blocks * 128 < vllm_config.model_config.max_model_len:
+            raise ValueError(f"State reservations leave {history_blocks} history blocks for max_model_len")
+        return packed_cache_config(groups, count, vllm_config.cache_config.prefix_cache_retention_interval)
     specs = _specs_from_groups(groups)
     page_sizes, layer_tuples = _get_worker_layer_tuples(groups)
     capacity = max(available_memory // sum(page_sizes), 0)

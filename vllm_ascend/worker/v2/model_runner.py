@@ -103,6 +103,7 @@ from vllm_ascend.hisparse.pcp import adapt_pcp_hisparse_connector
 from vllm_ascend.kv_trace.kv_trace_runner import install_trace
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import uses_a5_packed_cache
+from vllm_ascend.models.deepseek_v41.packed_cache import uses_fixed_swa_ring
 from vllm_ascend.models.host_offload import track_host_offload_owners
 from vllm_ascend.observability.runtime_guard.hooks import (
     runtime_guard_sample_tokens,
@@ -1209,11 +1210,14 @@ class NPUModelRunner(GPUModelRunner):
     def prepare_dummy_attn(
         self, input_batch: AscendInputBatch, valid_state_slots: bool = False
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        # Dummy DP work must not address positive ring IDs owned by live requests.
+        fixed_ring = uses_fixed_swa_ring(getattr(self, "kv_cache_config", None))
         block_tables, slot_mappings = super().prepare_dummy_attn(
             input_batch,
-            valid_state_slots=valid_state_slots,
+            valid_state_slots=valid_state_slots and not fixed_ring,
         )
-        prepare_v41_dummy_ring_state(self, input_batch.num_reqs)
+        if not fixed_ring:
+            prepare_v41_dummy_ring_state(self, input_batch.num_reqs)
         slot_mappings = self._maybe_extend_slot_mappings(input_batch, slot_mappings)
         return block_tables, slot_mappings
 

@@ -63,7 +63,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import PackedHistoryConfig, get_ascend_config
 from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
@@ -131,6 +131,7 @@ from .engram.parallel import gather_engram_hashes, resolve_dp_shared_memory
 from .engram.shared_pool import rollback_shared_engram
 from .engram_lifecycle import close_engram_on_init_failure
 from .indexer import DeepseekV41Indexer
+from .window_state import bind_window_staging_workspace
 
 
 def _retain_local_engram_tables(model):
@@ -1188,6 +1189,10 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
         self.has_engram = self.has_engram and bool(self.local_engram_layer_ids)
+        if PackedHistoryConfig.from_vllm_config(vllm_config) is not None:
+            bind_window_staging_workspace(
+                self.layers[self.start_layer : self.end_layer], vllm_config.scheduler_config, torch.device(self.device)
+            )
         self._oproj_buffer_pool = OProjBufferPool()
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):

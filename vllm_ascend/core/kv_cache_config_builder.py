@@ -51,6 +51,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
     make_cache_groups,
 )
+from vllm_ascend.models.deepseek_v41.packed_cache import packed_groups_if_enabled
 from vllm_ascend.models.glm5next.cache_config import (
     _get_glm5_next_cache_layout,
     get_glm5_next_kv_cache_config,
@@ -94,6 +95,9 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         mixed-page-size shared slots, then the Kimi-K3 DSpark mixed grouping,
         then vLLM's generic grouping.
         """
+        packed = packed_groups_if_enabled(vllm_config, kv_cache_spec)
+        if packed is not None:
+            return packed
         if vllm_config.model_config.hf_config.model_type == "kimi_k31":
             return paired_sfa_cache_groups(vllm_config, kv_cache_spec)
         step5_groups = get_step5_kv_cache_groups(vllm_config, kv_cache_spec, super().get_kv_cache_groups)
