@@ -1,4 +1,4 @@
 pr: 17
 entries:
   - category: feature
-    text: DeepSeek V4.1 Flash MRV2 supports an opt-in packed history cache for standalone serving and Mooncake Pull P/D. Set packed_history_cache.enabled in additional config to trade short-request performance for higher long-context capacity.
+    text: DeepSeek V4.1 Flash MRV2 supports an opt-in packed history cache for standalone and disaggregated serving. Set packed_history_cache.enabled in additional config to trade short-request performance for higher long-context capacity.

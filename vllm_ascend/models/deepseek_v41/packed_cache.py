@@ -150,8 +150,6 @@ def packed_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec]) 
     parallel = config.parallel_config
     if getattr(parallel, "use_ubatching", False):
         raise ValueError("Fixed SWA rings share a staging workspace and require non-overlapping forwards")
-    if config.kv_transfer_config is not None and config.kv_transfer_config.kv_connector != "MooncakePullConnector":
-        raise ValueError("Fixed SWA rings support MooncakePullConnector for disaggregated serving")
     if (
         config.model_config.architecture != "DeepseekV41ForCausalLM"
         or not config.use_v2_model_runner

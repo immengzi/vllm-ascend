@@ -79,13 +79,11 @@ def flash():
     return c, specs
 
 
-def worker_views(c, specs, count):
+def worker_views(c, specs, count, *, connector="MooncakePullConnector"):
     from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend
     from vllm_ascend.worker.v2 import attn_utils
 
-    c.kv_transfer_config = SimpleNamespace(
-        kv_connector="MooncakePullConnector", kv_connector_extra_config={}, is_kv_producer=False
-    )
+    c.kv_transfer_config = SimpleNamespace(kv_connector=connector, kv_connector_extra_config={}, is_kv_producer=False)
     builder = AscendKVCacheConfigBuilder()
     groups = builder.get_kv_cache_groups(c, specs)
     cfg = builder.get_kv_cache_config_from_groups(c, groups, count)
@@ -281,7 +279,7 @@ def test_packed_descriptors_expose_three_physical_pages(flash):
     config, specs = flash
     configure(config, 1, 1, 257)
     count = 64
-    cfg, views = worker_views(config, specs, count)
+    cfg, views = worker_views(config, specs, count, connector="MooncakeHybridConnector")
     pages = _reconstruct_shared_pages(cfg, views)
     base = min(t.data_ptr() for view in views.values() for t in (view if isinstance(view, tuple) else (view,)))
     spans = []
@@ -293,6 +291,15 @@ def test_packed_descriptors_expose_three_physical_pages(flash):
         assert len(addresses) == 1
         spans.append((addresses.pop() - base, page.block_stride))
     assert sorted(spans) == [(0, 131072), (count * 131072, 131072), (count * 262144, 107136)]
+
+
+def test_packed_groups_are_independent_of_connector_name(flash):
+    config, specs = flash
+    configure(config, 1, 1, 257)
+    builder = AscendKVCacheConfigBuilder()
+    standalone = builder.get_kv_cache_groups(config, specs)
+    config.kv_transfer_config = SimpleNamespace(kv_connector="ExternalHMAConnector")
+    assert builder.get_kv_cache_groups(config, specs) == standalone
 
 
 def test_stock_pull_registers_one_backing_with_per_plane_strides(flash):
@@ -324,7 +331,7 @@ def test_enable_requires_json_boolean(flash, bad_value):
         AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
 
 
-@pytest.mark.parametrize("feature", ["prefix_cache", "pcp", "other_model", "spec_decode", "connector", "hisparse"])
+@pytest.mark.parametrize("feature", ["prefix_cache", "pcp", "other_model", "spec_decode", "hma_disabled", "hisparse"])
 def test_explicit_opt_in_rejects_unsupported_combinations(flash, feature):
     config, specs = flash
     configure(config, 1, 2, 128)
@@ -336,8 +343,8 @@ def test_explicit_opt_in_rejects_unsupported_combinations(flash, feature):
         config.model_config.architecture = "OtherForCausalLM"
     elif feature == "spec_decode":
         config.speculative_config = SimpleNamespace()
-    elif feature == "connector":
-        config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeHybridConnector")
+    elif feature == "hma_disabled":
+        config.scheduler_config.disable_hybrid_kv_cache_manager = True
     else:
         config.attention_config.hisparse_config = SimpleNamespace()
     with pytest.raises(ValueError, match="Packed history|Fixed SWA rings"):

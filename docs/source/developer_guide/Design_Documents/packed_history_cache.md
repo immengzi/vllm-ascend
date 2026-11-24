@@ -28,6 +28,6 @@ Enable the option on the standalone service or on **both** P and D:
 --additional-config '{"packed_history_cache":{"enabled":true}}'
 ```
 
-Each peer uses the same layout and layer formats. They can have different budgets and local block IDs. For N input tokens, P supplies the history, index, window and compressor state for the first N−1 input tokens. D computes the final input token. The stock Mooncake Pull connector registers the backing and addresses each layer using its base, the local or remote block ID, and the stride published by the tensor view. The layout supplies normal placement descriptors consumed by the upstream allocator. The deployment must configure matching layouts on both sides.
+Both peers must use the same layout and layer formats. Their budgets and local block IDs may differ. For N input tokens, P supplies the history, index, window and compressor state for the first N−1 tokens. D restores those groups under its own block IDs and computes the final input token.
 
-Disaggregated serving currently accepts MooncakePullConnector only. Each layer descriptor publishes the block stride and the size of its physical plane. This lets a consumer reconstruct page boundaries even when a history component starts in the middle of a page.
+The layout publishes standard KV cache groups, tensor views and placement descriptors. A connector must support the model's hybrid cache groups and preserve each physical plane's block stride when translating between P and D block IDs. The descriptors record the plane size and layer offsets so a connector can locate a page even when a layer starts in the middle of it. vLLM handles connector selection and hybrid cache capability checks.
