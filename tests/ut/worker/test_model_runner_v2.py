@@ -1110,9 +1110,14 @@ def test_pcp_dummy_refreshes_captured_buffers_after_real_batch(num_reqs, num_tok
 
 
 @pytest.mark.parametrize("valid_state_slots", [False, True])
-def test_prepare_dummy_attn_without_pcp_uses_upstream(valid_state_slots):
+@pytest.mark.parametrize("packed", [False, True])
+def test_prepare_dummy_attn_without_pcp_uses_upstream(valid_state_slots, packed):
+    from vllm_ascend.models.deepseek_v41.packed_cache import PackedHistoryGroup
+
     runner = _make_runner()
     runner.pcp_manager = None
+    if packed:
+        runner.kv_cache_config.kv_cache_groups = [PackedHistoryGroup(layer_names=["swa"], kv_cache_spec=object())]
     # num_reqs feeds the V4.1 ring-state prep that runs after the upstream call.
     dummy = SimpleNamespace(num_reqs=0, num_tokens=0, num_tokens_after_padding=0)
     with (
@@ -1120,8 +1125,11 @@ def test_prepare_dummy_attn_without_pcp_uses_upstream(valid_state_slots):
         patch("vllm_ascend.worker.v2.model_runner.prepare_v41_dummy_ring_state") as prepare_ring,
     ):
         assert runner.prepare_dummy_attn(dummy, valid_state_slots=valid_state_slots) == ((), None)
-    parent.assert_called_once_with(dummy, valid_state_slots=valid_state_slots)
-    prepare_ring.assert_called_once_with(runner, dummy.num_reqs)
+    parent.assert_called_once_with(dummy, valid_state_slots=valid_state_slots and not packed)
+    if packed:
+        prepare_ring.assert_not_called()
+    else:
+        prepare_ring.assert_called_once_with(runner, dummy.num_reqs)
 
 
 @pytest.mark.parametrize("promised,padded,expected", [(6, 16, 6), (6, 1, 6), (None, 16, 1)])
