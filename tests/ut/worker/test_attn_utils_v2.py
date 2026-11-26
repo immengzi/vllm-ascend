@@ -60,6 +60,7 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.models.deepseek_v41.packed_cache import LogicalHistorySpec, PackedHistoryGroup
 from vllm_ascend.worker.utils import prepare_ascend_kernel_block_sizes
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2 import model_runner as v2_model_runner
@@ -2247,7 +2248,25 @@ class _CaptureStateBuilder(_PrefillStateBuilder):
 
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("full_graph", [False, True])
-def test_v41_capture_keeps_compressed_indexer_branches(monkeypatch, capture, full_graph):
+@pytest.mark.parametrize(
+    "packed,fixed_ring,dummy,skip",
+    [
+        (False, False, True, False),
+        (True, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, False, False, True),
+    ],
+)
+def test_v41_capture_and_ring_update_flags(monkeypatch, capture, full_graph, packed, fixed_ring, dummy, skip):
+    cls = PackedHistoryGroup if packed else KVCacheGroupSpec
+    history = (
+        LogicalHistorySpec(block_size=128, num_kv_heads=1, head_size=512, dtype=torch.bfloat16, reserved_state_tiles=22)
+        if fixed_ring
+        else _make_dsv4_mla_spec(block_size=128, compress_ratio=1)
+    )
+    cache_group = cls(layer_names=["layer.0"], kv_cache_spec=UniformTypeKVCacheSpecs.from_specs({"layer.0": history}))
+    monkeypatch.setattr(attn_utils, "ring_state_update_skipped", lambda: skip)
     monkeypatch.setattr(attn_utils, "AscendDSAV41MetadataBuilder", _CaptureStateBuilder)
     builder = _CaptureStateBuilder()
     group = _metadata_test_group(["layer.0"], builder)
@@ -2262,13 +2281,16 @@ def test_v41_capture_keeps_compressed_indexer_branches(monkeypatch, capture, ful
         max_seq_len=1,
         block_tables=(torch.zeros((1, 1), dtype=torch.int32),),
         slot_mappings=(torch.zeros(1, dtype=torch.int64),),
-        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())]),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[cache_group]),
         seq_lens_np=np.array([1], dtype=np.int32),
         positions=torch.tensor([0], dtype=torch.int64),
         for_cudagraph_capture=capture,
         full_graph_mode=full_graph,
+        offload_dummy=dummy,
     )
     assert builder.extra_kwargs is not None
+    assert builder.extra_kwargs["fixed_swa_ring"] is fixed_ring
+    assert builder.extra_kwargs["skip_ring_state_update"] is (skip or (packed and dummy and not capture))
     assert builder.extra_kwargs["full_graph_mode"] is (capture or full_graph)
 
 
