@@ -16,7 +16,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.ascend_config import PackedHistoryConfig
+from vllm_ascend.ascend_config import PackedHistoryConfig, validate_additional_config_bool
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
 
 # Each physical bank holds a dense BF16 window (or dense FP32 C2 ring) per ID.
@@ -145,7 +145,7 @@ def _logical_groups(config, options, specs, history, windows, states):
         first = next(iter(layers.values()))
         wrapper = (
             ReservedRingSpecs
-            if isinstance(first, (LogicalWindowSpec, LogicalCompressorSpec))
+            if not prefix_caching and isinstance(first, (LogicalWindowSpec, LogicalCompressorSpec))
             else UniformTypeKVCacheSpecs
         )
         uniform = wrapper.from_specs(layers)
@@ -159,9 +159,10 @@ def packed_groups_if_enabled(config: VllmConfig, specs: dict[str, KVCacheSpec]) 
     options = PackedHistoryConfig.from_vllm_config(config)
     if options is None:
         return None
-    if (config.additional_config or {}).get("enable_kvpp") or getattr(
-        config.cache_config, "enable_extensible_kv_cache", False
-    ):
+    kvpp_enabled = validate_additional_config_bool(
+        config.additional_config.get("enable_kvpp", False), "additional_config.enable_kvpp"
+    )
+    if kvpp_enabled or getattr(config.cache_config, "enable_extensible_kv_cache", False):
         raise ValueError("Packed history requires static placement with KVPP disabled")
     if getattr(config.attention_config, "hisparse_config", None) is not None:
         raise ValueError("Packed history requires device-resident KV")

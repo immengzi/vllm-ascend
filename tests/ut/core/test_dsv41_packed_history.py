@@ -3,22 +3,32 @@
 """Storage, admission and release for the 128 KiB Flash KV layout."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import generate_scheduler_kv_cache_config, get_request_block_hasher, init_none_hash
+from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups, get_kv_cache_configs
+from vllm.v1.core.kv_cache_utils import (
+    generate_scheduler_kv_cache_config,
+    get_request_block_hasher,
+    init_none_hash,
+    update_kv_cache_capacity,
+)
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import CircularBufferSpec
 from vllm.v1.request import Request
+from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.attention import dsa_v41
 from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
 from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 from vllm_ascend.models.deepseek_v41.cache_config import make_index_cache_spec, make_mla_cache_spec, make_swa_cache_spec
 from vllm_ascend.models.deepseek_v41.packed_cache import PackedHistoryGroup
+from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 
 
 @pytest.fixture
@@ -212,9 +222,48 @@ def test_extensible_cache_rejected_when_present(flash):
         AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
 
 
-def test_planner_auto_fit_reserves_state_and_null(flash):
-    from vllm.v1.core.kv_cache_planning import get_global_kv_cache_groups, get_kv_cache_configs
+@pytest.mark.parametrize("value", [False, "false", "0"])
+def test_disabled_kvpp_allows_packed_layout(flash, value):
+    config, specs = flash
+    configure(config, 2, 2, 128)
+    config.additional_config["enable_kvpp"] = value
+    assert isinstance(AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)[0], PackedHistoryGroup)
 
+
+@pytest.mark.parametrize("value", [True, "true", "invalid"])
+def test_enabled_or_invalid_kvpp_rejected(flash, value):
+    config, specs = flash
+    configure(config, 2, 2, 128)
+    config.additional_config["enable_kvpp"] = value
+    with pytest.raises(ValueError, match="enable_kvpp|KVPP disabled"):
+        AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
+
+
+def test_prefix_cache_fits_one_cold_request_at_exact_budget(flash):
+    config, specs = flash
+    length, chunk = 1024, 128
+    configure(config, 32, 32, length)
+    config.cache_config.enable_prefix_caching = True
+    config.max_in_flight_tokens = chunk
+    config.device_config = SimpleNamespace(device_type="cpu")
+    builder = AscendKVCacheConfigBuilder()
+    # Null block + eight history pages + three SWA pages per group + two private rings.
+    blocks = 1 + length // chunk + 3 * 20 + 2
+    with patch("vllm.v1.core.kv_cache_planning.get_kv_cache_config_builder", return_value=builder):
+        groups = get_global_kv_cache_groups(config, [specs])
+        (cache,) = get_kv_cache_configs(config, [specs], [blocks * 369280], groups)
+    with pytest.raises(ValueError, match="history blocks"):
+        builder.get_kv_cache_config_from_groups(config, groups, blocks - 1)
+    update_kv_cache_capacity(config, cache)
+    assert config.cache_config.kv_cache_max_concurrency == 1
+    manager = manager_for(cache, enable_caching=True)
+    request = Request("cold", list(range(length)), SamplingParams(max_tokens=1), pooling_params=None)
+    for computed in range(0, length, chunk):
+        request.num_computed_tokens = computed
+        assert manager.allocate_slots(request, chunk, delay_cache_blocks=True) is not None
+
+
+def test_planner_auto_fit_reserves_state_and_null(flash):
     config, specs = flash
     configure(config, 2, 3, 2048)
     config.device_config = SimpleNamespace(device_type="cpu")
@@ -239,8 +288,6 @@ def test_planner_auto_fit_reserves_state_and_null(flash):
     ],
 )
 def test_quota_capacity_report_matches_native_admission(flash, count, swa, compressor, length, limit):
-    from vllm.v1.core.kv_cache_utils import update_kv_cache_capacity
-
     config, specs = flash
     configure(config, swa, compressor, length)
     config.device_config = SimpleNamespace(device_type="cpu")
@@ -420,3 +467,59 @@ def test_request_window_prefill_uses_previous_tail_and_current_chunk():
     assert metadata.lengths.tolist() == [129, 3]
     assert metadata.row_starts.tolist() == [0, 256]
     assert metadata.block_table.tolist() == [[0, 1], [2, 0]]
+
+
+@pytest.mark.parametrize("prefix_caching,expected_length", [(True, 100000), (False, 128)])
+def test_swa_plan_and_execution_use_same_decode_length(flash, monkeypatch, prefix_caching, expected_length):
+    config, specs = flash
+    length = 100000
+    configure(config, 2, 2, length)
+    config.cache_config.enable_prefix_caching = prefix_caching
+    config.cache_config.block_size = 128
+    config.model_config.hf_text_config = SimpleNamespace(
+        sliding_window=128, head_dim=512, num_attention_heads=8, index_topk=8
+    )
+    groups = AscendKVCacheConfigBuilder().get_kv_cache_groups(config, specs)
+    name = "model.layers.0.self_attn.swa_cache"
+    gid = next(i for i, group in enumerate(groups) if name in group.layer_names)
+    spec = groups[gid].kv_cache_spec.kv_cache_specs[name]
+    backend = dsa_v41.DeepseekV41SWABackend
+    monkeypatch.setattr(dsa_v41.DeviceOperator, "get_dsv41_packed_cache_ops", lambda: None)
+    builder = dsa_v41.AscendDSAV41SWAMetadataBuilder(spec, [name], config, torch.device("cpu"))
+    builder._supports_device_ops = True
+    attn_groups = [[] for _ in groups]
+    attn_groups[gid] = [
+        AttentionGroup(
+            backend=backend, layer_names=[name], kv_cache_spec=spec, kv_cache_group_id=gid, metadata_builders=[builder]
+        )
+    ]
+    plan = Mock(return_value=torch.zeros_like(builder._smla_metadata))
+    execute = Mock(return_value=(None, None))
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla_metadata", plan, raising=False)
+    monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_mla", execute, raising=False)
+    query_start = torch.tensor([0, 1], dtype=torch.int32)
+    table = torch.ones((1, spec.max_num_blocks_per_req(config, length)), dtype=torch.int32)
+    swa = build_attn_metadata(
+        attn_groups=attn_groups,
+        num_reqs=1,
+        num_tokens=1,
+        query_start_loc_gpu=query_start,
+        query_start_loc_cpu=query_start,
+        max_query_len=1,
+        seq_lens=torch.tensor([length]),
+        max_seq_len=length,
+        block_tables=[table] * len(groups),
+        slot_mappings=torch.zeros((len(groups), 1), dtype=torch.int64),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        seq_lens_np=np.array([length], dtype=np.int32),
+        positions=torch.tensor([length - 1]),
+    )[name]
+    # The fixed ring stages the visible tail. Prefix caching reads the original SWA table.
+    staged_window = torch.empty(0) if swa.request_state is not None else None
+    impl = SimpleNamespace(role=SimpleNamespace(has_long_context=False, compress_ratio=0))
+    attn = MagicMock(packed_cache_ops=None)
+    dsa_v41.AscendDSAV41Impl._forward_attention_impl(
+        impl, attn, torch.empty(1), SimpleNamespace(swa=swa), None, staged_window=staged_window
+    )
+    assert plan.call_args.kwargs["seqused_ori_kv"].tolist() == [expected_length]
+    assert execute.call_args.kwargs["seqused_ori_kv"].tolist() == [expected_length]

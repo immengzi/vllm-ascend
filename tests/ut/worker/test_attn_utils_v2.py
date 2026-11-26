@@ -60,6 +60,7 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.models.deepseek_v4 import compressor as deepseek_v4_compressor
 from vllm_ascend.models.deepseek_v4 import indexer as deepseek_v4_indexer
 from vllm_ascend.models.deepseek_v4 import model as deepseek_v4_model
+from vllm_ascend.models.deepseek_v41.packed_cache import LogicalHistorySpec, PackedHistoryGroup
 from vllm_ascend.worker.utils import prepare_ascend_kernel_block_sizes
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2 import model_runner as v2_model_runner
@@ -2248,13 +2249,23 @@ class _CaptureStateBuilder(_PrefillStateBuilder):
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize("full_graph", [False, True])
 @pytest.mark.parametrize(
-    "packed,dummy,skip", [(False, True, False), (True, True, False), (True, False, False), (True, False, True)]
+    "packed,fixed_ring,dummy,skip",
+    [
+        (False, False, True, False),
+        (True, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, False, False, True),
+    ],
 )
-def test_v41_capture_and_ring_update_flags(monkeypatch, capture, full_graph, packed, dummy, skip):
-    from vllm_ascend.models.deepseek_v41.packed_cache import PackedHistoryGroup
-
+def test_v41_capture_and_ring_update_flags(monkeypatch, capture, full_graph, packed, fixed_ring, dummy, skip):
     cls = PackedHistoryGroup if packed else KVCacheGroupSpec
-    cache_group = cls(layer_names=["layer.0"], kv_cache_spec=object())
+    history = (
+        LogicalHistorySpec(block_size=128, num_kv_heads=1, head_size=512, dtype=torch.bfloat16, reserved_state_tiles=22)
+        if fixed_ring
+        else _make_dsv4_mla_spec(block_size=128, compress_ratio=1)
+    )
+    cache_group = cls(layer_names=["layer.0"], kv_cache_spec=UniformTypeKVCacheSpecs.from_specs({"layer.0": history}))
     monkeypatch.setattr(attn_utils, "ring_state_update_skipped", lambda: skip)
     monkeypatch.setattr(attn_utils, "AscendDSAV41MetadataBuilder", _CaptureStateBuilder)
     builder = _CaptureStateBuilder()
@@ -2278,7 +2289,7 @@ def test_v41_capture_and_ring_update_flags(monkeypatch, capture, full_graph, pac
         offload_dummy=dummy,
     )
     assert builder.extra_kwargs is not None
-    assert builder.extra_kwargs["fixed_swa_ring"] is packed
+    assert builder.extra_kwargs["fixed_swa_ring"] is fixed_ring
     assert builder.extra_kwargs["skip_ring_state_update"] is (skip or (packed and dummy and not capture))
     assert builder.extra_kwargs["full_graph_mode"] is (capture or full_graph)
 
