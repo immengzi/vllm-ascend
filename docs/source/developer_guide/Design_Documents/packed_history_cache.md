@@ -4,7 +4,7 @@ A Flash request keeps compressed history for its entire lifetime. Its sliding wi
 
 ## Placement and admission
 
-Each TP worker uses the existing MRV2 shared backing allocation. All groups in a DP replica obtain IDs from the same native block pool. For each ID, the worker exposes three planes with strides of 128, 128 and 104.625 KiB. A group owns the entire ID until release. The following examples show how its contents depend on the owner.
+Each TP worker uses the existing MRV2 shared backing allocation. All groups in a DP replica obtain IDs from the same native block pool. For each ID, the worker exposes three planes with strides of 128, 128 and 104.625 KiB. A group owns the entire ID until release. The table and capacity formula below describe the fixed-ring layout used when prefix caching is disabled.
 
 | Owner of one ID | First 128 KiB | Second 128 KiB | Last 104.625 KiB |
 | --- | --- | --- | --- |
@@ -18,13 +18,15 @@ For a worker with room for G IDs and quotas S (SWA requests) and C (compressor r
 
 At startup the packed layout reports how many whole requests of the configured maximum length fit per replica. Each request needs one history block per 128 input positions, rounded up. The limit is the smallest of the history-based request count and the two state quotas. The frontend token estimate multiplies this limit by the configured length. Shorter or mixed-length requests can reach a different concurrency.
 
-During attention, the worker assembles the visible tail of the old ring and the current rows in chronological order. After attention it commits the new rows to the ring. Sequential layers share the staging workspace. The packed path requires non-overlapping forwards and excludes bounded SWA replay, speculative decoding and extensible cache allocation. It supports the unpacked BF16 Flash KV format, INT8 indices with FP16 scales, and FP32 compressor rings with PP, PCP and DCP all equal to one.
+During attention, the worker assembles the visible tail of the old ring and the current rows in chronological order. After attention it commits the new rows to the ring. Sequential layers share the staging workspace. Packed history requires non-overlapping forwards and excludes bounded SWA replay, speculative decoding and extensible cache allocation. It supports the unpacked BF16 Flash KV format, INT8 indices with FP16 scales, and FP32 compressor rings with PP, PCP and DCP all equal to one.
 
 ## Prefix caching
 
-With `--enable-prefix-caching --no-swa-bounded-replay`, compressed history still uses the three packed planes. SWA uses vLLM's position-indexed sliding-window pages in the same allocation. A prefix hit requires both the compressed history and the SWA tail covering the same 128-token boundary. Concurrent continuations can read those immutable pages and write their own suffix pages. The native block pool keeps cached pages eligible for eviction once their last reader releases them.
+Enable this mode with `--enable-prefix-caching --no-swa-bounded-replay`. Compressed history uses the same packed planes. A request's fixed SWA ring overwrites old rows as the window advances. With prefix caching enabled, SWA uses vLLM's position-indexed pages in the shared pool so a continuation can reuse the window tail at its cache-hit boundary.
 
-Compressor rings remain private. Each 128-token boundary ends a complete compression pair, so a new continuation starts its next pair from its own input. The smaller of the configured SWA and compressor slot limits caps concurrent requests. The fixed-ring memory formula above applies with prefix caching disabled. With prefix caching enabled, SWA uses pages for its visible tail and in-flight chunk, and the reported cold-request capacity accounts for both. Actual capacity also depends on prefix reuse and eviction. Use the same prefix and replay settings on both P/D peers.
+Consider two requests with the same first 256 tokens and different suffixes. The second can start at token 257 when both the compressed history for the prefix and the SWA tail at token 256 are cached. The two requests can read the same prefix pages and write their own suffix pages. vLLM can evict a cached page once its last reader releases it. Hits end on a 128-token page boundary, which also completes a C2 compression pair. The continuation therefore starts its next pair in its own compressor ring.
+
+A cold request draws its history pages, SWA pages for the visible tail and in-flight chunk, and private compressor rings from the shared pool. Startup sizing checks that this demand fits for one request at the configured maximum length. The reported cold-request concurrency also accounts for the runtime compressor limit, which is the smaller of `swa_slots` and `compressor_slots` in this mode. Prefix hits can raise the concurrency that fits within the same page budget.
 
 ## Serving and P/D handoff
 
@@ -34,6 +36,6 @@ Enable the option on the standalone service or on **both** P and D:
 --additional-config '{"packed_history_cache":{"enabled":true}}'
 ```
 
-Both peers must use the same layout and layer formats. Their budgets and local block IDs may differ. For N input tokens, P supplies the history, index, window and compressor state for the first N−1 tokens. D restores those groups under its own block IDs and computes the final input token.
+Both peers must use the same layout, layer formats, prefix caching and SWA replay settings. Their budgets and local block IDs may differ. For N input tokens, P supplies the history, index, window and compressor state for the first N−1 tokens. D restores those groups under its own block IDs and computes the final input token.
 
 The layout publishes standard KV cache groups, tensor views and placement descriptors. A connector must support the model's hybrid cache groups and preserve each physical plane's block stride when translating between P and D block IDs. The descriptors record the plane size and layer offsets so a connector can locate a page even when a layer starts in the middle of it. vLLM handles connector selection and hybrid cache capability checks.
